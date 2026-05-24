@@ -1,0 +1,6 @@
+@ChatVerse.Infrastructure_HostAddress = http://localhost:5120
+
+GET {{ChatVerse.Infrastructure_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

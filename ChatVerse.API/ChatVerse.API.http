@@ -1,0 +1,6 @@
+@ChatVerse.API_HostAddress = http://localhost:5011
+
+GET {{ChatVerse.API_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
