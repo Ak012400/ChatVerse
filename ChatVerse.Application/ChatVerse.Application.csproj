@@ -17,4 +17,8 @@
     <ProjectReference Include="..\ChatVerse.Domain\ChatVerse.Domain.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Folder Include="Controllers\" />
+  </ItemGroup>
+
 </Project>
