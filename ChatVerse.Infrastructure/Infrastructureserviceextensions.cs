@@ -1,4 +1,6 @@
-﻿using ChatVerse.Infrastructure.Persistence.MongoDB;
+﻿using ChatVerse.Infrastructure.ExternalServices.Email;
+using ChatVerse.Infrastructure.ExternalServices.OpenAI;
+using ChatVerse.Infrastructure.Persistence.MongoDB;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
 using ChatVerse.Infrastructure.Persistence.Redis;
 using Microsoft.EntityFrameworkCore;
@@ -62,6 +64,11 @@ public static class InfrastructureServiceExtensions
         });
 
         services.AddScoped<RedisService>();
+        services.AddHttpClient<BrevoEmailService>();
+
+        // ── OpenAI Moderation ─────────────────────────────────
+        services.AddHttpClient<OpenAIModerationService>();
+        services.AddScoped<ModerationOrchestrator>();
 
         return services;
     }
