@@ -2,6 +2,7 @@
 using ChatVerse.Domain.Constants;
 using ChatVerse.Domain.Enums;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
+using ChatVerse.Infrastructure.ExternalServices.Email;
 using ChatVerse.Infrastructure.Persistence.Redis;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -17,17 +18,20 @@ public class AuthController : ControllerBase
     private readonly PostgresProcService _postgres;
     private readonly RedisService _redis;
     private readonly JwtService _jwt;
+    private readonly BrevoEmailService _email;
     private readonly ILogger<AuthController> _logger;
 
     public AuthController(
         PostgresProcService postgres,
         RedisService redis,
         JwtService jwt,
+        BrevoEmailService email,
         ILogger<AuthController> logger)
     {
         _postgres = postgres;
         _redis = redis;
         _jwt = jwt;
+        _email = email;
         _logger = logger;
     }
 
@@ -122,10 +126,9 @@ public class AuthController : ControllerBase
 
         await _postgres.UpsertOtpAsync(req.Email, otpCode, OtpPurpose.EmailVerification, expiresAt);
 
-        // TODO: Send email via Brevo
-        // await _emailService.SendOtpEmailAsync(req.Email, otpCode);
-        // For now log to console in dev
-        _logger.LogInformation("OTP for {Email}: {Code}", req.Email, otpCode);
+        // Send OTP email via Brevo
+        await _email.SendOtpEmailAsync(req.Email, otpCode, "email_verification");
+        _logger.LogInformation("OTP sent to {Email}", req.Email);
 
         return Ok(ApiResponse<object>.Ok(new
         {
@@ -175,6 +178,13 @@ public class AuthController : ControllerBase
         );
 
         await _redis.SetUserOnlineAsync(userId.Value.ToString());
+
+        // Send welcome email (fire and forget)
+        _ = Task.Run(async () =>
+        {
+            try { await _email.SendWelcomeEmailAsync(req.Email, req.Email.Split('@')[0]); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Welcome email failed"); }
+        });
 
         return Ok(ApiResponse<object>.Ok(new
         {
@@ -265,8 +275,8 @@ public class AuthController : ControllerBase
 
         await _postgres.UpsertOtpAsync(req.Email, otpCode, OtpPurpose.EmailVerification, expiresAt);
 
-        // TODO: await _emailService.SendOtpEmailAsync(req.Email, otpCode);
-        _logger.LogInformation("Resent OTP for {Email}: {Code}", req.Email, otpCode);
+        await _email.SendOtpEmailAsync(req.Email, otpCode, "email_verification");
+        _logger.LogInformation("OTP resent to {Email}", req.Email);
 
         return Ok(ApiResponse.Ok("OTP resent successfully"));
     }
@@ -324,8 +334,8 @@ public class AuthController : ControllerBase
             var otpCode = GenerateOtpCode();
             var expiresAt = DateTime.UtcNow.AddMinutes(Otp.ExpiryMinutes);
             await _postgres.UpsertOtpAsync(req.Email, otpCode, OtpPurpose.EmailVerification, expiresAt);
-            // TODO: await _emailService.SendOtpEmailAsync(req.Email, otpCode);
-            _logger.LogInformation("Upgrade OTP for {Email}: {Code}", req.Email, otpCode);
+            await _email.SendOtpEmailAsync(req.Email, otpCode, "email_verification");
+            _logger.LogInformation("Upgrade OTP sent to {Email}", req.Email);
         }
 
         return Ok(ApiResponse.Ok("Account upgraded. Please verify your email."));
@@ -386,30 +396,23 @@ public class AuthController : ControllerBase
 }
 
 // ── Request DTOs ─────────────────────────────────────────────
+// Note: [Required] on record types must go on constructor param, not property
 public record RegisterRequest(
-    [System.ComponentModel.DataAnnotations.Required]
-    string Username,
-    [System.ComponentModel.DataAnnotations.Required]
-    string Email,
-    [System.ComponentModel.DataAnnotations.Required]
-    string Password
+    [System.ComponentModel.DataAnnotations.Required] string Username,
+    [System.ComponentModel.DataAnnotations.Required] string Email,
+    [System.ComponentModel.DataAnnotations.Required] string Password
 );
 
 public record LoginRequest(
-    [System.ComponentModel.DataAnnotations.Required]
-    string Email,
-    [System.ComponentModel.DataAnnotations.Required]
-    string Password
+    [System.ComponentModel.DataAnnotations.Required] string Email,
+    [System.ComponentModel.DataAnnotations.Required] string Password
 );
 
 public record VerifyOtpRequest(
-    [System.ComponentModel.DataAnnotations.Required]
-    string Email,
-    [System.ComponentModel.DataAnnotations.Required]
-    string Code
+    [System.ComponentModel.DataAnnotations.Required] string Email,
+    [System.ComponentModel.DataAnnotations.Required] string Code
 );
 
 public record ResendOtpRequest(
-    [System.ComponentModel.DataAnnotations.Required]
-    string Email
+    [System.ComponentModel.DataAnnotations.Required] string Email
 );

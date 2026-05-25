@@ -1,6 +1,7 @@
 ﻿using ChatVerse.API.Extensions;
 using ChatVerse.Domain.Constants;
 using ChatVerse.Domain.Entities;
+using ChatVerse.Infrastructure.ExternalServices.OpenAI;
 using ChatVerse.Infrastructure.Persistence.MongoDB;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
 using ChatVerse.Infrastructure.Persistence.Redis;
@@ -15,33 +16,34 @@ public class ChatHub : Hub
     private readonly MongoService _mongo;
     private readonly RedisService _redis;
     private readonly PostgresProcService _postgres;
+    private readonly ModerationOrchestrator _moderation;
     private readonly ILogger<ChatHub> _logger;
 
     public ChatHub(
         MongoService mongo,
         RedisService redis,
         PostgresProcService postgres,
+        ModerationOrchestrator moderation,
         ILogger<ChatHub> logger)
     {
         _mongo = mongo;
         _redis = redis;
         _postgres = postgres;
+        _moderation = moderation;
         _logger = logger;
     }
 
     // ============================================================
     //  OnConnectedAsync
-    //  Called when user connects to /hubs/chat
     // ============================================================
     public override async Task OnConnectedAsync()
     {
         var userId = JwtService.GetUserId(Context.User!).ToString();
         var username = JwtService.GetUsername(Context.User!);
 
-        // Mark online in Redis
         await _redis.SetUserOnlineAsync(userId);
 
-        _logger.LogInformation("User {Username} connected to ChatHub [{ConnectionId}]",
+        _logger.LogInformation("User {Username} connected [{ConnectionId}]",
             username, Context.ConnectionId);
 
         await base.OnConnectedAsync();
@@ -49,7 +51,6 @@ public class ChatHub : Hub
 
     // ============================================================
     //  OnDisconnectedAsync
-    //  Called when user disconnects or loses connection
     // ============================================================
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
@@ -58,14 +59,12 @@ public class ChatHub : Hub
 
         await _redis.SetUserOfflineAsync(userId);
 
-        // Find which room this connection was in and decrement count
         var roomSlug = await _redis.GetStringAsync($"conn:room:{Context.ConnectionId}");
         if (roomSlug != null)
         {
             await _redis.DecrementRoomCountAsync(roomSlug);
             await _redis.DeleteKeyAsync($"conn:room:{Context.ConnectionId}");
 
-            // Notify room that user left
             await Clients.Group(roomSlug).SendAsync("UserLeft", new
             {
                 userId,
@@ -74,13 +73,12 @@ public class ChatHub : Hub
             });
         }
 
-        _logger.LogInformation("User {Username} disconnected from ChatHub", username);
+        _logger.LogInformation("User {Username} disconnected", username);
         await base.OnDisconnectedAsync(exception);
     }
 
     // ============================================================
     //  JoinRoom
-    //  Client calls this to enter a chat room
     // ============================================================
     public async Task JoinRoom(string roomSlug)
     {
@@ -89,7 +87,7 @@ public class ChatHub : Hub
         var trustScore = JwtService.GetTrustScore(Context.User!);
         var ageVerified = JwtService.GetAgeVerified(Context.User!);
 
-        // Check if room exists
+        // Room exists?
         var room = await _mongo.GetRoomBySlugAsync(roomSlug);
         if (room == null)
         {
@@ -104,29 +102,29 @@ public class ChatHub : Hub
             return;
         }
 
-        // Trust gate — restricted users (score < 20) cannot join
+        // Trust gate — block very low trust users
         if (trustScore < TrustBands.NewMax)
         {
             await Clients.Caller.SendAsync("Error", "Your trust score is too low to join rooms");
             return;
         }
 
-        // Check room ban in PostgreSQL
-        // (ban check via proc will be added when trust procs are built)
+        // Room ban check
+        var (isBanned, banReason, banExpiry) = await _postgres.CheckRoomBanAsync(
+            Guid.Parse(userId), roomSlug);
+        if (isBanned)
+        {
+            await Clients.Caller.SendAsync("Error",
+                $"You are banned from this room. {(banExpiry.HasValue ? $"Expires: {banExpiry:f}" : "Permanent")}");
+            return;
+        }
 
-        // Add to SignalR group
+        // Join SignalR group
         await Groups.AddToGroupAsync(Context.ConnectionId, roomSlug);
-
-        // Track which room this connection is in
-        await _redis.SetStringAsync(
-            $"conn:room:{Context.ConnectionId}",
-            roomSlug,
-            TimeSpan.FromHours(24));
-
-        // Increment room active count
+        await _redis.SetStringAsync($"conn:room:{Context.ConnectionId}", roomSlug, TimeSpan.FromHours(24));
         await _redis.IncrementRoomCountAsync(roomSlug);
 
-        // Send last 50 messages to the joining user
+        // Send room history to caller
         var messages = await _mongo.GetRoomMessagesAsync(roomSlug, 0, 50);
         await Clients.Caller.SendAsync("RoomHistory", new
         {
@@ -134,7 +132,7 @@ public class ChatHub : Hub
             messages = messages.Select(MapMessage)
         });
 
-        // Notify others in room
+        // Notify others
         await Clients.OthersInGroup(roomSlug).SendAsync("UserJoined", new
         {
             userId,
@@ -147,7 +145,6 @@ public class ChatHub : Hub
 
     // ============================================================
     //  LeaveRoom
-    //  Client calls this to exit a room cleanly
     // ============================================================
     public async Task LeaveRoom(string roomSlug)
     {
@@ -168,10 +165,9 @@ public class ChatHub : Hub
 
     // ============================================================
     //  SendMessage
-    //  Main message flow:
-    //  1. Save to MongoDB (status = pending)
-    //  2. Broadcast immediately to room
-    //  3. OpenAI moderation runs async — updates status after
+    //  1. Save to MongoDB
+    //  2. Broadcast immediately
+    //  3. Moderate async (never blocks)
     // ============================================================
     public async Task SendMessage(string roomSlug, string content, string? replyToId = null)
     {
@@ -179,7 +175,6 @@ public class ChatHub : Hub
         var username = JwtService.GetUsername(Context.User!);
         var trustScore = JwtService.GetTrustScore(Context.User!);
 
-        // Basic validation
         if (string.IsNullOrWhiteSpace(content) || content.Length > 2000)
         {
             await Clients.Caller.SendAsync("Error", "Invalid message content");
@@ -201,27 +196,42 @@ public class ChatHub : Hub
         };
 
         var saved = await _mongo.InsertMessageAsync(message);
-
-        // Increment room message count
         await _mongo.IncrementRoomMessageCountAsync(roomSlug);
 
-        // Broadcast to everyone in room immediately
+        // Broadcast immediately
         await Clients.Group(roomSlug).SendAsync("ReceiveMessage", MapMessage(saved));
 
-        // Mark user active day (fire and forget)
+        // Mark active day (fire and forget)
         _ = Task.Run(async () =>
         {
             try { await _postgres.MarkUserActiveDayAsync(Guid.Parse(userId)); }
             catch (Exception ex) { _logger.LogWarning(ex, "Failed to mark active day"); }
         });
 
-        _logger.LogInformation("Message sent by {Username} in {Room} [{MessageId}]",
-            username, roomSlug, saved.Id);
+        // Moderation (fire and forget — never blocks delivery)
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _moderation.ModerateMessageAsync(
+                    messageId: saved.Id!,
+                    roomId: roomSlug,
+                    senderId: userId,
+                    content: content,
+                    roomClients: Clients.Group(roomSlug)
+                );
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Moderation task failed for message {Id}", saved.Id);
+            }
+        });
+
+        _logger.LogInformation("Message sent by {Username} in {Room}", username, roomSlug);
     }
 
     // ============================================================
     //  SendTyping
-    //  Broadcast typing indicator to room (except sender)
     // ============================================================
     public async Task SendTyping(string roomSlug)
     {
@@ -231,14 +241,10 @@ public class ChatHub : Hub
 
     // ============================================================
     //  ReactToMessage
-    //  Add/remove emoji reaction on a message
     // ============================================================
     public async Task ReactToMessage(string roomSlug, string messageId, string emoji)
     {
         var userId = JwtService.GetUserId(Context.User!).ToString();
-
-        // TODO: update reaction in MongoDB
-        // For now broadcast reaction event
         await Clients.Group(roomSlug).SendAsync("MessageReaction", new
         {
             messageId,
@@ -247,9 +253,7 @@ public class ChatHub : Hub
         });
     }
 
-    // ============================================================
-    //  Private helpers
-    // ============================================================
+    // ── Map message to client DTO ─────────────────────────────
     private static object MapMessage(Message m) => new
     {
         id = m.Id,
