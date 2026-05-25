@@ -1,6 +1,7 @@
 ﻿using ChatVerse.Domain.Constants;
 using ChatVerse.Domain.Entities;
 using MongoDB.Bson;
+using MongoDB.Bson.Serialization.Conventions;
 using MongoDB.Driver;
 
 namespace ChatVerse.Infrastructure.Persistence.MongoDB;
@@ -21,6 +22,10 @@ public class MongoService
 
     public MongoService(IMongoClient client, string databaseName)
     {
+        // Register camelCase convention — matches MongoDB field names (isActive, displayName etc)
+        var pack = new ConventionPack { new CamelCaseElementNameConvention() };
+        ConventionRegistry.Register("camelCase", pack, _ => true);
+
         _db = client.GetDatabase(databaseName);
     }
 
