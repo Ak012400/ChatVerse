@@ -45,7 +45,21 @@ public static class InfrastructureServiceExtensions
         var redisConnStr = config.GetConnectionString("Redis")!;
 
         services.AddSingleton<IConnectionMultiplexer>(_ =>
-            ConnectionMultiplexer.Connect(redisConnStr));
+        {
+            var uri = new Uri(redisConnStr);
+            var cfg = new StackExchange.Redis.ConfigurationOptions
+            {
+                EndPoints = { $"{uri.Host}:{uri.Port}" },
+                Ssl = uri.Scheme == "rediss",
+                AbortOnConnectFail = false
+            };
+            // UserInfo is "default:password" — take the last part as password
+            var userInfo = uri.UserInfo;
+            if (!string.IsNullOrEmpty(userInfo))
+                cfg.Password = userInfo.Split(':').Last();
+
+            return ConnectionMultiplexer.Connect(cfg);
+        });
 
         services.AddScoped<RedisService>();
 
