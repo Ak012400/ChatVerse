@@ -1,7 +1,9 @@
 ﻿using ChatVerse.API.Extensions;
+using ChatVerse.API.Hubs;
 using ChatVerse.API.Middleware;
 using ChatVerse.Infrastructure;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.SignalR;
 using Microsoft.IdentityModel.Tokens;
 using StackExchange.Redis;
 using System.Text;
@@ -14,8 +16,6 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
 {
     c.SwaggerDoc("v1", new() { Title = "ChatVerse API", Version = "v1" });
-
-    // JWT support in Swagger UI
     c.AddSecurityDefinition("Bearer", new Microsoft.OpenApi.Models.OpenApiSecurityScheme
     {
         Name = "Authorization",
@@ -26,27 +26,26 @@ builder.Services.AddSwaggerGen(c =>
         Description = "Enter: Bearer {your JWT token}"
     });
     c.AddSecurityRequirement(new Microsoft.OpenApi.Models.OpenApiSecurityRequirement
-    {
+    {{
+        new Microsoft.OpenApi.Models.OpenApiSecurityScheme
         {
-            new Microsoft.OpenApi.Models.OpenApiSecurityScheme
+            Reference = new Microsoft.OpenApi.Models.OpenApiReference
             {
-                Reference = new Microsoft.OpenApi.Models.OpenApiReference
-                {
-                    Type = Microsoft.OpenApi.Models.ReferenceType.SecurityScheme,
-                    Id   = "Bearer"
-                }
-            },
-            Array.Empty<string>()
-        }
-    });
+                Type = Microsoft.OpenApi.Models.ReferenceType.SecurityScheme,
+                Id   = "Bearer"
+            }
+        },
+        Array.Empty<string>()
+    }});
 });
 
 // ── Infrastructure (PostgreSQL + MongoDB + Redis) ─────────────
 builder.Services.AddInfrastructure(builder.Configuration);
+
+// ── JwtService ────────────────────────────────────────────────
 builder.Services.AddSingleton<JwtService>();
 
-
-// ── JWT Authentication ─────────────────────────────────────────
+// ── JWT Authentication ────────────────────────────────────────
 var jwtConfig = builder.Configuration.GetSection("Jwt");
 var secretKey = jwtConfig["SecretKey"]!;
 var issuer = jwtConfig["Issuer"]!;
@@ -71,17 +70,16 @@ builder.Services.AddAuthentication(options =>
         ClockSkew = TimeSpan.Zero
     };
 
-    // SignalR sends JWT via query string — support that too
+    // SignalR sends JWT via query string
     options.Events = new JwtBearerEvents
     {
         OnMessageReceived = context =>
         {
             var accessToken = context.Request.Query["access_token"];
             var path = context.HttpContext.Request.Path;
-
             if (!string.IsNullOrEmpty(accessToken) &&
-                (path.StartsWithSegments("/hubs/chat") ||
-                 path.StartsWithSegments("/hubs/video")))
+               (path.StartsWithSegments("/hubs/chat") ||
+                path.StartsWithSegments("/hubs/video")))
             {
                 context.Token = accessToken;
             }
@@ -89,22 +87,62 @@ builder.Services.AddAuthentication(options =>
         }
     };
 });
+
 builder.Services.AddAuthorization();
 
-// ── SignalR + Redis Backplane ──────────────────────────────────
+// ── Redis — single ConfigurationOptions for everything ────────
 var redisConnStr = builder.Configuration.GetConnectionString("Redis")!;
 
+// Parse URI format (rediss://user:pass@host:port) safely
+ConfigurationOptions redisConfig;
+if (redisConnStr.StartsWith("rediss://") || redisConnStr.StartsWith("redis://"))
+{
+    // Upstash URI format — parse manually
+    var uri = new Uri(redisConnStr);
+    var host = uri.Host;
+    var port = uri.Port > 0 ? uri.Port : 6379;
+    var password = uri.UserInfo.Contains(':')
+                   ? uri.UserInfo.Split(':', 2)[1]
+                   : uri.UserInfo;
+    var ssl = redisConnStr.StartsWith("rediss://");
+
+    redisConfig = new ConfigurationOptions
+    {
+        EndPoints = { { host, port } },
+        Password = password,
+        Ssl = ssl,
+        AbortOnConnectFail = false,
+        ConnectTimeout = 5000,
+        SyncTimeout = 5000
+    };
+}
+else
+{
+    // Already host:port,password=xxx format
+    redisConfig = ConfigurationOptions.Parse(redisConnStr);
+    redisConfig.AbortOnConnectFail = false;
+}
+
+// Register singleton multiplexer
+builder.Services.AddSingleton<IConnectionMultiplexer>(
+    ConnectionMultiplexer.Connect(redisConfig));
+
+// ── SignalR + Redis Backplane ──────────────────────────────────
 builder.Services.AddSignalR(options =>
 {
     options.EnableDetailedErrors = builder.Environment.IsDevelopment();
-    options.MaximumReceiveMessageSize = 32 * 1024; // 32 KB max message
+    options.MaximumReceiveMessageSize = 32 * 1024;
     options.ClientTimeoutInterval = TimeSpan.FromSeconds(60);
     options.KeepAliveInterval = TimeSpan.FromSeconds(15);
 })
-.AddStackExchangeRedis(redisConnStr, options =>
+.AddStackExchangeRedis(options =>
 {
-    options.Configuration.ChannelPrefix =
-        RedisChannel.Literal("ChatVerse");
+    options.ConnectionFactory = async writer =>
+    {
+        var conn = await ConnectionMultiplexer.ConnectAsync(redisConfig, writer);
+        return conn;
+    };
+    options.Configuration.ChannelPrefix = RedisChannel.Literal("ChatVerse");
 });
 
 // ── CORS ──────────────────────────────────────────────────────
@@ -114,15 +152,13 @@ builder.Services.AddCors(options =>
     {
         if (builder.Environment.IsDevelopment())
         {
-            // Dev: allow Vite dev server
             policy.WithOrigins("http://localhost:5173", "https://localhost:5173")
                   .AllowAnyHeader()
                   .AllowAnyMethod()
-                  .AllowCredentials(); // Required for SignalR
+                  .AllowCredentials();
         }
         else
         {
-            // Production: lock to your domain
             policy.WithOrigins("https://chatverse.app")
                   .AllowAnyHeader()
                   .AllowAnyMethod()
@@ -131,32 +167,30 @@ builder.Services.AddCors(options =>
     });
 });
 
-// ── HttpClient (for Brevo + OpenAI calls) ─────────────────────
+// ── HttpClient ────────────────────────────────────────────────
 builder.Services.AddHttpClient();
 
 var app = builder.Build();
 
-// ── Middleware pipeline ────────────────────────────────────────
+// ── Middleware pipeline ───────────────────────────────────────
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
     app.UseSwaggerUI(c =>
     {
         c.SwaggerEndpoint("/swagger/v1/swagger.json", "ChatVerse API v1");
-        c.RoutePrefix = string.Empty; // Swagger at root /
+        c.RoutePrefix = string.Empty;
     });
 }
 
 app.UseHttpsRedirection();
 app.UseGlobalExceptionHandler();
-app.UseCors("ChatVerseCors");         // Must be before Auth
+app.UseCors("ChatVerseCors");
 app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapControllers();
-
-// ── SignalR Hub routes ─────────────────────────────────────────
-// app.MapHub<ChatHub>("/hubs/chat");    // uncomment when hubs are created
-// app.MapHub<VideoHub>("/hubs/video");  // uncomment when hubs are created
+app.MapHub<ChatHub>("/hubs/chat");
+// app.MapHub<VideoHub>("/hubs/video"); // uncomment when ready
 
 app.Run();
