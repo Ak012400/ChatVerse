@@ -191,6 +191,6 @@ app.UseAuthorization();
 
 app.MapControllers();
 app.MapHub<ChatHub>("/hubs/chat");
-// app.MapHub<VideoHub>("/hubs/video"); // uncomment when ready
+app.MapHub<VideoHub>("/hubs/video"); // uncomment when ready
 
 app.Run();
