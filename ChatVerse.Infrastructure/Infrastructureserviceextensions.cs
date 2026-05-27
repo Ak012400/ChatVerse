@@ -1,5 +1,7 @@
-﻿using ChatVerse.Infrastructure.ExternalServices.Email;
+﻿using ChatVerse.Infrastructure.ExternalServices.Cloudinary;
+using ChatVerse.Infrastructure.ExternalServices.Email;
 using ChatVerse.Infrastructure.ExternalServices.OpenAI;
+using ChatVerse.Infrastructure.ExternalServices.Razorpay;
 using ChatVerse.Infrastructure.Persistence.MongoDB;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
 using ChatVerse.Infrastructure.Persistence.Redis;
@@ -69,6 +71,11 @@ public static class InfrastructureServiceExtensions
         // ── OpenAI Moderation ─────────────────────────────────
         services.AddHttpClient<OpenAIModerationService>();
         services.AddScoped<ModerationOrchestrator>();
+        // Cloudinary
+        services.AddHttpClient<CloudinaryService>();
+
+        // Razorpay
+        services.AddHttpClient<RazorpayService>();
 
         return services;
     }
