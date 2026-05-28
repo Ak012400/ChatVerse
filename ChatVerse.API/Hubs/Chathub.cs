@@ -201,12 +201,9 @@ public class ChatHub : Hub
         // Broadcast immediately
         await Clients.Group(roomSlug).SendAsync("ReceiveMessage", MapMessage(saved));
 
-        // Mark active day (fire and forget)
-        _ = Task.Run(async () =>
-        {
-            try { await _postgres.MarkUserActiveDayAsync(Guid.Parse(userId)); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Failed to mark active day"); }
-        });
+        // Mark active day — direct call (no background task to avoid scope disposal)
+        try { await _postgres.MarkUserActiveDayAsync(Guid.Parse(userId)); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Failed to mark active day"); }
 
         // Moderation (fire and forget — never blocks delivery)
         _ = Task.Run(async () =>
