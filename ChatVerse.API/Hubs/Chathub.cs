@@ -154,14 +154,39 @@ public class ChatHub : Hub
     }
 
     // ============================================================
-    //  SendMessage
+    //  SendMessage (Updated with Ephemeral Image / Type support)
     // ============================================================
-    public async Task SendMessage(string roomSlug, string content, string? replyToId = null)
+    public async Task SendMessage(string roomSlug, string content, string type = "text", string? mediaUrl = null, string? replyToId = null)
     {
         var userId = JwtService.GetUserId(Context.User!).ToString();
         var username = JwtService.GetUsername(Context.User!);
         var trustScore = JwtService.GetTrustScore(Context.User!);
 
+        // ── 1. EPHEMERAL IMAGE (VANISH MODE) LOGIC ──
+        if (type == "ephemeral_image")
+        {
+            var tempMsgId = Guid.NewGuid().ToString("N")[..12];
+            await Clients.Group(roomSlug).SendAsync("ReceiveMessage", new
+            {
+                id = tempMsgId,
+                roomId = roomSlug,
+                senderId = userId,
+                senderName = username,
+                senderAvatar = (string?)null,
+                content = content ?? "📸 sent a photo",
+                type = type,
+                mediaUrl = mediaUrl, // Base64 Compressed Image
+                replyTo = replyToId,
+                reactions = new Dictionary<string, List<string>>(),
+                modStatus = "clean", // Frontend NSFW JS ne pass kar diya hai tabhi yaha aaya
+                createdAt = DateTime.UtcNow
+            });
+
+            _logger.LogInformation("Ephemeral image sent by {Username} in {Room}", username, roomSlug);
+            return; // 🛑 Yahi se wapas laut jao, DB mein kuch save mat karo!
+        }
+
+        // ── 2. NORMAL TEXT MESSAGE LOGIC ──
         if (string.IsNullOrWhiteSpace(content) || content.Length > 2000)
         {
             await Clients.Caller.SendAsync("Error", "Invalid message content");
@@ -175,7 +200,8 @@ public class ChatHub : Hub
             SenderName = username,
             SenderTrustScore = trustScore,
             Content = content.Trim(),
-            Type = "text",
+            Type = type,
+            MediaUrl = mediaUrl,
             ReplyTo = replyToId,
             Moderation = new MessageModeration { Status = "pending" },
             CreatedAt = DateTime.UtcNow
@@ -201,7 +227,7 @@ public class ChatHub : Hub
         {
             try
             {
-                // Step 1: Moderate
+                // Step 1: Moderate Text
                 await _moderation.ModerateMessageAsync(
                     messageId: messageId,
                     roomId: roomSlug,
