@@ -3,6 +3,7 @@ using ChatVerse.Infrastructure.ExternalServices.OpenAI;
 using ChatVerse.Infrastructure.Persistence.MongoDB;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
 using ChatVerse.Infrastructure.Persistence.Redis;
+using ChatVerse.Infrastructure.Services.LiveKit;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -47,28 +48,21 @@ public static class InfrastructureServiceExtensions
         var redisConnStr = config.GetConnectionString("Redis")!;
 
         services.AddSingleton<IConnectionMultiplexer>(_ =>
-        {
-            var uri = new Uri(redisConnStr);
-            var cfg = new StackExchange.Redis.ConfigurationOptions
-            {
-                EndPoints = { $"{uri.Host}:{uri.Port}" },
-                Ssl = uri.Scheme == "rediss",
-                AbortOnConnectFail = false
-            };
-            // UserInfo is "default:password" — take the last part as password
-            var userInfo = uri.UserInfo;
-            if (!string.IsNullOrEmpty(userInfo))
-                cfg.Password = userInfo.Split(':').Last();
-
-            return ConnectionMultiplexer.Connect(cfg);
-        });
+            ConnectionMultiplexer.Connect(redisConnStr));
 
         services.AddScoped<RedisService>();
+
+        // ── Brevo Email ───────────────────────────────────────
         services.AddHttpClient<BrevoEmailService>();
 
-        // ── OpenAI Moderation ─────────────────────────────────
-        services.AddHttpClient<OpenAIModerationService>();
+        // ── Groq Moderation (free, replaces OpenAI) ──────────
+        services.AddHttpClient<OpenAIModerationService>(client =>
+        {
+            client.Timeout = TimeSpan.FromSeconds(10);
+        });
         services.AddScoped<ModerationOrchestrator>();
+        // ── LiveKit Service ───────────────────────────────────────────
+        services.AddSingleton<LiveKitService>();
 
         return services;
     }
