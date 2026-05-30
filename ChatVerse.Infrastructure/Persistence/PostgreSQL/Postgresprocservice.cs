@@ -337,6 +337,15 @@ public class PostgresProcService
         }
         return (false, null, null);
     }
+    public async Task<short?> GetTrustScoreAsync(Guid userId)
+    {
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(
+            "SELECT trust_score FROM user_auth.users WHERE user_id = @p_user_id", conn);
+        cmd.Parameters.AddWithValue("p_user_id", userId);
+        var result = await cmd.ExecuteScalarAsync();
+        return result == DBNull.Value ? (short?)null : (short?)result;
+    }
 }
 
 // ── Snake case helper ─────────────────────────────────────────

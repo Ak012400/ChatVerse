@@ -206,6 +206,8 @@ public class ChatHub : Hub
         catch (Exception ex) { _logger.LogWarning(ex, "Failed to mark active day"); }
 
         // Moderation (fire and forget — never blocks delivery)
+        var callerClient = Clients.Caller;
+        var roomClients = Clients.Group(roomSlug);
         _ = Task.Run(async () =>
         {
             try
@@ -215,8 +217,19 @@ public class ChatHub : Hub
                     roomId: roomSlug,
                     senderId: userId,
                     content: content,
-                    roomClients: Clients.Group(roomSlug)
+                    roomClients: roomClients
                 );
+
+                // After moderation — check trust score and warn if low
+                var newScore = await _postgres.GetTrustScoreAsync(Guid.Parse(userId));
+                if (newScore <= 60)
+                {
+                    var band = newScore <= 20 ? "New" :
+                               newScore <= 40 ? "Restricted" :
+                               newScore <= 70 ? "Normal" :
+                               newScore <= 90 ? "Trusted" : "Elite";
+                    await callerClient.SendAsync("TrustWarning", new { score = newScore, band });
+                }
             }
             catch (Exception ex)
             {
