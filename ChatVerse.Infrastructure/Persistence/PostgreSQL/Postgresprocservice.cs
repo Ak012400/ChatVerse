@@ -243,10 +243,7 @@ public class PostgresProcService
     }
 
     public async Task<(Guid? ReportId, string? Error)> FileReportAsync(
-        Guid reporterId,
-        Guid reportedId,
-        string reason,
-        string? description)
+        Guid reporterId, Guid reportedId, string reason, string? description)
     {
         var conn = await GetOpenConnectionAsync();
         await using var cmd = Proc(conn, "trust.usp_file_report");
@@ -263,17 +260,24 @@ public class PostgresProcService
         );
     }
 
+    // ── Quick trust score read (no proc needed) ───────────────
+    public async Task<short> GetTrustScoreAsync(Guid userId)
+    {
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(
+            "SELECT trust_score FROM user_auth.users WHERE id = @id", conn);
+        cmd.Parameters.AddWithValue("id", userId);
+        var result = await cmd.ExecuteScalarAsync();
+        return result == null || result == DBNull.Value ? (short)50 : Convert.ToInt16(result);
+    }
+
     // ============================================================
     //  BILLING PROCS
     // ============================================================
 
     public async Task<(Guid? SubscriptionId, Guid? PaymentId, string? Error)> CreateSubscriptionAsync(
-        Guid userId,
-        string planType,
-        string razorpayOrderId,
-        int amountPaise,
-        DateTime startsAt,
-        DateTime endsAt)
+        Guid userId, string planType, string razorpayOrderId,
+        int amountPaise, DateTime startsAt, DateTime endsAt)
     {
         var conn = await GetOpenConnectionAsync();
         await using var cmd = Proc(conn, "billing.usp_create_subscription");
@@ -325,7 +329,6 @@ public class PostgresProcService
             "SELECT * FROM chat.usp_check_room_ban(@p_user_id, @p_room_slug)", conn);
         cmd.Parameters.AddWithValue("p_user_id", userId);
         cmd.Parameters.AddWithValue("p_room_slug", roomSlug);
-
         await using var reader = await cmd.ExecuteReaderAsync();
         if (await reader.ReadAsync())
         {
@@ -336,15 +339,6 @@ public class PostgresProcService
             return (true, reason, expiresAt);
         }
         return (false, null, null);
-    }
-    public async Task<short?> GetTrustScoreAsync(Guid userId)
-    {
-        var conn = await GetOpenConnectionAsync();
-        await using var cmd = new NpgsqlCommand(
-            "SELECT trust_score FROM user_auth.users WHERE user_id = @p_user_id", conn);
-        cmd.Parameters.AddWithValue("p_user_id", userId);
-        var result = await cmd.ExecuteScalarAsync();
-        return result == DBNull.Value ? (short?)null : (short?)result;
     }
 }
 

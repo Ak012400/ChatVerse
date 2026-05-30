@@ -3,6 +3,7 @@ using ChatVerse.Infrastructure.ExternalServices.OpenAI;
 using ChatVerse.Infrastructure.Persistence.MongoDB;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
 using ChatVerse.Infrastructure.Persistence.Redis;
+using ChatVerse.Infrastructure.Services.LiveKit;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -60,6 +61,8 @@ public static class InfrastructureServiceExtensions
             client.Timeout = TimeSpan.FromSeconds(10);
         });
         services.AddScoped<ModerationOrchestrator>();
+        // ── LiveKit Service ───────────────────────────────────────────
+        services.AddSingleton<LiveKitService>();
 
         return services;
     }
