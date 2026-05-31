@@ -1,6 +1,7 @@
 ﻿using ChatVerse.API.Extensions;
 using ChatVerse.API.Hubs;
 using ChatVerse.API.Middleware;
+using ChatVerse.API.Models;
 using ChatVerse.Infrastructure;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.SignalR;
@@ -45,6 +46,8 @@ try
 
     // ── Infrastructure (PostgreSQL + MongoDB + Redis) ─────────────
     builder.Services.AddInfrastructure(builder.Configuration);
+    // Program.cs
+    builder.Services.Configure<VideoSettings>(builder.Configuration.GetSection("VideoSettings"));
 
     // ── JwtService ────────────────────────────────────────────────
     builder.Services.AddSingleton<JwtService>();

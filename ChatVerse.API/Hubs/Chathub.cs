@@ -8,6 +8,7 @@ using ChatVerse.Infrastructure.Persistence.Redis;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.DependencyInjection;
+using System.Collections.Concurrent;
 
 namespace ChatVerse.API.Hubs;
 
@@ -20,6 +21,7 @@ public class ChatHub : Hub
     private readonly ModerationOrchestrator _moderation;
     private readonly ILogger<ChatHub> _logger;
     private readonly IServiceScopeFactory _scopeFactory;
+    private static readonly ConcurrentQueue<string> _waitingUsers = new ConcurrentQueue<string>();
 
     public ChatHub(
         MongoService mongo,
@@ -57,6 +59,10 @@ public class ChatHub : Hub
     {
         var userId = JwtService.GetUserId(Context.User!).ToString();
         var username = JwtService.GetUsername(Context.User!);
+        var newQueue = new ConcurrentQueue<string>(_waitingUsers.Where(u => u != userId));
+        foreach (var user in newQueue) _waitingUsers.Enqueue(user);
+
+        _waitingUsers.Clear();
         await _redis.SetUserOfflineAsync(userId);
 
         var roomSlug = await _redis.GetStringAsync($"conn:room:{Context.ConnectionId}");
@@ -277,6 +283,66 @@ public class ChatHub : Hub
     {
         var userId = JwtService.GetUserId(Context.User!).ToString();
         await Clients.Group(roomSlug).SendAsync("MessageReaction", new { messageId, emoji, userId });
+    }
+    // ── 🎲 AUTO-MATCHING LOGIC ──
+
+    // ── 🎲 AUTO-MATCHING LOGIC (सुधरा हुआ) ──
+    public async Task StartAutoMatch()
+    {
+        var currentUserId = Context.UserIdentifier;
+        if (string.IsNullOrEmpty(currentUserId)) return;
+
+        // अगर यूज़र पहले से Queue में है, तो उसे दोबारा मत डालो
+        if (_waitingUsers.Contains(currentUserId)) return;
+
+        if (_waitingUsers.TryDequeue(out var partnerUserId))
+        {
+            var randomRoomId = Guid.NewGuid().ToString();
+
+            await Clients.User(currentUserId).SendAsync("MatchFound", randomRoomId, partnerUserId, true);
+            await Clients.User(partnerUserId).SendAsync("MatchFound", randomRoomId, currentUserId, false);
+        }
+        else
+        {
+            _waitingUsers.Enqueue(currentUserId);
+            await Clients.Caller.SendAsync("WaitingForMatch");
+        }
+    }
+
+    public async Task CancelMatch()
+    {
+        var currentUserId = Context.UserIdentifier;
+        // ConcurrentQueue से रिमूव करने के लिए एक नई List बनाओ (सिर्फ cancellation के वक्त)
+        var newQueue = new ConcurrentQueue<string>(_waitingUsers.Where(u => u != currentUserId));
+        _waitingUsers.Clear();
+        foreach (var user in newQueue) _waitingUsers.Enqueue(user);
+
+        await Clients.Caller.SendAsync("MatchCancelled");
+    }
+    // ── 📞 WEBRTC SIGNALING METHODS ──
+
+    // 1. Offer भेजना
+    public async Task SendWebRTCOffer(string partnerId, string sdp)
+    {
+        await Clients.User(partnerId).SendAsync("ReceiveOffer", Context.UserIdentifier, sdp);
+    }
+
+    // 2. Answer भेजना
+    public async Task SendWebRTCAnswer(string partnerId, string sdp)
+    {
+        await Clients.User(partnerId).SendAsync("ReceiveAnswer", Context.UserIdentifier, sdp);
+    }
+
+    // 3. ICE Candidates (नेटवर्क का रास्ता) भेजना
+    public async Task SendIceCandidate(string partnerId, string candidate)
+    {
+        await Clients.User(partnerId).SendAsync("ReceiveIceCandidate", Context.UserIdentifier, candidate);
+    }
+
+    // 4. जब कोई "Skip" या "Disconnect" दबाए
+    public async Task EndMatch(string partnerId)
+    {
+        await Clients.User(partnerId).SendAsync("PartnerLeft");
     }
 
     // ── Map message to client DTO ─────────────────────────────
