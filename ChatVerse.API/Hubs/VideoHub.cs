@@ -10,6 +10,37 @@ using Microsoft.AspNetCore.SignalR;
 
 namespace ChatVerse.API.Hubs;
 
+/// <summary>
+/// VideoHub — designed to be the long-term home for random-match WebRTC.
+///
+/// ⚠ INCOMPLETE — DO NOT POINT FRONTEND HERE YET.
+///
+/// What works:
+///   - JoinQueue / LeaveQueue (Redis enqueue)
+///   - SendSignal (unified WebRTC signaling)
+///   - SessionReady / EndSession (session lifecycle)
+///   - ReportNsfw (browser-detected NSFW reporting + trust penalty)
+///
+/// What's MISSING:
+///   - A background service (e.g. <c>MatchingService : BackgroundService</c>)
+///     that polls the Redis queue every ~500ms, dequeues two users via
+///     <see cref="RedisService.DequeueForVideoAsync"/>, creates a video
+///     session in MongoDB, and emits "MatchFound" to both clients via
+///     <see cref="Microsoft.AspNetCore.SignalR.IHubContext{VideoHub}"/>.
+///
+/// Until that service exists, random video matching lives in
+/// <see cref="ChatHub"/> (StartAutoMatch / CancelMatch / WebRTC relays).
+/// Frontend currently uses ChatHub for video — see
+/// <c>chatverse-client/src/pages/video/VideoPage.tsx</c>.
+///
+/// Migration plan (when ready):
+///   1. Add <c>MatchingService.cs</c> as a hosted background service.
+///   2. Register it in <c>Program.cs</c> via <c>AddHostedService</c>.
+///   3. Refactor frontend to open a second SignalR connection at
+///      <c>/hubs/video</c> and call JoinQueue / SendSignal.
+///   4. Remove the StartAutoMatch / SendWebRTCOffer/Answer/IceCandidate
+///      methods from ChatHub.
+/// </summary>
 [Authorize]
 public class VideoHub : Hub
 {

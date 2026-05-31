@@ -151,6 +151,95 @@ public class PostgresProcService
     }
 
     // ============================================================
+    //  AUTH HELPERS — raw SQL for BCrypt-based login flow
+    //  The stored procs do exact-match hash comparison which BCrypt
+    //  can't support (per-hash random salts). These helpers let the
+    //  controller fetch the stored hash and verify in code instead.
+    // ============================================================
+
+    public record UserAuthRecord(
+        Guid UserId,
+        string Username,
+        string? PasswordHash,
+        short TrustScore,
+        bool IsEmailVerified,
+        bool AgeVerified,
+        string Status);
+
+    /// <summary>
+    /// Fetch the auth record for a registered user by email.
+    /// Returns null if no user found or the row belongs to a guest.
+    /// </summary>
+    public async Task<UserAuthRecord?> GetUserAuthByEmailAsync(string email)
+    {
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(
+            @"SELECT id, username, password_hash, trust_score, is_email_verified, age_verified, status::text
+              FROM user_auth.users
+              WHERE email = @p_email AND is_guest = false
+              LIMIT 1", conn);
+        cmd.Parameters.AddWithValue("p_email", email);
+
+        await using var reader = await cmd.ExecuteReaderAsync();
+        if (!await reader.ReadAsync()) return null;
+
+        return new UserAuthRecord(
+            UserId: reader.GetGuid(0),
+            Username: reader.GetString(1),
+            PasswordHash: reader.IsDBNull(2) ? null : reader.GetString(2),
+            TrustScore: reader.GetInt16(3),
+            IsEmailVerified: reader.GetBoolean(4),
+            AgeVerified: reader.GetBoolean(5),
+            Status: reader.GetString(6)
+        );
+    }
+
+    /// <summary>
+    /// Fetch a minimal user view by id — used after OTP verify when we
+    /// already know the userId and need the canonical username + flags
+    /// to mint a correct JWT.
+    /// </summary>
+    public async Task<UserAuthRecord?> GetUserAuthByIdAsync(Guid userId)
+    {
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(
+            @"SELECT id, username, password_hash, trust_score, is_email_verified, age_verified, status::text
+              FROM user_auth.users
+              WHERE id = @p_user_id
+              LIMIT 1", conn);
+        cmd.Parameters.AddWithValue("p_user_id", userId);
+
+        await using var reader = await cmd.ExecuteReaderAsync();
+        if (!await reader.ReadAsync()) return null;
+
+        return new UserAuthRecord(
+            UserId: reader.GetGuid(0),
+            Username: reader.GetString(1),
+            PasswordHash: reader.IsDBNull(2) ? null : reader.GetString(2),
+            TrustScore: reader.GetInt16(3),
+            IsEmailVerified: reader.GetBoolean(4),
+            AgeVerified: reader.GetBoolean(5),
+            Status: reader.GetString(6)
+        );
+    }
+
+    /// <summary>
+    /// Update a user's stored password hash. Used to silently re-hash
+    /// legacy SHA-256 passwords to BCrypt after a successful login.
+    /// </summary>
+    public async Task UpdatePasswordHashAsync(Guid userId, string newHash)
+    {
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(
+            @"UPDATE user_auth.users
+              SET password_hash = @p_hash, updated_at = NOW()
+              WHERE id = @p_user_id", conn);
+        cmd.Parameters.AddWithValue("p_hash", newHash);
+        cmd.Parameters.AddWithValue("p_user_id", userId);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    // ============================================================
     //  IAM PROCS
     // ============================================================
 

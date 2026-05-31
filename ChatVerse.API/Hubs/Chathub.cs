@@ -59,10 +59,16 @@ public class ChatHub : Hub
     {
         var userId = JwtService.GetUserId(Context.User!).ToString();
         var username = JwtService.GetUsername(Context.User!);
-        var newQueue = new ConcurrentQueue<string>(_waitingUsers.Where(u => u != userId));
-        foreach (var user in newQueue) _waitingUsers.Enqueue(user);
 
+        // Rebuild waiting queue without this user.
+        // Order matters: snapshot the survivors FIRST, then clear the
+        // shared queue, then enqueue the survivors. The earlier version
+        // cleared after enqueueing, which wiped the entire queue on every
+        // disconnect.
+        var survivors = _waitingUsers.Where(u => u != userId).ToList();
         _waitingUsers.Clear();
+        foreach (var user in survivors) _waitingUsers.Enqueue(user);
+
         await _redis.SetUserOfflineAsync(userId);
 
         var roomSlug = await _redis.GetStringAsync($"conn:room:{Context.ConnectionId}");
@@ -343,6 +349,108 @@ public class ChatHub : Hub
     public async Task EndMatch(string partnerId)
     {
         await Clients.User(partnerId).SendAsync("PartnerLeft");
+    }
+
+    // ============================================================
+    //  DIRECT INVITE CALLING
+    //  - Caller invokes InviteToCall(targetUserId, message)
+    //  - Target receives "IncomingCall" event with a per-invite id
+    //  - Target invokes AcceptCall(inviteId) or DeclineCall(inviteId)
+    //  - On accept, both sides receive "CallAccepted" with a shared
+    //    livekit room name — they then fetch a LiveKit token from
+    //    POST /api/direct-call/token?roomName=...
+    //  This pairs with the LiveKit-based 2-person call flow rather than
+    //  raw WebRTC P2P. Two reasons: (1) consistent infra with group
+    //  calls, (2) NAT traversal handled by LiveKit's TURN.
+    // ============================================================
+
+    public async Task InviteToCall(string targetUserId, string? message)
+    {
+        var callerId = JwtService.GetUserId(Context.User!).ToString();
+        var callerName = JwtService.GetUsername(Context.User!);
+
+        if (callerId == targetUserId)
+        {
+            await Clients.Caller.SendAsync("Error", "You cannot call yourself");
+            return;
+        }
+
+        // Per-invite handle so accept/decline reference the same call.
+        var inviteId = Guid.NewGuid().ToString("N")[..12];
+        var roomName = $"dc-{inviteId}";
+
+        // 60s TTL — invite auto-expires if no response.
+        await _redis.SetStringAsync(
+            $"directcall:invite:{inviteId}",
+            $"{callerId}:{targetUserId}:{roomName}",
+            TimeSpan.FromSeconds(60));
+
+        await Clients.User(targetUserId).SendAsync("IncomingCall", new
+        {
+            inviteId,
+            callerId,
+            callerName,
+            message,
+            roomName,
+            expiresInSeconds = 60
+        });
+
+        await Clients.Caller.SendAsync("CallInviteSent", new { inviteId, targetUserId, roomName });
+    }
+
+    public async Task AcceptCall(string inviteId)
+    {
+        var accepterId = JwtService.GetUserId(Context.User!).ToString();
+
+        var stored = await _redis.GetStringAsync($"directcall:invite:{inviteId}");
+        if (stored == null)
+        {
+            await Clients.Caller.SendAsync("CallError", new
+            {
+                inviteId,
+                reason = "expired_or_invalid"
+            });
+            return;
+        }
+
+        var parts = stored.Split(':');
+        if (parts.Length != 3)
+        {
+            await Clients.Caller.SendAsync("CallError", new { inviteId, reason = "malformed" });
+            return;
+        }
+        var callerId = parts[0];
+        var targetId = parts[1];
+        var roomName = parts[2];
+
+        if (accepterId != targetId)
+        {
+            await Clients.Caller.SendAsync("CallError", new { inviteId, reason = "not_invited" });
+            return;
+        }
+
+        // Burn the invite — single use.
+        await _redis.DeleteKeyAsync($"directcall:invite:{inviteId}");
+
+        // Notify both sides with the shared room name. Each side
+        // fetches its own LiveKit token via /api/direct-call/token.
+        await Clients.User(callerId).SendAsync("CallAccepted", new { inviteId, roomName });
+        await Clients.User(targetId).SendAsync("CallAccepted", new { inviteId, roomName });
+    }
+
+    public async Task DeclineCall(string inviteId)
+    {
+        var declinerId = JwtService.GetUserId(Context.User!).ToString();
+
+        var stored = await _redis.GetStringAsync($"directcall:invite:{inviteId}");
+        if (stored == null) return; // already expired
+
+        var parts = stored.Split(':');
+        if (parts.Length != 3) return;
+        var callerId = parts[0];
+
+        await _redis.DeleteKeyAsync($"directcall:invite:{inviteId}");
+        await Clients.User(callerId).SendAsync("CallDeclined", new { inviteId, declinerId });
     }
 
     // ── Map message to client DTO ─────────────────────────────

@@ -177,6 +177,76 @@ public class RedisService
     }
 
     // ============================================================
+    //  RANDOM GROUP LOBBIES
+    //  Sorted set of open LiveKit rooms — score = current participant
+    //  count. Lets us pick the most-filled room that still has room
+    //  (good UX — newcomers join an existing convo rather than sitting
+    //  in an empty room).
+    // ============================================================
+
+    private const string RandomGroupOpenKey = "randomgroup:open";
+
+    /// <summary>
+    /// Pick the open lobby with the highest fill (but still under max).
+    /// Returns the room name + current count, or null if none available.
+    /// </summary>
+    public async Task<(string RoomName, int Count)?> FindOpenRandomGroupAsync(int maxParticipants)
+    {
+        // Score range: 1..(max-1). 0 means empty (should already be cleaned).
+        var entries = await _db.SortedSetRangeByScoreWithScoresAsync(
+            RandomGroupOpenKey,
+            start: 0,
+            stop: maxParticipants - 1,
+            order: Order.Descending,
+            take: 1);
+
+        if (entries.Length == 0) return null;
+        var entry = entries[0];
+        return (entry.Element.ToString(), (int)entry.Score);
+    }
+
+    /// <summary>Add a brand-new lobby with one participant.</summary>
+    public async Task RegisterRandomGroupAsync(string roomName)
+    {
+        await _db.SortedSetAddAsync(RandomGroupOpenKey, roomName, 1);
+    }
+
+    /// <summary>
+    /// Increment a lobby's participant count by one. Returns the new count.
+    /// </summary>
+    public async Task<double> IncrementRandomGroupAsync(string roomName)
+    {
+        return await _db.SortedSetIncrementAsync(RandomGroupOpenKey, roomName, 1);
+    }
+
+    /// <summary>
+    /// Decrement participant count. Removes the lobby from the open set
+    /// if it hits zero so it isn't picked for new joins.
+    /// </summary>
+    public async Task<double> DecrementRandomGroupAsync(string roomName)
+    {
+        var newScore = await _db.SortedSetIncrementAsync(RandomGroupOpenKey, roomName, -1);
+        if (newScore <= 0) await _db.SortedSetRemoveAsync(RandomGroupOpenKey, roomName);
+        return newScore;
+    }
+
+    /// <summary>Force-remove a lobby (e.g. after it hits max capacity).</summary>
+    public async Task UnlistRandomGroupAsync(string roomName)
+    {
+        await _db.SortedSetRemoveAsync(RandomGroupOpenKey, roomName);
+    }
+
+    /// <summary>
+    /// Snapshot of all open lobbies with their counts — useful for an
+    /// "active rooms" dashboard or admin view.
+    /// </summary>
+    public async Task<List<(string RoomName, int Count)>> ListRandomGroupsAsync()
+    {
+        var entries = await _db.SortedSetRangeByScoreWithScoresAsync(RandomGroupOpenKey);
+        return entries.Select(e => (e.Element.ToString(), (int)e.Score)).ToList();
+    }
+
+    // ============================================================
     //  GENERIC HELPERS
     // ============================================================
 

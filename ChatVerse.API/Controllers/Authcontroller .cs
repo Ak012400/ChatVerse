@@ -6,8 +6,6 @@ using ChatVerse.Infrastructure.ExternalServices.Email;
 using ChatVerse.Infrastructure.Persistence.Redis;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-using System.Security.Cryptography;
-using System.Text;
 
 namespace ChatVerse.API.Controllers;
 
@@ -100,7 +98,7 @@ public class AuthController : ControllerBase
         if (req.Password.Length < 8)
             return BadRequest(ApiResponse.Fail("Password must be at least 8 characters"));
 
-        var passwordHash = HashPassword(req.Password);
+        var passwordHash = PasswordHasher.Hash(req.Password);
         var (userId, error) = await _postgres.RegisterUserAsync(
             req.Username, req.Email, passwordHash);
 
@@ -167,74 +165,20 @@ public class AuthController : ControllerBase
         // Mark active day
         await _postgres.MarkUserActiveDayAsync(userId!.Value);
 
+        // Pull canonical username + flags from DB so the JWT reflects truth
+        // instead of an email-prefix guess.
+        var user = await _postgres.GetUserAuthByIdAsync(userId.Value);
+        var username = user?.Username ?? req.Email.Split('@')[0];
+        var trustScore = user?.TrustScore ?? (short)60;
+        var ageVerified = user?.AgeVerified ?? false;
+
         // Mint JWT — email now verified
         var token = _jwt.GenerateToken(
             userId: userId.Value,
-            username: req.Email.Split('@')[0], // temp — get real username below
-            isGuest: false,
-            trustScore: 60,  // base + otp_verified delta
-            isEmailVerified: true,
-            ageVerified: false
-        );
-
-        await _redis.SetUserOnlineAsync(userId.Value.ToString());
-
-        // Send welcome email (fire and forget)
-        _ = Task.Run(async () =>
-        {
-            try { await _email.SendWelcomeEmailAsync(req.Email, req.Email.Split('@')[0]); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Welcome email failed"); }
-        });
-
-        return Ok(ApiResponse<object>.Ok(new
-        {
-            token,
-            userId = userId.Value.ToString(),
-            emailVerified = true
-        }, "Email verified successfully"));
-    }
-
-    // ============================================================
-    //  POST /api/auth/login
-    //  Email + password login — returns JWT
-    // ============================================================
-    [HttpPost("login")]
-    [AllowAnonymous]
-    public async Task<IActionResult> Login([FromBody] LoginRequest req)
-    {
-        if (!ModelState.IsValid)
-            return BadRequest(ApiResponse.Fail("Invalid request data"));
-
-        var passwordHash = HashPassword(req.Password);
-
-        var (userId, username, trustScore, isEmailVerified, ageVerified, error)
-            = await _postgres.LoginUserAsync(req.Email, passwordHash);
-
-        if (error != null)
-        {
-            var message = error switch
-            {
-                "INVALID_CREDENTIALS" => "Invalid email or password",
-                "ACCOUNT_BANNED" => "Your account has been banned",
-                "ACCOUNT_SUSPENDED" => "Your account is suspended",
-                _ => "Login failed"
-            };
-            // 401 for invalid creds, 403 for banned/suspended
-            var statusCode = error == "INVALID_CREDENTIALS" ? 401 : 403;
-            return StatusCode(statusCode, ApiResponse.Fail(message));
-        }
-
-        // Mark active day — may clear tenure gate
-        var tenureCleared = await _postgres.MarkUserActiveDayAsync(userId!.Value);
-        if (tenureCleared)
-            _logger.LogInformation("User {UserId} just cleared 7-day tenure gate", userId);
-
-        var token = _jwt.GenerateToken(
-            userId: userId.Value,
-            username: username!,
+            username: username,
             isGuest: false,
             trustScore: trustScore,
-            isEmailVerified: isEmailVerified,
+            isEmailVerified: true,
             ageVerified: ageVerified
         );
 
@@ -244,8 +188,15 @@ public class AuthController : ControllerBase
             username,
             isGuest = false
         });
-
         await _redis.SetUserOnlineAsync(userId.Value.ToString());
+
+        // Send welcome email (fire and forget) — use the real username
+        var welcomeUsername = username;
+        _ = Task.Run(async () =>
+        {
+            try { await _email.SendWelcomeEmailAsync(req.Email, welcomeUsername); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Welcome email failed"); }
+        });
 
         return Ok(ApiResponse<object>.Ok(new
         {
@@ -253,8 +204,92 @@ public class AuthController : ControllerBase
             userId = userId.Value.ToString(),
             username,
             trustScore,
-            isEmailVerified,
-            ageVerified
+            isEmailVerified = true,
+            ageVerified,
+            emailVerified = true  // legacy alias — keep for compat
+        }, "Email verified successfully"));
+    }
+
+    // ============================================================
+    //  POST /api/auth/login
+    //  Email + password login — returns JWT
+    //
+    //  Verification happens in code (not in the stored proc) so we can
+    //  use BCrypt, which embeds a random salt per hash and therefore
+    //  can't be matched by an exact-string SELECT. Legacy SHA-256 hashes
+    //  are still recognised by PasswordHasher.Verify, and silently
+    //  re-hashed to BCrypt on the next successful login.
+    // ============================================================
+    [HttpPost("login")]
+    [AllowAnonymous]
+    public async Task<IActionResult> Login([FromBody] LoginRequest req)
+    {
+        if (!ModelState.IsValid)
+            return BadRequest(ApiResponse.Fail("Invalid request data"));
+
+        var record = await _postgres.GetUserAuthByEmailAsync(req.Email);
+
+        // Generic message to avoid leaking which half (email or password) is wrong.
+        if (record == null || string.IsNullOrEmpty(record.PasswordHash))
+            return StatusCode(401, ApiResponse.Fail("Invalid email or password"));
+
+        // Status gates first — banned/suspended users shouldn't even hit hash compare.
+        if (string.Equals(record.Status, "banned", StringComparison.OrdinalIgnoreCase))
+            return StatusCode(403, ApiResponse.Fail("Your account has been banned"));
+        if (string.Equals(record.Status, "suspended", StringComparison.OrdinalIgnoreCase))
+            return StatusCode(403, ApiResponse.Fail("Your account is suspended"));
+
+        var (isValid, needsRehash) = PasswordHasher.Verify(req.Password, record.PasswordHash);
+        if (!isValid)
+            return StatusCode(401, ApiResponse.Fail("Invalid email or password"));
+
+        // Silently upgrade legacy SHA-256 hashes to BCrypt.
+        if (needsRehash)
+        {
+            try
+            {
+                var newHash = PasswordHasher.Hash(req.Password);
+                await _postgres.UpdatePasswordHashAsync(record.UserId, newHash);
+                _logger.LogInformation("Re-hashed legacy password for user {UserId}", record.UserId);
+            }
+            catch (Exception ex)
+            {
+                // Don't block the login if re-hash fails — try again next time.
+                _logger.LogWarning(ex, "Failed to re-hash legacy password for user {UserId}", record.UserId);
+            }
+        }
+
+        // Mark active day — may clear tenure gate
+        var tenureCleared = await _postgres.MarkUserActiveDayAsync(record.UserId);
+        if (tenureCleared)
+            _logger.LogInformation("User {UserId} just cleared 7-day tenure gate", record.UserId);
+
+        var token = _jwt.GenerateToken(
+            userId: record.UserId,
+            username: record.Username,
+            isGuest: false,
+            trustScore: record.TrustScore,
+            isEmailVerified: record.IsEmailVerified,
+            ageVerified: record.AgeVerified
+        );
+
+        await _redis.SetSessionAsync(record.UserId.ToString(), new
+        {
+            userId = record.UserId.ToString(),
+            username = record.Username,
+            isGuest = false
+        });
+
+        await _redis.SetUserOnlineAsync(record.UserId.ToString());
+
+        return Ok(ApiResponse<object>.Ok(new
+        {
+            token,
+            userId = record.UserId.ToString(),
+            username = record.Username,
+            trustScore = record.TrustScore,
+            isEmailVerified = record.IsEmailVerified,
+            ageVerified = record.AgeVerified
         }, "Login successful"));
     }
 
@@ -312,7 +347,7 @@ public class AuthController : ControllerBase
         if (req.Password.Length < 8)
             return BadRequest(ApiResponse.Fail("Password must be at least 8 characters"));
 
-        var passwordHash = HashPassword(req.Password);
+        var passwordHash = PasswordHasher.Hash(req.Password);
         var (success, error) = await _postgres.UpgradeGuestToUserAsync(
             userId, req.Email, passwordHash);
 
@@ -362,12 +397,6 @@ public class AuthController : ControllerBase
     // ============================================================
     //  Private helpers
     // ============================================================
-
-    private static string HashPassword(string password)
-    {
-        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(password));
-        return Convert.ToHexString(bytes).ToLower();
-    }
 
     private static string GenerateOtpCode()
     {
