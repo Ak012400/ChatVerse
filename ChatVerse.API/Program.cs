@@ -135,7 +135,7 @@ try
     builder.Services.AddSignalR(options =>
     {
         options.EnableDetailedErrors = builder.Environment.IsDevelopment();
-        options.MaximumReceiveMessageSize = 32 * 1024;
+        options.MaximumReceiveMessageSize = 5 *1024 * 1024;
         options.ClientTimeoutInterval = TimeSpan.FromSeconds(60);
         options.KeepAliveInterval = TimeSpan.FromSeconds(15);
     })
