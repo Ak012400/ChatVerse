@@ -1,5 +1,6 @@
 ﻿using ChatVerse.API.Extensions;
 using Microsoft.EntityFrameworkCore;
+using ChatVerse.Infrastructure.ExternalServices.Cloudinary;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -13,13 +14,16 @@ namespace ChatVerse.API.Controllers;
 public class AgeController : ControllerBase
 {
     private readonly PostgresProcService _postgres;
+    private readonly CloudinaryService _cloudinary;
     private readonly ILogger<AgeController> _logger;
 
     public AgeController(
         PostgresProcService postgres,
+        CloudinaryService cloudinary,
         ILogger<AgeController> logger)
     {
         _postgres = postgres;
+        _cloudinary = cloudinary;
         _logger = logger;
     }
 
@@ -171,6 +175,78 @@ public class AgeController : ControllerBase
             docId = docId.ToString(),
             status = "pending",
             message = "Document submitted for review. You will be notified within 24-48 hours."
+        }));
+    }
+
+    // ============================================================
+    //  POST /api/age/doc-upload-file  (multipart/form-data)
+    //  All-in-one: takes the file directly, pushes it to Cloudinary
+    //  (private/authenticated upload) and creates the verification
+    //  record server-side. Frontend doesn't need any Cloudinary keys.
+    // ============================================================
+    [HttpPost("doc-upload-file")]
+    [RequestSizeLimit(10 * 1024 * 1024)] // 10 MB
+    public async Task<IActionResult> SubmitDocumentFile(
+        [FromForm] string docType,
+        [FromForm] IFormFile file)
+    {
+        var userId = JwtService.GetUserId(User);
+
+        var validDocTypes = new[] { "aadhaar", "passport", "driving_license" };
+        if (string.IsNullOrWhiteSpace(docType) ||
+            !validDocTypes.Contains(docType.ToLower()))
+            return BadRequest(ApiResponse.Fail(
+                "Invalid document type. Allowed: aadhaar, passport, driving_license"));
+
+        if (file == null || file.Length == 0)
+            return BadRequest(ApiResponse.Fail("No file uploaded"));
+
+        if (file.Length > 10 * 1024 * 1024)
+            return BadRequest(ApiResponse.Fail("File too large (max 10 MB)"));
+
+        var allowedContent = new[] { "image/jpeg", "image/png", "image/webp", "application/pdf" };
+        if (!allowedContent.Contains(file.ContentType))
+            return BadRequest(ApiResponse.Fail("Unsupported file type. Use JPG, PNG, WEBP, or PDF."));
+
+        // Push to Cloudinary as a private/authenticated asset.
+        await using var stream = file.OpenReadStream();
+        var upload = await _cloudinary.UploadDocumentAsync(stream, file.FileName, userId.ToString());
+
+        if (!upload.Success)
+        {
+            _logger.LogError("Doc upload to Cloudinary failed for user {UserId}: {Err}",
+                userId, upload.Error);
+            return StatusCode(500, ApiResponse.Fail("Could not upload your document. Try again."));
+        }
+
+        // Create the verification record.
+        var (docId, error) = await _postgres.SubmitDocumentVerificationAsync(
+            userId,
+            docType.ToLower(),
+            upload.PublicId,
+            upload.SecureUrl);
+
+        if (error != null)
+        {
+            var message = error switch
+            {
+                "ALREADY_AGE_VERIFIED" => "You are already age verified",
+                "DOC_REVIEW_PENDING"   => "A document is already under review. Please wait.",
+                _ => "Document submission failed"
+            };
+            return BadRequest(ApiResponse.Fail(message));
+        }
+
+        _logger.LogInformation(
+            "Document uploaded + submitted — user {UserId}, docId {DocId}, publicId {PublicId}",
+            userId, docId, upload.PublicId);
+
+        return Ok(ApiResponse<object>.Ok(new
+        {
+            docId = docId.ToString(),
+            status = "pending",
+            bytes = upload.Bytes,
+            message = "Document submitted. You will be notified within 24-48 hours."
         }));
     }
 

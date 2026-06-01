@@ -6,6 +6,7 @@ using ChatVerse.Infrastructure.ExternalServices.Email;
 using ChatVerse.Infrastructure.Persistence.Redis;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using System.Text.Json;
 
 namespace ChatVerse.API.Controllers;
 
@@ -81,7 +82,12 @@ public class AuthController : ControllerBase
 
     // ============================================================
     //  POST /api/auth/register
-    //  Email registration — sends OTP after success
+    //  Stage 1 of OTP-first registration.
+    //
+    //  Nothing is written to user_auth.users yet — we hold the intent
+    //  (username + email + hashed password) in Redis with a short TTL.
+    //  The actual row is only created after the OTP is verified, so a
+    //  user who never completes verification leaves no trace.
     // ============================================================
     [HttpPost("register")]
     [AllowAnonymous]
@@ -89,57 +95,58 @@ public class AuthController : ControllerBase
     {
         if (!ModelState.IsValid)
             return BadRequest(ApiResponse.Fail("Invalid request data"));
-
-        // Basic email format check
         if (!req.Email.Contains('@'))
             return BadRequest(ApiResponse.Fail("Invalid email address"));
-
-        // Password minimum length
         if (req.Password.Length < 8)
             return BadRequest(ApiResponse.Fail("Password must be at least 8 characters"));
+        if (string.IsNullOrWhiteSpace(req.Username) || req.Username.Length < 3)
+            return BadRequest(ApiResponse.Fail("Username must be at least 3 characters"));
 
-        var passwordHash = PasswordHasher.Hash(req.Password);
-        var (userId, error) = await _postgres.RegisterUserAsync(
-            req.Username, req.Email, passwordHash);
+        // Best-effort fast fail — the proc's UNIQUE constraint is the
+        // real guarantee, but checking up front avoids wasting an OTP
+        // and lets the form react instantly.
+        var (emailTaken, usernameTaken) =
+            await _postgres.CheckRegistrationAvailabilityAsync(req.Email, req.Username);
+        if (emailTaken)
+            return Conflict(ApiResponse.Fail("This email is already registered"));
+        if (usernameTaken)
+            return Conflict(ApiResponse.Fail("This username is already taken"));
 
-        if (error != null)
-        {
-            var message = error switch
-            {
-                "EMAIL_TAKEN" => "This email is already registered",
-                "USERNAME_TAKEN" => "This username is already taken",
-                _ => "Registration failed"
-            };
-            return Conflict(ApiResponse.Fail(message));
-        }
-
-        // Check OTP rate limit
+        // Rate-limit OTPs BEFORE doing the work (3 per 15 min per email).
         var allowed = await _redis.TryAllowOtpRequestAsync(req.Email);
         if (!allowed)
-            return StatusCode(429, ApiResponse.Fail("Too many OTP requests. Try again in 15 minutes."));
+            return StatusCode(429, ApiResponse.Fail(
+                "Too many OTP requests. Try again in 15 minutes."));
 
-        // Generate + store OTP
+        // Stage the intent + OTP in Redis.
+        var passwordHash = PasswordHasher.Hash(req.Password);
+        var intent = JsonSerializer.Serialize(new
+        {
+            username = req.Username,
+            email = req.Email,
+            passwordHash
+        });
+        await _redis.SetRegistrationIntentAsync(req.Email, intent);
+
         var otpCode = GenerateOtpCode();
-        var expiresAt = DateTime.UtcNow.AddMinutes(Otp.ExpiryMinutes);
+        await _redis.SetRegistrationOtpAsync(req.Email, otpCode);
 
-        await _postgres.UpsertOtpAsync(req.Email, otpCode, OtpPurpose.EmailVerification, expiresAt);
-
-        // Send OTP email via Brevo
         await _email.SendOtpEmailAsync(req.Email, otpCode, "email_verification");
-        _logger.LogInformation("OTP sent to {Email}", req.Email);
+        _logger.LogInformation("Registration OTP sent to {Email}", req.Email);
 
         return Ok(ApiResponse<object>.Ok(new
         {
-            userId = userId.ToString(),
             email = req.Email,
             otpSent = true,
             expiresIn = $"{Otp.ExpiryMinutes} minutes"
-        }, "Registration successful. Check your email for OTP."));
+        }, "OTP sent. Check your email to finish creating your account."));
     }
 
     // ============================================================
     //  POST /api/auth/verify-otp
-    //  Verify email OTP — returns JWT on success
+    //  Stage 2 of OTP-first registration. Reads the Redis-staged
+    //  intent + OTP, creates the user row, marks email_verified=true,
+    //  applies the +10 trust event, and returns a JWT.
     // ============================================================
     [HttpPost("verify-otp")]
     [AllowAnonymous]
@@ -148,53 +155,95 @@ public class AuthController : ControllerBase
         if (!ModelState.IsValid)
             return BadRequest(ApiResponse.Fail("Invalid request data"));
 
-        var (isValid, userId, message) = await _postgres.VerifyOtpAsync(
-            req.Email, req.Code, OtpPurpose.EmailVerification);
+        var storedOtp = await _redis.GetRegistrationOtpAsync(req.Email);
+        if (storedOtp == null)
+            return BadRequest(ApiResponse.Fail(
+                "OTP has expired or was never requested. Please register again."));
+        if (!string.Equals(storedOtp, req.Code, StringComparison.Ordinal))
+            return BadRequest(ApiResponse.Fail("Invalid OTP code"));
 
-        if (!isValid)
+        var intentJson = await _redis.GetRegistrationIntentAsync(req.Email);
+        if (intentJson == null)
         {
-            var errorMsg = message switch
-            {
-                "OTP_NOT_FOUND" => "Invalid OTP code",
-                "OTP_EXPIRED" => "OTP has expired. Please request a new one.",
-                _ => "OTP verification failed"
-            };
-            return BadRequest(ApiResponse.Fail(errorMsg));
+            // Intent expired before the OTP did — rare edge case (different TTLs).
+            return BadRequest(ApiResponse.Fail(
+                "Your registration session expired. Please register again."));
         }
 
-        // Mark active day
-        await _postgres.MarkUserActiveDayAsync(userId!.Value);
+        var intent = JsonSerializer.Deserialize<RegistrationIntent>(intentJson);
+        if (intent == null)
+            return StatusCode(500, ApiResponse.Fail("Malformed registration intent"));
 
-        // Pull canonical username + flags from DB so the JWT reflects truth
-        // instead of an email-prefix guess.
-        var user = await _postgres.GetUserAuthByIdAsync(userId.Value);
-        var username = user?.Username ?? req.Email.Split('@')[0];
-        var trustScore = user?.TrustScore ?? (short)60;
-        var ageVerified = user?.AgeVerified ?? false;
+        // Now actually create the user row.
+        var (userId, error) = await _postgres.RegisterUserAsync(
+            intent.Username, intent.Email, intent.PasswordHash);
 
-        // Mint JWT — email now verified
+        if (error != null)
+        {
+            // Possible race: someone grabbed the email/username during
+            // the OTP window. Surface the same error the form pre-check
+            // would have given.
+            var message = error switch
+            {
+                "EMAIL_TAKEN"    => "This email was just taken by another signup. Please try a different one.",
+                "USERNAME_TAKEN" => "This username was just taken. Please choose another.",
+                _                => "Registration failed"
+            };
+            return Conflict(ApiResponse.Fail(message));
+        }
+
+        // OTP good + user created — burn the staged data.
+        await _redis.DeleteRegistrationOtpAsync(req.Email);
+        await _redis.DeleteRegistrationIntentAsync(req.Email);
+
+        // Flip the email-verified flag (default insert is false).
+        await _postgres.MarkEmailVerifiedAsync(userId!.Value);
+
+        // Apply OTP-verified trust event (+10). The proc handles the
+        // clamp + ledger insert + denormalised trust_score update.
+        short newTrust = 60;
+        try
+        {
+            var (afterScore, _) = await _postgres.ApplyTrustEventAsync(
+                userId: userId.Value,
+                eventType: TrustEventType.OtpVerified,
+                delta: (short)TrustDeltas.OtpVerified,
+                reason: "Email OTP verified at registration",
+                refSource: "auth"
+            );
+            newTrust = afterScore;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to apply OTP-verified trust event for {UserId}", userId);
+        }
+
+        await _postgres.MarkUserActiveDayAsync(userId.Value);
+
+        // Mint JWT
         var token = _jwt.GenerateToken(
             userId: userId.Value,
-            username: username,
+            username: intent.Username,
             isGuest: false,
-            trustScore: trustScore,
+            trustScore: newTrust,
             isEmailVerified: true,
-            ageVerified: ageVerified
+            ageVerified: false
         );
 
         await _redis.SetSessionAsync(userId.Value.ToString(), new
         {
             userId = userId.Value.ToString(),
-            username,
+            username = intent.Username,
             isGuest = false
         });
         await _redis.SetUserOnlineAsync(userId.Value.ToString());
 
-        // Send welcome email (fire and forget) — use the real username
-        var welcomeUsername = username;
+        // Welcome email (fire and forget)
+        var emailForBg = req.Email;
+        var usernameForBg = intent.Username;
         _ = Task.Run(async () =>
         {
-            try { await _email.SendWelcomeEmailAsync(req.Email, welcomeUsername); }
+            try { await _email.SendWelcomeEmailAsync(emailForBg, usernameForBg); }
             catch (Exception ex) { _logger.LogWarning(ex, "Welcome email failed"); }
         });
 
@@ -202,13 +251,15 @@ public class AuthController : ControllerBase
         {
             token,
             userId = userId.Value.ToString(),
-            username,
-            trustScore,
+            username = intent.Username,
+            trustScore = newTrust,
             isEmailVerified = true,
-            ageVerified,
-            emailVerified = true  // legacy alias — keep for compat
-        }, "Email verified successfully"));
+            ageVerified = false
+        }, "Email verified and account created."));
     }
+
+    // Deserialised shape of the Redis-staged registration intent.
+    private record RegistrationIntent(string Username, string Email, string PasswordHash);
 
     // ============================================================
     //  POST /api/auth/login
@@ -242,6 +293,14 @@ public class AuthController : ControllerBase
         var (isValid, needsRehash) = PasswordHasher.Verify(req.Password, record.PasswordHash);
         if (!isValid)
             return StatusCode(401, ApiResponse.Fail("Invalid email or password"));
+
+        // Belt-and-braces: with the new OTP-first flow this should never
+        // trigger for new accounts, but legacy rows that were created
+        // under the old "register-then-verify" code still might be
+        // unverified. Force them through OTP before letting them in.
+        if (!record.IsEmailVerified)
+            return StatusCode(403, ApiResponse.Fail(
+                "Please verify your email before signing in."));
 
         // Silently upgrade legacy SHA-256 hashes to BCrypt.
         if (needsRehash)
@@ -295,23 +354,29 @@ public class AuthController : ControllerBase
 
     // ============================================================
     //  POST /api/auth/resend-otp
-    //  Resend OTP — rate limited via Redis
+    //  Reissues an OTP for an in-progress registration. Requires that
+    //  a registration intent still be staged in Redis — otherwise the
+    //  caller hasn't started the flow and shouldn't receive an OTP.
     // ============================================================
     [HttpPost("resend-otp")]
     [AllowAnonymous]
     public async Task<IActionResult> ResendOtp([FromBody] ResendOtpRequest req)
     {
+        var intent = await _redis.GetRegistrationIntentAsync(req.Email);
+        if (intent == null)
+            return BadRequest(ApiResponse.Fail(
+                "Your registration session expired. Please register again."));
+
         var allowed = await _redis.TryAllowOtpRequestAsync(req.Email);
         if (!allowed)
-            return StatusCode(429, ApiResponse.Fail("Too many requests. Try again in 15 minutes."));
+            return StatusCode(429, ApiResponse.Fail(
+                "Too many requests. Try again in 15 minutes."));
 
         var otpCode = GenerateOtpCode();
-        var expiresAt = DateTime.UtcNow.AddMinutes(Otp.ExpiryMinutes);
-
-        await _postgres.UpsertOtpAsync(req.Email, otpCode, OtpPurpose.EmailVerification, expiresAt);
+        await _redis.SetRegistrationOtpAsync(req.Email, otpCode);
 
         await _email.SendOtpEmailAsync(req.Email, otpCode, "email_verification");
-        _logger.LogInformation("OTP resent to {Email}", req.Email);
+        _logger.LogInformation("Registration OTP resent to {Email}", req.Email);
 
         return Ok(ApiResponse.Ok("OTP resent successfully"));
     }

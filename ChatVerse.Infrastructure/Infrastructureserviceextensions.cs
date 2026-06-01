@@ -1,4 +1,5 @@
-﻿using ChatVerse.Infrastructure.ExternalServices.Email;
+﻿using ChatVerse.Infrastructure.ExternalServices.Cloudinary;
+using ChatVerse.Infrastructure.ExternalServices.Email;
 using ChatVerse.Infrastructure.ExternalServices.OpenAI;
 using ChatVerse.Infrastructure.Persistence.MongoDB;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
@@ -63,6 +64,12 @@ public static class InfrastructureServiceExtensions
         services.AddScoped<ModerationOrchestrator>();
         // ── LiveKit Service ───────────────────────────────────────────
         services.AddSingleton<LiveKitService>();
+
+        // ── Cloudinary (avatars + private docs) ──────────────────────
+        services.AddHttpClient<CloudinaryService>(client =>
+        {
+            client.Timeout = TimeSpan.FromSeconds(30);
+        });
 
         return services;
     }

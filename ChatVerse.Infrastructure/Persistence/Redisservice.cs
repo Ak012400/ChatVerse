@@ -247,6 +247,52 @@ public class RedisService
     }
 
     // ============================================================
+    //  REGISTRATION INTENT
+    //  Hold the user's submitted username + email + hashed password in
+    //  Redis until the OTP is verified. The actual user row in
+    //  user_auth.users is created only on successful verify — keeps
+    //  the DB free of "zombie" half-registered accounts.
+    // ============================================================
+
+    private static string RegIntentKey(string email) => $"registration:intent:{email.ToLower()}";
+    private static string RegOtpKey(string email)    => $"registration:otp:{email.ToLower()}";
+
+    private static readonly TimeSpan RegIntentTtl = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan RegOtpTtl    = TimeSpan.FromMinutes(10);
+
+    public async Task SetRegistrationIntentAsync(string email, string jsonIntent)
+    {
+        await _db.StringSetAsync(RegIntentKey(email), jsonIntent, RegIntentTtl);
+    }
+
+    public async Task<string?> GetRegistrationIntentAsync(string email)
+    {
+        var val = await _db.StringGetAsync(RegIntentKey(email));
+        return val.HasValue ? (string?)val : null;
+    }
+
+    public async Task DeleteRegistrationIntentAsync(string email)
+    {
+        await _db.KeyDeleteAsync(RegIntentKey(email));
+    }
+
+    public async Task SetRegistrationOtpAsync(string email, string code)
+    {
+        await _db.StringSetAsync(RegOtpKey(email), code, RegOtpTtl);
+    }
+
+    public async Task<string?> GetRegistrationOtpAsync(string email)
+    {
+        var val = await _db.StringGetAsync(RegOtpKey(email));
+        return val.HasValue ? (string?)val : null;
+    }
+
+    public async Task DeleteRegistrationOtpAsync(string email)
+    {
+        await _db.KeyDeleteAsync(RegOtpKey(email));
+    }
+
+    // ============================================================
     //  GENERIC HELPERS
     // ============================================================
 

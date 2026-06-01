@@ -239,6 +239,92 @@ public class PostgresProcService
         await cmd.ExecuteNonQueryAsync();
     }
 
+    /// <summary>
+    /// Fast pre-check for email + username availability. Returns a flag
+    /// for each so we can fail fast in /register before bothering to
+    /// send an OTP. The real uniqueness guarantee still comes from the
+    /// proc's underlying constraint on insert.
+    /// </summary>
+    public async Task<(bool EmailTaken, bool UsernameTaken)> CheckRegistrationAvailabilityAsync(
+        string email, string username)
+    {
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(
+            @"SELECT
+                EXISTS(SELECT 1 FROM user_auth.users WHERE LOWER(email) = LOWER(@p_email)),
+                EXISTS(SELECT 1 FROM user_auth.users WHERE LOWER(username) = LOWER(@p_username))",
+            conn);
+        cmd.Parameters.AddWithValue("p_email", email);
+        cmd.Parameters.AddWithValue("p_username", username);
+
+        await using var reader = await cmd.ExecuteReaderAsync();
+        await reader.ReadAsync();
+        return (reader.GetBoolean(0), reader.GetBoolean(1));
+    }
+
+    /// <summary>
+    /// Flip a user's is_email_verified flag to true. Used after the new
+    /// "OTP-first" registration flow creates the row.
+    /// </summary>
+    public async Task MarkEmailVerifiedAsync(Guid userId)
+    {
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(
+            @"UPDATE user_auth.users
+              SET is_email_verified = TRUE, updated_at = NOW()
+              WHERE id = @p_user_id", conn);
+        cmd.Parameters.AddWithValue("p_user_id", userId);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    // ============================================================
+    //  ADMIN REVIEW PROCS
+    // ============================================================
+
+    /// <summary>
+    /// Admin marks a user report as valid / invalid / dismissed.
+    /// Backing proc handles the trust delta side-effects.
+    /// </summary>
+    public async Task<(bool Success, string? Error)> ReviewReportAsync(
+        Guid reportId, Guid reviewerId, string outcome, string? note)
+    {
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = Proc(conn, "trust.usp_review_report");
+        cmd.Parameters.AddWithValue("p_report_id", reportId);
+        cmd.Parameters.AddWithValue("p_reviewer_id", reviewerId);
+        cmd.Parameters.Add(new NpgsqlParameter("p_outcome", NpgsqlDbType.Varchar) { Value = outcome });
+        cmd.Parameters.AddWithValue("p_review_note", (object?)note ?? DBNull.Value);
+        cmd.Parameters.Add(new NpgsqlParameter("p_success", NpgsqlDbType.Boolean) { Direction = ParameterDirection.Output });
+        cmd.Parameters.Add(new NpgsqlParameter("p_error", NpgsqlDbType.Varchar) { Direction = ParameterDirection.Output });
+        await cmd.ExecuteNonQueryAsync();
+        return (
+            (bool)cmd.Parameters["p_success"].Value!,
+            cmd.Parameters["p_error"].Value == DBNull.Value ? null : (string?)cmd.Parameters["p_error"].Value
+        );
+    }
+
+    /// <summary>
+    /// Admin approves/rejects a document verification. On approve, the
+    /// proc flips users.age_verified=true.
+    /// </summary>
+    public async Task<(bool Success, string? Error)> ReviewDocumentAsync(
+        Guid docId, Guid reviewerId, string outcome, string? rejectReason)
+    {
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = Proc(conn, "iam.usp_review_document_verification");
+        cmd.Parameters.AddWithValue("p_doc_id", docId);
+        cmd.Parameters.AddWithValue("p_reviewer_id", reviewerId);
+        cmd.Parameters.Add(new NpgsqlParameter("p_outcome", NpgsqlDbType.Varchar) { Value = outcome });
+        cmd.Parameters.AddWithValue("p_reject_reason", (object?)rejectReason ?? DBNull.Value);
+        cmd.Parameters.Add(new NpgsqlParameter("p_success", NpgsqlDbType.Boolean) { Direction = ParameterDirection.Output });
+        cmd.Parameters.Add(new NpgsqlParameter("p_error", NpgsqlDbType.Varchar) { Direction = ParameterDirection.Output });
+        await cmd.ExecuteNonQueryAsync();
+        return (
+            (bool)cmd.Parameters["p_success"].Value!,
+            cmd.Parameters["p_error"].Value == DBNull.Value ? null : (string?)cmd.Parameters["p_error"].Value
+        );
+    }
+
     // ============================================================
     //  IAM PROCS
     // ============================================================
