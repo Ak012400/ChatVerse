@@ -290,6 +290,126 @@ public class ChatHub : Hub
         var userId = JwtService.GetUserId(Context.User!).ToString();
         await Clients.Group(roomSlug).SendAsync("MessageReaction", new { messageId, emoji, userId });
     }
+
+    // ============================================================
+    //  DIRECT MESSAGES (DMs)
+    //  Realtime path — persistence + moderation are kicked off here.
+    //  The REST DmsController is a fallback for cold loads / non-hub
+    //  clients. Both routes converge on the same MongoDB collection
+    //  and emit the same "ReceiveDm" payload.
+    // ============================================================
+
+    public async Task SendDm(string recipientId, string content)
+    {
+        if (JwtService.GetIsGuest(Context.User!))
+        {
+            await Clients.Caller.SendAsync("Error", "DMs require a registered account");
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(content) || content.Length > 2000)
+        {
+            await Clients.Caller.SendAsync("Error", "Invalid DM content");
+            return;
+        }
+        if (!Guid.TryParse(recipientId, out _))
+        {
+            await Clients.Caller.SendAsync("Error", "Invalid recipient");
+            return;
+        }
+
+        var senderId = JwtService.GetUserId(Context.User!).ToString();
+        var senderName = JwtService.GetUsername(Context.User!);
+        if (senderId == recipientId)
+        {
+            await Clients.Caller.SendAsync("Error", "You can't DM yourself");
+            return;
+        }
+
+        var convId = Infrastructure.Persistence.MongoDB.MongoService.ConversationIdFor(senderId, recipientId);
+        var dm = new DmMessage
+        {
+            ConversationId = convId,
+            SenderId       = senderId,
+            SenderName     = senderName,
+            RecipientId    = recipientId,
+            Content        = content.Trim(),
+            Type           = "text",
+            CreatedAt      = DateTime.UtcNow,
+        };
+
+        var saved = await _mongo.InsertDmAsync(dm);
+
+        var payload = new
+        {
+            id            = saved.Id,
+            conversationId = saved.ConversationId,
+            senderId      = saved.SenderId,
+            senderName    = saved.SenderName,
+            recipientId   = saved.RecipientId,
+            content       = saved.Content,
+            type          = saved.Type,
+            createdAt     = saved.CreatedAt,
+        };
+
+        // Send to both ends — the sender sees their own message echoed
+        // back so the UI stays simple (single render path for incoming
+        // and outgoing messages).
+        await Clients.Users(new[] { senderId, recipientId }).SendAsync("ReceiveDm", payload);
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var scope = _scopeFactory.CreateScope();
+                var moderation = scope.ServiceProvider
+                    .GetRequiredService<Infrastructure.ExternalServices.OpenAI.ModerationOrchestrator>();
+                await moderation.ModerateMessageAsync(
+                    messageId: saved.Id ?? "",
+                    roomId: convId,
+                    senderId: senderId,
+                    content: content,
+                    roomClients: Clients.Users(new[] { senderId, recipientId })
+                );
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "DM moderation failed for {Id}", saved.Id);
+            }
+        });
+    }
+
+    /// <summary>Lightweight typing indicator for a 1-to-1 thread.</summary>
+    public async Task SendDmTyping(string recipientId)
+    {
+        if (!Guid.TryParse(recipientId, out _)) return;
+        var senderId = JwtService.GetUserId(Context.User!).ToString();
+        var senderName = JwtService.GetUsername(Context.User!);
+        var convId = Infrastructure.Persistence.MongoDB.MongoService.ConversationIdFor(senderId, recipientId);
+        await Clients.User(recipientId).SendAsync("DmTyping", new
+        {
+            conversationId = convId,
+            senderId,
+            senderName,
+        });
+    }
+
+    /// <summary>Mark conversation read + notify the other side.</summary>
+    public async Task MarkDmRead(string otherUserId)
+    {
+        if (!Guid.TryParse(otherUserId, out _)) return;
+        var meId = JwtService.GetUserId(Context.User!).ToString();
+        var convId = Infrastructure.Persistence.MongoDB.MongoService.ConversationIdFor(meId, otherUserId);
+        var n = await _mongo.MarkDmConversationReadAsync(convId, meId);
+        if (n > 0)
+        {
+            await Clients.User(otherUserId).SendAsync("DmRead", new
+            {
+                conversationId = convId,
+                readerId = meId,
+            });
+        }
+    }
+
     // ── 🎲 AUTO-MATCHING LOGIC ──
 
     // ── 🎲 AUTO-MATCHING LOGIC (सुधरा हुआ) ──

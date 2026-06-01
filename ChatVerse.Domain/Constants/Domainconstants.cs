@@ -59,6 +59,7 @@ public static class MongoCollections
     public const string Rooms = "rooms";
     public const string ModerationLogs = "moderation_logs";
     public const string VideoSessions = "video_sessions";
+    public const string DmMessages = "dm_messages";
 }
 
 public static class AgeVerification

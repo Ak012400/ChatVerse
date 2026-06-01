@@ -279,3 +279,27 @@ public class NsfwFlag
     public string Label { get; set; } = default!;
     public double Confidence { get; set; }
 }
+
+// ============================================================
+//  DM (direct message) entity. Lives in dm_messages collection.
+//  ConversationId is deterministic — see DmService.ConvIdFor.
+// ============================================================
+public class DmMessage
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    /// <summary>Stable id derived from sorted (sender, recipient) pair.</summary>
+    public string ConversationId { get; set; } = default!;
+    public string SenderId { get; set; } = default!;
+    public string SenderName { get; set; } = default!;
+    public string RecipientId { get; set; } = default!;
+    public string Content { get; set; } = default!;
+    public string Type { get; set; } = "text";
+    public string? MediaUrl { get; set; }
+    public bool IsRead { get; set; } = false;
+    public bool IsDeleted { get; set; } = false;
+    public DateTime CreatedAt { get; set; }
+    public DateTime? ReadAt { get; set; }
+}

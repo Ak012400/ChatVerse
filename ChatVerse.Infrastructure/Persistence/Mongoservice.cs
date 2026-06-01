@@ -10,7 +10,7 @@ namespace ChatVerse.Infrastructure.Persistence.MongoDB;
 /// All MongoDB access — collections + aggregation pipelines.
 /// No raw queries in controllers — everything goes through here.
 /// </summary>
-public class MongoService
+public partial class MongoService
 {
     private readonly IMongoDatabase _db;
 
@@ -19,6 +19,7 @@ public class MongoService
     private IMongoCollection<Room> Rooms => _db.GetCollection<Room>(MongoCollections.Rooms);
     private IMongoCollection<ModerationLog> ModerationLogs => _db.GetCollection<ModerationLog>(MongoCollections.ModerationLogs);
     private IMongoCollection<VideoSession> VideoSessions => _db.GetCollection<VideoSession>(MongoCollections.VideoSessions);
+    private IMongoCollection<DmMessage> DmMessages => _db.GetCollection<DmMessage>(MongoCollections.DmMessages);
 
     public MongoService(IMongoClient client, string databaseName)
     {
@@ -305,6 +306,145 @@ public class MongoService
     }
 }
 
+// ── DM helpers — kept on partial for proximity ───────────────
+public partial class MongoService
+{
+    /// <summary>
+    /// Deterministic conversation id so both participants see the same
+    /// key regardless of who started the chat. Sort the two UUIDs as
+    /// strings, then join with a dash.
+    /// </summary>
+    public static string ConversationIdFor(string userA, string userB)
+    {
+        var (a, b) = string.CompareOrdinal(userA, userB) <= 0
+            ? (userA, userB)
+            : (userB, userA);
+        return $"dm:{a}-{b}";
+    }
+
+    /// <summary>Persist a new DM and return the saved entity (with id).</summary>
+    public async Task<DmMessage> InsertDmAsync(DmMessage dm)
+    {
+        await DmMessages.InsertOneAsync(dm);
+        return dm;
+    }
+
+    /// <summary>Paginated message history for a single conversation.</summary>
+    public async Task<List<DmMessage>> GetDmThreadAsync(
+        string conversationId, int skip = 0, int limit = Pagination.DefaultPageSize)
+    {
+        var filter = Builders<DmMessage>.Filter.And(
+            Builders<DmMessage>.Filter.Eq(m => m.ConversationId, conversationId),
+            Builders<DmMessage>.Filter.Ne(m => m.IsDeleted, true)
+        );
+
+        return await DmMessages
+            .Find(filter)
+            .SortByDescending(m => m.CreatedAt)
+            .Skip(skip)
+            .Limit(limit)
+            .ToListAsync();
+    }
+
+    /// <summary>
+    /// All conversations involving <paramref name="userId"/>, each with
+    /// the latest message, the other participant's id, and an unread
+    /// count for this user. Sorted newest-activity-first.
+    /// </summary>
+    public async Task<List<DmConversationSummary>> GetUserDmConversationsAsync(string userId)
+    {
+        // Pipeline: match user → sort newest first → group by conv,
+        // first message kept → project fields → sort newest.
+        var matchUser = new BsonDocument("$match", new BsonDocument
+        {
+            { "$or", new BsonArray
+                {
+                    new BsonDocument("senderId", userId),
+                    new BsonDocument("recipientId", userId),
+                }
+            },
+            { "isDeleted", new BsonDocument("$ne", true) }
+        });
+
+        var sortDesc = new BsonDocument("$sort", new BsonDocument("createdAt", -1));
+
+        var group = new BsonDocument("$group", new BsonDocument
+        {
+            { "_id", "$conversationId" },
+            { "lastMessage", new BsonDocument("$first", "$$ROOT") },
+            { "unreadCount", new BsonDocument("$sum",
+                new BsonDocument("$cond", new BsonArray
+                {
+                    new BsonDocument
+                    {
+                        { "$and", new BsonArray
+                            {
+                                new BsonDocument("$eq", new BsonArray { "$recipientId", userId }),
+                                new BsonDocument("$ne", new BsonArray { "$isRead", true }),
+                            }
+                        }
+                    },
+                    1, 0
+                }))
+            }
+        });
+
+        var project = new BsonDocument("$project", new BsonDocument
+        {
+            { "_id", 0 },
+            { "conversationId", "$_id" },
+            { "unreadCount", 1 },
+            { "lastMessage", 1 },
+        });
+
+        var sortByActivity = new BsonDocument("$sort", new BsonDocument("lastMessage.createdAt", -1));
+
+        var pipeline = new[] { matchUser, sortDesc, group, project, sortByActivity };
+        var docs = await DmMessages.Aggregate<BsonDocument>(pipeline).ToListAsync();
+
+        var results = new List<DmConversationSummary>();
+        foreach (var doc in docs)
+        {
+            var last = doc["lastMessage"].AsBsonDocument;
+            var senderId = last.GetValue("senderId", "").AsString;
+            var recipientId = last.GetValue("recipientId", "").AsString;
+            var otherUserId = senderId == userId ? recipientId : senderId;
+
+            results.Add(new DmConversationSummary
+            {
+                ConversationId = doc["conversationId"].AsString,
+                OtherUserId = otherUserId,
+                UnreadCount = doc.GetValue("unreadCount", 0).ToInt32(),
+                LastMessageContent = last.GetValue("content", "").AsString,
+                LastMessageSenderId = senderId,
+                LastMessageAt = last.GetValue("createdAt", BsonNull.Value).IsBsonNull
+                    ? DateTime.MinValue
+                    : last["createdAt"].ToUniversalTime(),
+            });
+        }
+        return results;
+    }
+
+    /// <summary>
+    /// Flip is_read=true on all unread DMs in this conversation that were
+    /// sent TO this user. Returns how many rows were updated so the
+    /// caller can broadcast a "read receipt" event.
+    /// </summary>
+    public async Task<long> MarkDmConversationReadAsync(string conversationId, string userId)
+    {
+        var filter = Builders<DmMessage>.Filter.And(
+            Builders<DmMessage>.Filter.Eq(m => m.ConversationId, conversationId),
+            Builders<DmMessage>.Filter.Eq(m => m.RecipientId, userId),
+            Builders<DmMessage>.Filter.Ne(m => m.IsRead, true)
+        );
+        var update = Builders<DmMessage>.Update
+            .Set(m => m.IsRead, true)
+            .Set(m => m.ReadAt, DateTime.UtcNow);
+        var res = await DmMessages.UpdateManyAsync(filter, update);
+        return res.ModifiedCount;
+    }
+}
+
 // ── Supporting result types ───────────────────────────────────
 public class UserMessageStats
 {
@@ -312,4 +452,14 @@ public class UserMessageStats
     public int FlaggedCount { get; set; }
     public int BlockedCount { get; set; }
     public double FlagRate { get; set; }
+}
+
+public class DmConversationSummary
+{
+    public string ConversationId   { get; set; } = default!;
+    public string OtherUserId      { get; set; } = default!;
+    public int    UnreadCount      { get; set; }
+    public string LastMessageContent  { get; set; } = "";
+    public string LastMessageSenderId { get; set; } = "";
+    public DateTime LastMessageAt  { get; set; }
 }
