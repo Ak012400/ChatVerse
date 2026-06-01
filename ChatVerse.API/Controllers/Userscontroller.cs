@@ -1,4 +1,5 @@
 using ChatVerse.API.Extensions;
+using ChatVerse.Infrastructure.ExternalServices.Cloudinary;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -22,6 +23,8 @@ namespace ChatVerse.API.Controllers;
 public class UsersController : ControllerBase
 {
     private readonly ChatVerseDbContext _db;
+    private readonly PostgresProcService _postgres;
+    private readonly CloudinaryService _cloudinary;
     private readonly ILogger<UsersController> _logger;
 
     private const int DefaultLimit = 10;
@@ -29,9 +32,13 @@ public class UsersController : ControllerBase
 
     public UsersController(
         ChatVerseDbContext db,
+        PostgresProcService postgres,
+        CloudinaryService cloudinary,
         ILogger<UsersController> logger)
     {
         _db = db;
+        _postgres = postgres;
+        _cloudinary = cloudinary;
         _logger = logger;
     }
 
@@ -94,4 +101,102 @@ public class UsersController : ControllerBase
             results
         }));
     }
+
+    // ============================================================
+    //  GET /api/users/me
+    //  Fresh server-side view of the signed-in user. Handy after a
+    //  profile edit when the cached JWT still has the old username.
+    // ============================================================
+    [HttpGet("me")]
+    public async Task<IActionResult> GetMe()
+    {
+        var meId = JwtService.GetUserId(User);
+        var record = await _postgres.GetUserAuthByIdAsync(meId);
+        if (record == null) return NotFound(ApiResponse.Fail("User not found"));
+
+        return Ok(ApiResponse<object>.Ok(new
+        {
+            userId          = record.UserId.ToString(),
+            username        = record.Username,
+            trustScore      = record.TrustScore,
+            isEmailVerified = record.IsEmailVerified,
+            ageVerified     = record.AgeVerified,
+        }));
+    }
+
+    // ============================================================
+    //  PATCH /api/users/me
+    //  Body: { username?: string }
+    //  Only fields the user is allowed to edit themselves.
+    // ============================================================
+    [HttpPatch("me")]
+    public async Task<IActionResult> UpdateMe([FromBody] UpdateMeRequest req)
+    {
+        if (JwtService.GetIsGuest(User))
+            return StatusCode(403, ApiResponse.Fail("Sign up to edit your profile."));
+
+        var meId = JwtService.GetUserId(User);
+
+        if (!string.IsNullOrWhiteSpace(req.Username))
+        {
+            var (ok, error) = await _postgres.UpdateUsernameAsync(meId, req.Username.Trim());
+            if (!ok)
+            {
+                var message = error switch
+                {
+                    "USERNAME_TAKEN"    => "That username is already taken",
+                    "INVALID_USERNAME"  => "Username must be 3–50 characters",
+                    _ => "Could not update username",
+                };
+                return Conflict(ApiResponse.Fail(message));
+            }
+        }
+
+        var record = await _postgres.GetUserAuthByIdAsync(meId);
+        return Ok(ApiResponse<object>.Ok(new
+        {
+            userId   = meId.ToString(),
+            username = record?.Username,
+        }, "Profile updated"));
+    }
+
+    // ============================================================
+    //  POST /api/users/me/avatar  (multipart/form-data)
+    //  Server-side Cloudinary public upload. Stores the CDN URL on
+    //  user_auth.users.avatar_url.
+    // ============================================================
+    [HttpPost("me/avatar")]
+    [RequestSizeLimit(5 * 1024 * 1024)]
+    public async Task<IActionResult> UploadAvatar([FromForm] IFormFile file)
+    {
+        if (JwtService.GetIsGuest(User))
+            return StatusCode(403, ApiResponse.Fail("Sign up to set an avatar."));
+
+        var meId = JwtService.GetUserId(User);
+        if (file == null || file.Length == 0)
+            return BadRequest(ApiResponse.Fail("No file uploaded"));
+        if (file.Length > 5 * 1024 * 1024)
+            return BadRequest(ApiResponse.Fail("Avatar too large (max 5 MB)"));
+
+        var allowedContent = new[] { "image/jpeg", "image/png", "image/webp" };
+        if (!allowedContent.Contains(file.ContentType))
+            return BadRequest(ApiResponse.Fail("Use JPG, PNG, or WEBP"));
+
+        await using var stream = file.OpenReadStream();
+        var upload = await _cloudinary.UploadAvatarAsync(stream, file.FileName, meId.ToString());
+        if (!upload.Success)
+        {
+            _logger.LogError("Avatar upload failed for {UserId}: {Err}", meId, upload.Error);
+            return StatusCode(500, ApiResponse.Fail("Avatar upload failed"));
+        }
+
+        await _postgres.UpdateAvatarUrlAsync(meId, upload.SecureUrl);
+
+        return Ok(ApiResponse<object>.Ok(new
+        {
+            avatarUrl = upload.SecureUrl,
+        }, "Avatar updated"));
+    }
 }
+
+public record UpdateMeRequest(string? Username);

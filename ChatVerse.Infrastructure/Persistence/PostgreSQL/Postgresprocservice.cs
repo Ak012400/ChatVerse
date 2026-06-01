@@ -263,6 +263,47 @@ public class PostgresProcService
     }
 
     /// <summary>
+    /// Update the user's display username. Returns false on conflict.
+    /// Username uniqueness is enforced by the DB UNIQUE constraint.
+    /// </summary>
+    public async Task<(bool Success, string? Error)> UpdateUsernameAsync(Guid userId, string newUsername)
+    {
+        if (string.IsNullOrWhiteSpace(newUsername) || newUsername.Length < 3 || newUsername.Length > 50)
+            return (false, "INVALID_USERNAME");
+
+        var conn = await GetOpenConnectionAsync();
+        try
+        {
+            await using var cmd = new NpgsqlCommand(
+                @"UPDATE user_auth.users
+                  SET username = @p_username, updated_at = NOW()
+                  WHERE id = @p_user_id", conn);
+            cmd.Parameters.AddWithValue("p_username", newUsername);
+            cmd.Parameters.AddWithValue("p_user_id", userId);
+            await cmd.ExecuteNonQueryAsync();
+            return (true, null);
+        }
+        catch (Npgsql.PostgresException ex) when (ex.SqlState == "23505")
+        {
+            // unique_violation
+            return (false, "USERNAME_TAKEN");
+        }
+    }
+
+    /// <summary>Update the avatar URL on the user record.</summary>
+    public async Task UpdateAvatarUrlAsync(Guid userId, string? avatarUrl)
+    {
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(
+            @"UPDATE user_auth.users
+              SET avatar_url = @p_avatar, updated_at = NOW()
+              WHERE id = @p_user_id", conn);
+        cmd.Parameters.AddWithValue("p_avatar", (object?)avatarUrl ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("p_user_id", userId);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>
     /// Flip a user's is_email_verified flag to true. Used after the new
     /// "OTP-first" registration flow creates the row.
     /// </summary>

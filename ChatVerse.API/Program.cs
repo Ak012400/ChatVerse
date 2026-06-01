@@ -2,6 +2,7 @@
 using ChatVerse.API.Hubs;
 using ChatVerse.API.Middleware;
 using ChatVerse.API.Models;
+using ChatVerse.API.Services;
 using ChatVerse.Infrastructure;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.SignalR;
@@ -176,6 +177,11 @@ try
 
     // ── HttpClient ────────────────────────────────────────────────
     builder.Services.AddHttpClient();
+
+    // ── Background services ───────────────────────────────────────
+    // Drives VideoHub's random-1-on-1 queue. Safe to run on multiple
+    // replicas — the Redis LPOP is atomic.
+    builder.Services.AddHostedService<MatchingService>();
 
     var app = builder.Build();
 

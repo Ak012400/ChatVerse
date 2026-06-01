@@ -11,35 +11,20 @@ using Microsoft.AspNetCore.SignalR;
 namespace ChatVerse.API.Hubs;
 
 /// <summary>
-/// VideoHub — designed to be the long-term home for random-match WebRTC.
+/// VideoHub — long-term home for random-1-on-1 WebRTC.
 ///
-/// ⚠ INCOMPLETE — DO NOT POINT FRONTEND HERE YET.
+/// Backend is now COMPLETE — <see cref="ChatVerse.API.Services.MatchingService"/>
+/// runs as a hosted background service, polls the Redis queue every
+/// 500ms, dequeues pairs, persists a <see cref="Domain.Entities.VideoSession"/>
+/// in MongoDB, and emits "MatchFound" to both clients here.
 ///
-/// What works:
-///   - JoinQueue / LeaveQueue (Redis enqueue)
-///   - SendSignal (unified WebRTC signaling)
-///   - SessionReady / EndSession (session lifecycle)
-///   - ReportNsfw (browser-detected NSFW reporting + trust penalty)
-///
-/// What's MISSING:
-///   - A background service (e.g. <c>MatchingService : BackgroundService</c>)
-///     that polls the Redis queue every ~500ms, dequeues two users via
-///     <see cref="RedisService.DequeueForVideoAsync"/>, creates a video
-///     session in MongoDB, and emits "MatchFound" to both clients via
-///     <see cref="Microsoft.AspNetCore.SignalR.IHubContext{VideoHub}"/>.
-///
-/// Until that service exists, random video matching lives in
-/// <see cref="ChatHub"/> (StartAutoMatch / CancelMatch / WebRTC relays).
-/// Frontend currently uses ChatHub for video — see
-/// <c>chatverse-client/src/pages/video/VideoPage.tsx</c>.
-///
-/// Migration plan (when ready):
-///   1. Add <c>MatchingService.cs</c> as a hosted background service.
-///   2. Register it in <c>Program.cs</c> via <c>AddHostedService</c>.
-///   3. Refactor frontend to open a second SignalR connection at
-///      <c>/hubs/video</c> and call JoinQueue / SendSignal.
-///   4. Remove the StartAutoMatch / SendWebRTCOffer/Answer/IceCandidate
-///      methods from ChatHub.
+/// Frontend migration is still pending: <c>VideoPage.tsx</c> currently
+/// drives video through <see cref="ChatHub"/>'s legacy in-memory queue
+/// (StartAutoMatch / SendWebRTCOffer/Answer/IceCandidate). When ready:
+///   1. Open a second SignalR connection at <c>/hubs/video</c>.
+///   2. Replace <c>StartAutoMatch</c> with <c>JoinQueue</c> here.
+///   3. Replace SendWebRTC* relays with the unified <c>SendSignal</c>.
+///   4. Remove the legacy methods from ChatHub.
 /// </summary>
 [Authorize]
 public class VideoHub : Hub

@@ -306,6 +306,34 @@ public partial class MongoService
     }
 }
 
+// ── Private room helpers ────────────────────────────────────
+public partial class MongoService
+{
+    /// <summary>Insert a brand-new user-created room.</summary>
+    public async Task<Room> InsertRoomAsync(Room room) { await Rooms.InsertOneAsync(room); return room; }
+
+    /// <summary>
+    /// Find a room by its invite token (used when a guest follows a
+    /// share-link). Returns null when the link is stale.
+    /// </summary>
+    public async Task<Room?> GetRoomByInviteTokenAsync(string token)
+    {
+        var filter = Builders<Room>.Filter.Eq("inviteToken", token);
+        return await Rooms.Find(filter).FirstOrDefaultAsync();
+    }
+
+    /// <summary>
+    /// Soft-deactivate a room — keeps history but takes it out of all
+    /// active room lists and rejects new joins.
+    /// </summary>
+    public async Task DeactivateRoomAsync(string slug)
+    {
+        var filter = Builders<Room>.Filter.Eq(r => r.Slug, slug);
+        var update = Builders<Room>.Update.Set(r => r.IsActive, false);
+        await Rooms.UpdateOneAsync(filter, update);
+    }
+}
+
 // ── DM helpers — kept on partial for proximity ───────────────
 public partial class MongoService
 {

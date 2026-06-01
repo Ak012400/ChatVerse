@@ -382,6 +382,81 @@ public class AuthController : ControllerBase
     }
 
     // ============================================================
+    //  POST /api/auth/forgot-password
+    //  Always responds 200, regardless of whether the email exists.
+    //  Prevents account-enumeration via timing or status code.
+    // ============================================================
+    [HttpPost("forgot-password")]
+    [AllowAnonymous]
+    public async Task<IActionResult> ForgotPassword([FromBody] ForgotPasswordRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.Email) || !req.Email.Contains('@'))
+            return BadRequest(ApiResponse.Fail("Invalid email"));
+
+        // Rate-limit same as OTP — 3 per 15 min.
+        var allowed = await _redis.TryAllowOtpRequestAsync(req.Email);
+        if (!allowed)
+        {
+            // Still return a generic OK to avoid leaking the throttle.
+            return Ok(ApiResponse.Ok("If that account exists, we've sent a reset code."));
+        }
+
+        var record = await _postgres.GetUserAuthByEmailAsync(req.Email);
+        if (record != null && record.IsEmailVerified)
+        {
+            var code = GenerateOtpCode();
+            await _redis.SetPasswordResetCodeAsync(req.Email, code);
+            try
+            {
+                await _email.SendOtpEmailAsync(req.Email, code, "password_reset");
+                _logger.LogInformation("Password reset code sent to {Email}", req.Email);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Password reset email failed");
+            }
+        }
+
+        // Generic message regardless.
+        return Ok(ApiResponse.Ok("If that account exists, we've sent a reset code."));
+    }
+
+    // ============================================================
+    //  POST /api/auth/reset-password
+    //  Verify code + set a fresh BCrypt hash.
+    // ============================================================
+    [HttpPost("reset-password")]
+    [AllowAnonymous]
+    public async Task<IActionResult> ResetPassword([FromBody] ResetPasswordRequest req)
+    {
+        if (!ModelState.IsValid)
+            return BadRequest(ApiResponse.Fail("Invalid request"));
+        if (req.NewPassword.Length < 8)
+            return BadRequest(ApiResponse.Fail("Password must be at least 8 characters"));
+
+        var stored = await _redis.GetPasswordResetCodeAsync(req.Email);
+        if (stored == null)
+            return BadRequest(ApiResponse.Fail("Reset code has expired. Request a new one."));
+        if (!string.Equals(stored, req.Code, StringComparison.Ordinal))
+            return BadRequest(ApiResponse.Fail("Invalid reset code"));
+
+        var record = await _postgres.GetUserAuthByEmailAsync(req.Email);
+        if (record == null)
+            return BadRequest(ApiResponse.Fail("Account not found"));
+
+        var newHash = PasswordHasher.Hash(req.NewPassword);
+        await _postgres.UpdatePasswordHashAsync(record.UserId, newHash);
+        await _redis.DeletePasswordResetCodeAsync(req.Email);
+
+        // Best-effort: invalidate any active session so other devices are kicked.
+        try { await _redis.DeleteSessionAsync(record.UserId.ToString()); } catch { /* ignore */ }
+
+        _logger.LogInformation("Password reset for user {UserId}", record.UserId);
+
+        return Ok(ApiResponse.Ok("Password updated. Please sign in with your new password."));
+    }
+
+    // ============================================================
     //  POST /api/auth/logout
     //  Invalidate session in Redis
     // ============================================================
@@ -509,4 +584,14 @@ public record VerifyOtpRequest(
 
 public record ResendOtpRequest(
     [System.ComponentModel.DataAnnotations.Required] string Email
+);
+
+public record ForgotPasswordRequest(
+    [System.ComponentModel.DataAnnotations.Required] string Email
+);
+
+public record ResetPasswordRequest(
+    [System.ComponentModel.DataAnnotations.Required] string Email,
+    [System.ComponentModel.DataAnnotations.Required] string Code,
+    [System.ComponentModel.DataAnnotations.Required] string NewPassword
 );

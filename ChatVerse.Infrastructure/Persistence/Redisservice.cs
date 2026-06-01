@@ -293,6 +293,32 @@ public class RedisService
     }
 
     // ============================================================
+    //  PASSWORD RESET
+    //  Single-use code emailed to a user who lost their password.
+    //  Code is stored against the email (not user-id) to avoid
+    //  leaking whether an account exists for that address.
+    // ============================================================
+
+    private static string PwResetKey(string email) => $"password:reset:{email.ToLower()}";
+    private static readonly TimeSpan PwResetTtl = TimeSpan.FromMinutes(15);
+
+    public async Task SetPasswordResetCodeAsync(string email, string code)
+    {
+        await _db.StringSetAsync(PwResetKey(email), code, PwResetTtl);
+    }
+
+    public async Task<string?> GetPasswordResetCodeAsync(string email)
+    {
+        var v = await _db.StringGetAsync(PwResetKey(email));
+        return v.HasValue ? (string?)v : null;
+    }
+
+    public async Task DeletePasswordResetCodeAsync(string email)
+    {
+        await _db.KeyDeleteAsync(PwResetKey(email));
+    }
+
+    // ============================================================
     //  GENERIC HELPERS
     // ============================================================
 
