@@ -318,8 +318,24 @@ public partial class MongoService
     /// </summary>
     public async Task<Room?> GetRoomByInviteTokenAsync(string token)
     {
-        var filter = Builders<Room>.Filter.Eq("inviteToken", token);
+        var filter = Builders<Room>.Filter.Eq(r => r.InviteToken, token);
         return await Rooms.Find(filter).FirstOrDefaultAsync();
+    }
+
+    /// <summary>
+    /// Look up a batch of rooms by slug — used by "my joined private
+    /// rooms" so we can resolve a Redis set of slugs into full
+    /// metadata in a single query.
+    /// </summary>
+    public async Task<List<Room>> GetRoomsBySlugsAsync(IEnumerable<string> slugs)
+    {
+        var list = slugs.ToList();
+        if (list.Count == 0) return new List<Room>();
+        var filter = Builders<Room>.Filter.And(
+            Builders<Room>.Filter.In(r => r.Slug, list),
+            Builders<Room>.Filter.Eq(r => r.IsActive, true)
+        );
+        return await Rooms.Find(filter).ToListAsync();
     }
 
     /// <summary>

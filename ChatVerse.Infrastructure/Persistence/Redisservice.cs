@@ -319,6 +319,32 @@ public class RedisService
     }
 
     // ============================================================
+    //  PER-USER JOINED PRIVATE ROOMS
+    //  A user's "I have access to these private rooms" set, keyed by
+    //  user-id (works for guests too since they get a UUID).
+    // ============================================================
+    private static string JoinedRoomsKey(string userId) => $"user:rooms:{userId}";
+
+    public async Task AddJoinedRoomAsync(string userId, string roomSlug)
+    {
+        var key = JoinedRoomsKey(userId);
+        await _db.SetAddAsync(key, roomSlug);
+        // 1-year sliding TTL — active users keep their membership cached.
+        await _db.KeyExpireAsync(key, TimeSpan.FromDays(365));
+    }
+
+    public async Task<List<string>> GetJoinedRoomsAsync(string userId)
+    {
+        var members = await _db.SetMembersAsync(JoinedRoomsKey(userId));
+        return members.Select(v => (string)v!).ToList();
+    }
+
+    public async Task RemoveJoinedRoomAsync(string userId, string roomSlug)
+    {
+        await _db.SetRemoveAsync(JoinedRoomsKey(userId), roomSlug);
+    }
+
+    // ============================================================
     //  GENERIC HELPERS
     // ============================================================
 

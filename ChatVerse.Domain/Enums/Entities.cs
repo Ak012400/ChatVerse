@@ -216,6 +216,17 @@ public class Room
     public string? CreatedBy { get; set; }
     public RoomStats Stats { get; set; } = new();
     public bool IsActive { get; set; } = true;
+    /// <summary>
+    /// Hidden from the public room list. Visible only to users who
+    /// joined explicitly via an invite token. User-created rooms are
+    /// private by default.
+    /// </summary>
+    public bool IsPrivate { get; set; } = false;
+    /// <summary>
+    /// Shareable token for invite-based joining. NULL for seeded public
+    /// rooms (they don't need one). Stored as a non-guessable GUID.
+    /// </summary>
+    public string? InviteToken { get; set; }
     public DateTime CreatedAt { get; set; }
 }
 
