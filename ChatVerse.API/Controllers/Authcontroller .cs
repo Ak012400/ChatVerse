@@ -170,8 +170,18 @@ public class AuthController : ControllerBase
                 "Your registration session expired. Please register again."));
         }
 
-        var intent = JsonSerializer.Deserialize<RegistrationIntent>(intentJson);
-        if (intent == null)
+        // NOTE: the Redis-staged JSON uses camelCase keys (username/email/passwordHash)
+        // while the record's positional properties are PascalCase. Default JSON
+        // options are case-sensitive, so without this option every field would
+        // deserialise to null and Npgsql would blow up on the next RegisterUserAsync
+        // call with "Parameter 'p_username' must have ... its Value set."
+        var intent = JsonSerializer.Deserialize<RegistrationIntent>(
+            intentJson,
+            new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        if (intent == null
+            || string.IsNullOrWhiteSpace(intent.Username)
+            || string.IsNullOrWhiteSpace(intent.Email)
+            || string.IsNullOrWhiteSpace(intent.PasswordHash))
             return StatusCode(500, ApiResponse.Fail("Malformed registration intent"));
 
         // Now actually create the user row.
