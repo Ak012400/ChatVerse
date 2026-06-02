@@ -3,6 +3,7 @@ using Microsoft.EntityFrameworkCore;
 using Npgsql;
 using NpgsqlTypes;
 using System.Data;
+using System.Net;
 
 namespace ChatVerse.Infrastructure.Persistence.PostgreSQL;
 
@@ -382,7 +383,10 @@ public class PostgresProcService
         //   42883: procedure iam.usp_submit_age_declaration(... p_dob => timestamp without time zone ...) does not exist
         // Force the param type to Date so the function lookup succeeds.
         cmd.Parameters.Add(new NpgsqlParameter("p_dob", NpgsqlDbType.Date) { Value = dob });
-        cmd.Parameters.Add(new NpgsqlParameter("p_ip_address", NpgsqlDbType.Inet) { Value = (object?)ipAddress ?? DBNull.Value });
+
+        // Replace this line:
+        var ip = ipAddress == null ? (object)DBNull.Value : IPAddress.Parse(ipAddress);
+        cmd.Parameters.Add(new NpgsqlParameter("p_ip_address", NpgsqlDbType.Inet) { Value = ip });
         cmd.Parameters.Add(new NpgsqlParameter("p_user_agent", NpgsqlDbType.Text) { Value = (object?)userAgent ?? DBNull.Value });
         cmd.Parameters.Add(new NpgsqlParameter("p_success", NpgsqlDbType.Boolean) { Direction = ParameterDirection.Output });
         cmd.Parameters.Add(new NpgsqlParameter("p_error", NpgsqlDbType.Varchar) { Direction = ParameterDirection.Output });
