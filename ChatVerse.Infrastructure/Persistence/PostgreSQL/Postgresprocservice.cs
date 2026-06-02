@@ -375,10 +375,15 @@ public class PostgresProcService
     {
         var conn = await GetOpenConnectionAsync();
         await using var cmd = Proc(conn, "iam.usp_submit_age_declaration");
-        cmd.Parameters.AddWithValue("p_user_id", userId);
-        cmd.Parameters.AddWithValue("p_dob", dob.ToDateTime(TimeOnly.MinValue));
-        cmd.Parameters.AddWithValue("p_ip_address", (object?)ipAddress ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("p_user_agent", (object?)userAgent ?? DBNull.Value);
+        cmd.Parameters.Add(new NpgsqlParameter("p_user_id", NpgsqlDbType.Uuid) { Value = userId });
+        // IMPORTANT: the proc's p_dob is DATE. Passing DateOnly.ToDateTime(...)
+        // via AddWithValue makes Npgsql infer `timestamp without time zone`,
+        // which doesn't match the proc signature and you get
+        //   42883: procedure iam.usp_submit_age_declaration(... p_dob => timestamp without time zone ...) does not exist
+        // Force the param type to Date so the function lookup succeeds.
+        cmd.Parameters.Add(new NpgsqlParameter("p_dob", NpgsqlDbType.Date) { Value = dob });
+        cmd.Parameters.Add(new NpgsqlParameter("p_ip_address", NpgsqlDbType.Text) { Value = (object?)ipAddress ?? DBNull.Value });
+        cmd.Parameters.Add(new NpgsqlParameter("p_user_agent", NpgsqlDbType.Text) { Value = (object?)userAgent ?? DBNull.Value });
         cmd.Parameters.Add(new NpgsqlParameter("p_success", NpgsqlDbType.Boolean) { Direction = ParameterDirection.Output });
         cmd.Parameters.Add(new NpgsqlParameter("p_error", NpgsqlDbType.Varchar) { Direction = ParameterDirection.Output });
         await cmd.ExecuteNonQueryAsync();
