@@ -1,23 +1,28 @@
-using System.Text;
-using System.Text.Json;
+using Resend;
 
 namespace ChatVerse.Infrastructure.ExternalServices.Email;
 
 /// <summary>
-/// Brevo (formerly Sendinblue) transactional email service.
+/// Transactional email service using Resend's REST API
+/// (https://resend.com). Class name is kept as BrevoEmailService for
+/// backward compatibility with existing callers — internally it's
+/// fully Resend now.
 ///
-/// Templates are intentionally LIGHT-themed and minimal — gradient-heavy
-/// dark emails get flagged by spam filters (especially Outlook/Yahoo),
-/// and Gmail/iOS render light HTML predictably across both color modes.
+/// Why Resend (vs Brevo / SendGrid):
+/// • No IP allow-list — works from Render / any serverless host out
+///   of the box. Brevo's free tier requires whitelisted IPs which
+///   isn't viable on Render's rotating egress IPs.
+/// • 3,000 emails/month + 100/day free, no card required.
+/// • Excellent deliverability, modern API, official .NET SDK.
 ///
-/// We also send a plain-text alternative alongside the HTML — Gmail
-/// computes its spam score partly off the text/html ratio, and a
-/// matching plain version raises deliverability significantly.
+/// To swap to another provider (Postmark, SendGrid, Mailgun) only
+/// the SendEmailAsync internals need to change — the public surface
+/// (SendOtpEmailAsync, SendWelcomeEmailAsync) and the HTML/plain
+/// templates stay the same.
 /// </summary>
 public class BrevoEmailService
 {
-    private readonly HttpClient _http;
-    private readonly string _apiKey;
+    private readonly IResend _resend;
     private readonly string _senderEmail;
     private readonly string _senderName;
     private readonly ILogger<BrevoEmailService> _logger;
@@ -29,24 +34,31 @@ public class BrevoEmailService
     private const string SupportEmail = "support@chatverse.app";
     private const string WebsiteUrl = "https://chatverse.app";
 
-    public BrevoEmailService(
-        HttpClient http,
-        IConfiguration config,
-        ILogger<BrevoEmailService> logger)
+    public BrevoEmailService(IConfiguration config, ILogger<BrevoEmailService> logger)
     {
-        _http = http;
-        _apiKey = config["Brevo:ApiKey"]!;
-        _senderEmail = config["Brevo:SenderEmail"]!;
-        _senderName = config["Brevo:SenderName"]!;
-        _logger = logger;
+        // Prefer Resend:ApiKey but fall back to legacy Brevo:ApiKey so
+        // we don't blow up at startup if env vars haven't been swapped yet.
+        var apiKey = config["Resend:ApiKey"]
+                  ?? config["Brevo:ApiKey"]
+                  ?? throw new InvalidOperationException(
+                       "Resend:ApiKey is missing. Set the Resend__ApiKey env var.");
 
-        _http.BaseAddress = new Uri("https://api.brevo.com/v3/");
-        _http.DefaultRequestHeaders.Add("api-key", _apiKey);
-        _http.DefaultRequestHeaders.Add("accept", "application/json");
+        _resend = ResendClient.Create(apiKey);
+
+        // Sender identity. For testing, use Resend's pre-verified
+        // onboarding@resend.dev. For production, verify your domain
+        // and switch this to e.g. no-reply@chatverse.app.
+        _senderEmail = config["Resend:SenderEmail"]
+                    ?? config["Brevo:SenderEmail"]
+                    ?? "onboarding@resend.dev";
+        _senderName = config["Resend:SenderName"]
+                   ?? config["Brevo:SenderName"]
+                   ?? CompanyName;
+        _logger = logger;
     }
 
     // ============================================================
-    //  Public surface
+    //  Public surface — unchanged from before
     // ============================================================
     public async Task<bool> SendOtpEmailAsync(string toEmail, string otpCode, string purpose)
     {
@@ -80,44 +92,41 @@ public class BrevoEmailService
     }
 
     // ============================================================
-    //  Core send (HTML + plain text + reply-to)
+    //  Core send — Resend EmailSendAsync
     // ============================================================
     private async Task<bool> SendEmailAsync(
         string toEmail, string subject, string htmlContent, string textContent)
     {
         try
         {
-            var payload = new
+            var msg = new EmailMessage
             {
-                sender = new { name = _senderName, email = _senderEmail },
-                to = new[] { new { email = toEmail } },
-                replyTo = new { email = SupportEmail, name = $"{CompanyName} Support" },
-                subject,
-                htmlContent,
-                textContent,
-                // Brevo respects List-Unsubscribe automatically when this is set,
-                // and Gmail uses it to render the unsubscribe link → trust signal.
-                headers = new Dictionary<string, string>
-                {
-                    ["X-Mailer"] = "ChatVerse-Transactional",
-                    ["List-Unsubscribe"] = $"<mailto:{SupportEmail}?subject=Unsubscribe>"
-                }
+                From = $"{_senderName} <{_senderEmail}>",
+                Subject = subject,
+                HtmlBody = htmlContent,
+                TextBody = textContent,
             };
+            msg.To.Add(toEmail);
+            msg.ReplyTo.Add(SupportEmail);
 
-            var json = JsonSerializer.Serialize(payload);
-            var content = new StringContent(json, Encoding.UTF8, "application/json");
+            // List-Unsubscribe + custom mailer header → Gmail trust signals.
+            msg.Headers ??= new Dictionary<string, string>();
+            msg.Headers["X-Mailer"] = "ChatVerse-Transactional";
+            msg.Headers["List-Unsubscribe"] = $"<mailto:{SupportEmail}?subject=Unsubscribe>";
 
-            var response = await _http.PostAsync("smtp/email", content);
+            var resp = await _resend.EmailSendAsync(msg);
 
-            if (response.IsSuccessStatusCode)
+            if (resp.Success)
             {
-                _logger.LogInformation("Email sent to {Email} — Subject: {Subject}", toEmail, subject);
+                _logger.LogInformation(
+                    "Email sent to {Email} — Subject: {Subject} (Resend id: {Id})",
+                    toEmail, subject, resp.Content);
                 return true;
             }
 
-            var error = await response.Content.ReadAsStringAsync();
-            _logger.LogError("Brevo email failed: {StatusCode} — {Error}",
-                response.StatusCode, error);
+            _logger.LogError(
+                "Resend email failed for {Email}: {Status}",
+                toEmail, resp.Exception?.Message ?? "unknown");
             return false;
         }
         catch (Exception ex)
@@ -146,7 +155,6 @@ public class BrevoEmailService
           <title>{{heading}}</title>
         </head>
         <body style="margin:0;padding:0;background:#f4f5f7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1f2328;">
-          <!-- Preheader (hidden, shows in inbox preview) -->
           <div style="display:none;max-height:0;overflow:hidden;mso-hide:all;">
             Your {{CompanyName}} verification code — valid for 10 minutes.
           </div>
@@ -157,7 +165,6 @@ public class BrevoEmailService
                 <table role="presentation" width="520" cellpadding="0" cellspacing="0" border="0"
                        style="max-width:520px;width:100%;background:#ffffff;border:1px solid #e6e8eb;border-radius:12px;overflow:hidden;">
 
-                  <!-- Header -->
                   <tr>
                     <td style="padding:24px 32px;border-bottom:1px solid #eef0f2;">
                       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
@@ -172,13 +179,11 @@ public class BrevoEmailService
                     </td>
                   </tr>
 
-                  <!-- Body -->
                   <tr>
                     <td style="padding:32px;">
                       <h1 style="margin:0 0 12px;font-size:22px;line-height:1.3;font-weight:600;letter-spacing:-0.01em;color:#1f2328;">{{heading}}</h1>
                       <p style="margin:0 0 28px;font-size:15px;line-height:1.6;color:#4a5159;">{{lead}}</p>
 
-                      <!-- OTP block -->
                       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:28px;">
                         <tr>
                           <td align="center" style="background:#f8f9fb;border:1px solid #e6e8eb;border-radius:10px;padding:22px;">
@@ -194,7 +199,6 @@ public class BrevoEmailService
                     </td>
                   </tr>
 
-                  <!-- Footer -->
                   <tr>
                     <td style="padding:20px 32px;border-top:1px solid #eef0f2;background:#fafbfc;">
                       <p style="margin:0 0 6px;font-size:12px;line-height:1.5;color:#6a737d;">
@@ -221,8 +225,6 @@ public class BrevoEmailService
         """;
     }
 
-    // Plain-text version is used by Gmail/Outlook to compute spam score
-    // and is what shows in text-only clients. Keep it mirror-of-HTML.
     private static string BuildOtpText(string heading, string lead, string otpCode)
     {
         var year = DateTime.UtcNow.Year;

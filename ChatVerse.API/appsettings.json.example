@@ -31,9 +31,10 @@
     "ApiSecret": "YOUR_API_SECRET"
   },
 
-  "Brevo": {
-    "ApiKey":      "xkeysib-YOUR_KEY",
-    "SenderEmail": "you@example.com",
+  "Resend": {
+    "_comment": "Transactional email via Resend (https://resend.com). Free tier: 3,000/mo + 100/day, no IP allow-list. Create API key at resend.com/api-keys. For prod, verify your domain and use a sender from it (e.g. no-reply@chatverse.app); for testing, leave SenderEmail as onboarding@resend.dev which Resend pre-verifies.",
+    "ApiKey":      "re_YOUR_RESEND_API_KEY",
+    "SenderEmail": "onboarding@resend.dev",
     "SenderName":  "ChatVerse"
   },
 
@@ -44,6 +45,10 @@
 
   "OpenAI": { "ApiKey": "YOUR_OPENAI_KEY_OR_LEAVE_BLANK" },
   "Groq":   { "ApiKey": "gsk_YOUR_GROQ_KEY" },
+  "Gemini": {
+    "_comment": "Fallback AI provider. Free tier: 1500 req/day on gemini-1.5-flash. Get key from aistudio.google.com. Backend tries Groq first, falls back to Gemini on 429/5xx.",
+    "ApiKey":  "YOUR_GEMINI_KEY"
+  },
 
   "Razorpay": {
     "KeyId":         "rzp_test_YOUR_KEY",

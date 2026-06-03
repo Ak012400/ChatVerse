@@ -53,8 +53,10 @@ public static class InfrastructureServiceExtensions
 
         services.AddScoped<RedisService>();
 
-        // ── Brevo Email ───────────────────────────────────────
-        services.AddHttpClient<BrevoEmailService>();
+        // ── Brevo Email (SMTP path — bypasses Brevo's API IP allow-list) ──
+        // MailKit opens a fresh SMTP connection per send so it doesn't
+        // need pooling. Singleton because config is immutable per process.
+        services.AddSingleton<BrevoEmailService>();
 
         // ── AI chat provider (Groq → Gemini fallback) ────────
         // Used by both text moderation and AiPersonaService so neither
