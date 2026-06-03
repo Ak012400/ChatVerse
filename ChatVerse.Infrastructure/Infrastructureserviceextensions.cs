@@ -56,6 +56,14 @@ public static class InfrastructureServiceExtensions
         // ── Brevo Email ───────────────────────────────────────
         services.AddHttpClient<BrevoEmailService>();
 
+        // ── AI chat provider (Groq → Gemini fallback) ────────
+        // Used by both text moderation and AiPersonaService so neither
+        // is pinned to a single quota.
+        services.AddHttpClient<ChatVerse.Infrastructure.ExternalServices.AI.AiChatProvider>(c =>
+        {
+            c.Timeout = TimeSpan.FromSeconds(20);
+        });
+
         // ── Groq Moderation (free, replaces OpenAI) ──────────
         services.AddHttpClient<OpenAIModerationService>(client =>
         {
@@ -66,10 +74,9 @@ public static class InfrastructureServiceExtensions
         services.AddSingleton<LiveKitService>();
 
         // ── Cloudinary (avatars + private docs) ──────────────────────
-        services.AddHttpClient<CloudinaryService>(client =>
-        {
-            client.Timeout = TimeSpan.FromSeconds(30);
-        });
+        // SDK manages its own HttpClient internally — register as plain
+        // singleton (config + secret are immutable for the process).
+        services.AddSingleton<CloudinaryService>();
 
         return services;
     }
