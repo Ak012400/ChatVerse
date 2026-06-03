@@ -28,9 +28,18 @@ public class AiPersonaService : BackgroundService
     private readonly ILogger<AiPersonaService> _logger;
     private readonly IConfiguration _config;
 
-    private const int ScanIntervalMs = 30_000;       // every 30s
-    private const int IdleThresholdSecs = 45;        // room must be idle this long
-    private const int PostCooldownSecs = 90;         // don't double-post within this
+    // Scan cadence — chosen so a lonely user never waits more than this
+    // before the AI persona shows up. 6s feels near-instant in UX terms.
+    private const int ScanIntervalMs = 6_000;
+
+    // For rooms with multiple humans, AI doesn't barge in mid-conversation —
+    // it only chimes in after this long of silence.
+    private const int IdleThresholdSecsActive = 45;
+
+    // For rooms with ≤1 humans (the "lonely" path), we skip the idle gate
+    // entirely. The cooldown below is what stops the AI from spamming.
+    private const int CooldownSecsLonely = 75;     // AI posts at most once / 75s when alone
+    private const int CooldownSecsActive = 150;    // longer when humans are talking
 
     public AiPersonaService(
         IServiceProvider services,
@@ -106,38 +115,62 @@ public class AiPersonaService : BackgroundService
 
     // ============================================================
     //  Should this room get an AI message right now?
+    //
+    //  Decision tree (online = real human users in the room):
+    //
+    //    online == 0  →  skip (no one's looking, don't burn quota)
+    //    online == 1  →  LONELY path — fast, no idle gate. Single user
+    //                    gets an AI companion within one scan tick (~6s).
+    //                    Throttled only by the 75-second cooldown.
+    //    online >  1  →  ACTIVE path — only chime in after 45s of silence
+    //                    so we never barge in on a real conversation.
+    //                    Throttled by the 150-second cooldown.
     // ============================================================
     private async Task MaybePostInRoomAsync(
         string slug, string roomName,
         MongoService mongo, RedisService redis, AiChatProvider ai,
         DateTime now, CancellationToken ct)
     {
-        // Cooldown: did we (any replica) post here recently?
+        var onlineCount = await redis.GetRoomOnlineCountAsync(slug);
+        if (onlineCount == 0) return; // nobody to see it
+
+        var isLonely = onlineCount == 1;
+
+        // Cooldown check first — cheap, avoids hitting Mongo + Groq
+        // if we just posted. Uses a real string key with explicit TTL
+        // rather than the old "abuse UserOnline helper" approach which
+        // pinned the cooldown to UserOnline's TTL (~5 min) regardless.
         var cooldownKey = $"ai:cooldown:{slug}";
-        var coldExists = await redis.IsUserOnlineAsync(cooldownKey); // re-using helper as KEYS check
-        if (coldExists) return;
+        if (await redis.GetStringAsync(cooldownKey) != null) return;
 
-        // Recent messages — used both for idle check + as Groq context.
+        // Pull recent messages — used both for idle gating (active rooms)
+        // and as conversational context for Groq/Gemini.
         var recent = await mongo.GetRoomMessagesAsync(slug, 0, 8);
-        if (recent.Count == 0)
-        {
-            // Empty room is fine but only post if the room is active enough
-            // that someone will see it — gate on presence > 0.
-            if (await redis.GetRoomOnlineCountAsync(slug) == 0) return;
-        }
-        else
-        {
-            // Idle check — last message must be > IdleThresholdSecs old.
-            var last = recent[0]; // proc returns newest-first
-            if ((now - last.CreatedAt).TotalSeconds < IdleThresholdSecs) return;
-        }
 
-        // Acquire a soft lock (write-once with TTL via existing setter).
-        await redis.SetUserOnlineAsync(cooldownKey); // ~5min TTL, more than enough
+        if (!isLonely && recent.Count > 0)
+        {
+            // ACTIVE room — only chime in once the humans have gone quiet.
+            var last = recent[0]; // proc returns newest-first
+            if ((now - last.CreatedAt).TotalSeconds < IdleThresholdSecsActive) return;
+        }
+        // Lonely path: no idle gate. We post even if the user just sent
+        // a message a second ago — the AI is there to keep them company.
+
+        // Acquire the cooldown lock with an explicit TTL. The cooldown
+        // is different for lonely vs active rooms so a single user gets
+        // more company than a chatty group.
+        var cooldownSecs = isLonely ? CooldownSecsLonely : CooldownSecsActive;
+        await redis.SetStringAsync(cooldownKey, "1", TimeSpan.FromSeconds(cooldownSecs));
 
         var persona = PersonaPool.PickFor(slug, now);
         var reply = await GenerateReplyAsync(persona, roomName, recent, ai, ct);
-        if (string.IsNullOrWhiteSpace(reply)) return;
+        if (string.IsNullOrWhiteSpace(reply))
+        {
+            // Provider failed — release the lock so we can try again
+            // sooner instead of waiting out the full cooldown.
+            await redis.DeleteKeyAsync(cooldownKey);
+            return;
+        }
 
         // Optional typing pre-signal so the message doesn't pop instantly.
         try
@@ -188,6 +221,14 @@ public class AiPersonaService : BackgroundService
         AiChatProvider ai,
         CancellationToken ct)
     {
+        // System prompt is dynamic — when the room is empty / brand-new
+        // user just joined, the persona should greet warmly rather than
+        // reply-to-a-message-that-doesn't-exist.
+        var isOpening = recent.Count == 0;
+        var sceneRule = isOpening
+            ? "- The room is quiet right now. Greet the room warmly with one short line that fits the theme — make a stranger feel welcome, ask something casual they can answer in one sentence."
+            : "- Reply naturally to what people are saying. Don't repeat them. One short message, one open-ended hook at most.";
+
         var system = $$"""
         You are a casual user named {{persona.Username}} hanging out in the chat
         room "{{roomName}}". Your background: {{persona.Description}} You're from {{persona.City}}.
@@ -195,11 +236,9 @@ public class AiPersonaService : BackgroundService
         Rules:
         - Keep replies short (1-2 sentences max).
         - Match the room's tone — casual, warm.
-        - Don't ask many questions in one message; one open-ended hook is fine.
         - Don't mention you are an AI, but never claim to be human if asked directly —
           deflect with humour. Never give medical, legal, or financial advice.
-        - Don't repeat what someone just said back at them.
-        - If the room is empty, post a light conversation starter that fits the room theme.
+        {{sceneRule}}
         """;
 
         var msgs = new List<AiChatProvider.ChatMessage>
@@ -212,8 +251,8 @@ public class AiPersonaService : BackgroundService
         foreach (var m in recent.OrderBy(m => m.CreatedAt))
             msgs.Add(new("user", $"{m.SenderName}: {m.Content}"));
 
-        msgs.Add(new("user", recent.Count == 0
-            ? "(The room is quiet. Drop a casual line that fits this room.)"
+        msgs.Add(new("user", isOpening
+            ? "(You just walked into the room. There's one person here. Greet warmly with one short line that fits the theme.)"
             : "(Reply to the last message naturally.)"));
 
         var reply = await ai.CompleteAsync(
