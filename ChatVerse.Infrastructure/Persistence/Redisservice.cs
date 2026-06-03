@@ -56,6 +56,14 @@ public class RedisService
     //  TTL auto-expires after 5 min — heartbeat renews it
     // ============================================================
 
+    // Global presence set keyed by userId. SADD on online, SREM on
+    // offline. SCARD is O(1) so we can publish a live "1,247 online"
+    // count without scanning keys.
+    private const string PresenceGlobalSet = "presence:global";
+    // Per-room presence sets so each chat room can report its own
+    // "12 active" badge without touching Postgres or Mongo.
+    private static string PresenceRoomSet(string roomSlug) => $"presence:room:{roomSlug}";
+
     public async Task SetUserOnlineAsync(string userId)
     {
         await _db.StringSetAsync(
@@ -63,11 +71,16 @@ public class RedisService
             "1",
             RedisTTL.UserOnline
         );
+        // Add to the global set. We intentionally don't TTL the set
+        // itself — individual membership is removed on disconnect /
+        // by the periodic janitor below.
+        await _db.SetAddAsync(PresenceGlobalSet, userId);
     }
 
     public async Task SetUserOfflineAsync(string userId)
     {
         await _db.KeyDeleteAsync(RedisKeys.UserOnline(userId));
+        await _db.SetRemoveAsync(PresenceGlobalSet, userId);
     }
 
     public async Task<bool> IsUserOnlineAsync(string userId)
@@ -77,10 +90,54 @@ public class RedisService
 
     /// <summary>
     /// Renew online TTL — called every 2 min from SignalR heartbeat.
+    /// Also re-adds the user to the global set in case the prior
+    /// disconnect was a crash that left the set stale.
     /// </summary>
     public async Task RenewOnlineStatusAsync(string userId)
     {
         await _db.KeyExpireAsync(RedisKeys.UserOnline(userId), RedisTTL.UserOnline);
+        await _db.SetAddAsync(PresenceGlobalSet, userId);
+    }
+
+    /// <summary>
+    /// O(1) read of currently-online users. Note: counts logical
+    /// users, not connections — so a user with 3 tabs counts once.
+    /// </summary>
+    public async Task<long> GetGlobalOnlineCountAsync()
+    {
+        return await _db.SetLengthAsync(PresenceGlobalSet);
+    }
+
+    public async Task JoinRoomPresenceAsync(string roomSlug, string userId)
+    {
+        await _db.SetAddAsync(PresenceRoomSet(roomSlug), userId);
+    }
+
+    public async Task LeaveRoomPresenceAsync(string roomSlug, string userId)
+    {
+        await _db.SetRemoveAsync(PresenceRoomSet(roomSlug), userId);
+    }
+
+    public async Task<long> GetRoomOnlineCountAsync(string roomSlug)
+    {
+        return await _db.SetLengthAsync(PresenceRoomSet(roomSlug));
+    }
+
+    /// <summary>
+    /// Returns the current online count for every requested room slug
+    /// in one round-trip. Used by the rooms list to populate badges.
+    /// </summary>
+    public async Task<Dictionary<string, long>> GetRoomOnlineCountsAsync(IEnumerable<string> roomSlugs)
+    {
+        var slugs = roomSlugs.ToArray();
+        if (slugs.Length == 0) return new();
+
+        var batch = _db.CreateBatch();
+        var tasks = slugs.Select(s => batch.SetLengthAsync(PresenceRoomSet(s))).ToArray();
+        batch.Execute();
+        var results = await Task.WhenAll(tasks);
+        return slugs.Zip(results, (slug, count) => (slug, count))
+                    .ToDictionary(p => p.slug, p => p.count);
     }
 
     // ============================================================
@@ -174,6 +231,174 @@ public class RedisService
     public async Task<long> GetVideoQueueLengthAsync()
     {
         return await _db.ListLengthAsync(VideoQueueKey);
+    }
+
+    // ============================================================
+    //  RANDOM GROUP LOBBIES
+    //  Sorted set of open LiveKit rooms — score = current participant
+    //  count. Lets us pick the most-filled room that still has room
+    //  (good UX — newcomers join an existing convo rather than sitting
+    //  in an empty room).
+    // ============================================================
+
+    private const string RandomGroupOpenKey = "randomgroup:open";
+
+    /// <summary>
+    /// Pick the open lobby with the highest fill (but still under max).
+    /// Returns the room name + current count, or null if none available.
+    /// </summary>
+    public async Task<(string RoomName, int Count)?> FindOpenRandomGroupAsync(int maxParticipants)
+    {
+        // Score range: 1..(max-1). 0 means empty (should already be cleaned).
+        var entries = await _db.SortedSetRangeByScoreWithScoresAsync(
+            RandomGroupOpenKey,
+            start: 0,
+            stop: maxParticipants - 1,
+            order: Order.Descending,
+            take: 1);
+
+        if (entries.Length == 0) return null;
+        var entry = entries[0];
+        return (entry.Element.ToString(), (int)entry.Score);
+    }
+
+    /// <summary>Add a brand-new lobby with one participant.</summary>
+    public async Task RegisterRandomGroupAsync(string roomName)
+    {
+        await _db.SortedSetAddAsync(RandomGroupOpenKey, roomName, 1);
+    }
+
+    /// <summary>
+    /// Increment a lobby's participant count by one. Returns the new count.
+    /// </summary>
+    public async Task<double> IncrementRandomGroupAsync(string roomName)
+    {
+        return await _db.SortedSetIncrementAsync(RandomGroupOpenKey, roomName, 1);
+    }
+
+    /// <summary>
+    /// Decrement participant count. Removes the lobby from the open set
+    /// if it hits zero so it isn't picked for new joins.
+    /// </summary>
+    public async Task<double> DecrementRandomGroupAsync(string roomName)
+    {
+        var newScore = await _db.SortedSetIncrementAsync(RandomGroupOpenKey, roomName, -1);
+        if (newScore <= 0) await _db.SortedSetRemoveAsync(RandomGroupOpenKey, roomName);
+        return newScore;
+    }
+
+    /// <summary>Force-remove a lobby (e.g. after it hits max capacity).</summary>
+    public async Task UnlistRandomGroupAsync(string roomName)
+    {
+        await _db.SortedSetRemoveAsync(RandomGroupOpenKey, roomName);
+    }
+
+    /// <summary>
+    /// Snapshot of all open lobbies with their counts — useful for an
+    /// "active rooms" dashboard or admin view.
+    /// </summary>
+    public async Task<List<(string RoomName, int Count)>> ListRandomGroupsAsync()
+    {
+        var entries = await _db.SortedSetRangeByScoreWithScoresAsync(RandomGroupOpenKey);
+        return entries.Select(e => (e.Element.ToString(), (int)e.Score)).ToList();
+    }
+
+    // ============================================================
+    //  REGISTRATION INTENT
+    //  Hold the user's submitted username + email + hashed password in
+    //  Redis until the OTP is verified. The actual user row in
+    //  user_auth.users is created only on successful verify — keeps
+    //  the DB free of "zombie" half-registered accounts.
+    // ============================================================
+
+    private static string RegIntentKey(string email) => $"registration:intent:{email.ToLower()}";
+    private static string RegOtpKey(string email)    => $"registration:otp:{email.ToLower()}";
+
+    private static readonly TimeSpan RegIntentTtl = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan RegOtpTtl    = TimeSpan.FromMinutes(10);
+
+    public async Task SetRegistrationIntentAsync(string email, string jsonIntent)
+    {
+        await _db.StringSetAsync(RegIntentKey(email), jsonIntent, RegIntentTtl);
+    }
+
+    public async Task<string?> GetRegistrationIntentAsync(string email)
+    {
+        var val = await _db.StringGetAsync(RegIntentKey(email));
+        return val.HasValue ? (string?)val : null;
+    }
+
+    public async Task DeleteRegistrationIntentAsync(string email)
+    {
+        await _db.KeyDeleteAsync(RegIntentKey(email));
+    }
+
+    public async Task SetRegistrationOtpAsync(string email, string code)
+    {
+        await _db.StringSetAsync(RegOtpKey(email), code, RegOtpTtl);
+    }
+
+    public async Task<string?> GetRegistrationOtpAsync(string email)
+    {
+        var val = await _db.StringGetAsync(RegOtpKey(email));
+        return val.HasValue ? (string?)val : null;
+    }
+
+    public async Task DeleteRegistrationOtpAsync(string email)
+    {
+        await _db.KeyDeleteAsync(RegOtpKey(email));
+    }
+
+    // ============================================================
+    //  PASSWORD RESET
+    //  Single-use code emailed to a user who lost their password.
+    //  Code is stored against the email (not user-id) to avoid
+    //  leaking whether an account exists for that address.
+    // ============================================================
+
+    private static string PwResetKey(string email) => $"password:reset:{email.ToLower()}";
+    private static readonly TimeSpan PwResetTtl = TimeSpan.FromMinutes(15);
+
+    public async Task SetPasswordResetCodeAsync(string email, string code)
+    {
+        await _db.StringSetAsync(PwResetKey(email), code, PwResetTtl);
+    }
+
+    public async Task<string?> GetPasswordResetCodeAsync(string email)
+    {
+        var v = await _db.StringGetAsync(PwResetKey(email));
+        return v.HasValue ? (string?)v : null;
+    }
+
+    public async Task DeletePasswordResetCodeAsync(string email)
+    {
+        await _db.KeyDeleteAsync(PwResetKey(email));
+    }
+
+    // ============================================================
+    //  PER-USER JOINED PRIVATE ROOMS
+    //  A user's "I have access to these private rooms" set, keyed by
+    //  user-id (works for guests too since they get a UUID).
+    // ============================================================
+    private static string JoinedRoomsKey(string userId) => $"user:rooms:{userId}";
+
+    public async Task AddJoinedRoomAsync(string userId, string roomSlug)
+    {
+        var key = JoinedRoomsKey(userId);
+        await _db.SetAddAsync(key, roomSlug);
+        // 1-year sliding TTL — active users keep their membership cached.
+        await _db.KeyExpireAsync(key, TimeSpan.FromDays(365));
+    }
+
+    public async Task<List<string>> GetJoinedRoomsAsync(string userId)
+    {
+        var members = await _db.SetMembersAsync(JoinedRoomsKey(userId));
+        return members.Select(v => (string)v!).ToList();
+    }
+
+    public async Task RemoveJoinedRoomAsync(string userId, string roomSlug)
+    {
+        await _db.SetRemoveAsync(JoinedRoomsKey(userId), roomSlug);
     }
 
     // ============================================================

@@ -1,4 +1,5 @@
-﻿using ChatVerse.Infrastructure.ExternalServices.Email;
+﻿using ChatVerse.Infrastructure.ExternalServices.Cloudinary;
+using ChatVerse.Infrastructure.ExternalServices.Email;
 using ChatVerse.Infrastructure.ExternalServices.OpenAI;
 using ChatVerse.Infrastructure.Persistence.MongoDB;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
@@ -52,8 +53,18 @@ public static class InfrastructureServiceExtensions
 
         services.AddScoped<RedisService>();
 
-        // ── Brevo Email ───────────────────────────────────────
-        services.AddHttpClient<BrevoEmailService>();
+        // ── Brevo Email (SMTP path — bypasses Brevo's API IP allow-list) ──
+        // MailKit opens a fresh SMTP connection per send so it doesn't
+        // need pooling. Singleton because config is immutable per process.
+        services.AddSingleton<BrevoEmailService>();
+
+        // ── AI chat provider (Groq → Gemini fallback) ────────
+        // Used by both text moderation and AiPersonaService so neither
+        // is pinned to a single quota.
+        services.AddHttpClient<ChatVerse.Infrastructure.ExternalServices.AI.AiChatProvider>(c =>
+        {
+            c.Timeout = TimeSpan.FromSeconds(20);
+        });
 
         // ── Groq Moderation (free, replaces OpenAI) ──────────
         services.AddHttpClient<OpenAIModerationService>(client =>
@@ -63,6 +74,11 @@ public static class InfrastructureServiceExtensions
         services.AddScoped<ModerationOrchestrator>();
         // ── LiveKit Service ───────────────────────────────────────────
         services.AddSingleton<LiveKitService>();
+
+        // ── Cloudinary (avatars + private docs) ──────────────────────
+        // SDK manages its own HttpClient internally — register as plain
+        // singleton (config + secret are immutable for the process).
+        services.AddSingleton<CloudinaryService>();
 
         return services;
     }

@@ -1,0 +1,104 @@
+{
+  "_comment": "Public template — copy to appsettings.json (which is gitignored) and fill in real values. In production (Render), set these as environment variables instead — Render auto-maps ENV__KEY → ENV:KEY in .NET config.",
+
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  },
+  "AllowedHosts": "*",
+
+  "ConnectionStrings": {
+    "PostgreSQL": "Host=YOUR_SUPABASE_HOST;Database=postgres;Username=postgres;Password=YOUR_PASSWORD;SSL Mode=Require;Trust Server Certificate=true",
+    "Redis":      "rediss://default:YOUR_TOKEN@YOUR_UPSTASH_HOST:6379",
+    "MongoDB":    "mongodb+srv://YOUR_USER:YOUR_PASS@YOUR_CLUSTER.mongodb.net/?retryWrites=true&w=majority"
+  },
+
+  "MongoDB": { "DatabaseName": "chatverse" },
+
+  "Jwt": {
+    "_comment": "Generate a 64+ char random secret for production. Never reuse dev secret.",
+    "SecretKey":   "REPLACE_WITH_64_CHAR_RANDOM_SECRET",
+    "Issuer":      "ChatVerse",
+    "Audience":    "ChatVerseUsers",
+    "ExpiryHours": 24
+  },
+
+  "Cloudinary": {
+    "CloudName": "YOUR_CLOUD_NAME",
+    "ApiKey":    "YOUR_API_KEY",
+    "ApiSecret": "YOUR_API_SECRET"
+  },
+
+  "Smtp": {
+    "_comment": "Transactional email via SMTP. Defaults below are for Gmail (free 500/day, no domain required). To use Gmail: enable 2-Step Verification on your Google account, then https://myaccount.google.com/apppasswords → create an app password, paste the 16-char value as Smtp:Password (no spaces). Switch to any other provider by changing only Host / Port / Username / Password.",
+    "Host":      "smtp.gmail.com",
+    "Port":      "587",
+    "Username":  "your-gmail@gmail.com",
+    "Password":  "YOUR_16_CHAR_APP_PASSWORD",
+    "FromEmail": "your-gmail@gmail.com",
+    "FromName":  "ChatVerse"
+  },
+
+  "Google": {
+    "_comment": "OAuth Client ID from console.cloud.google.com → Credentials → Web application. Used to validate id_token from @react-oauth/google on the frontend. Frontend ALSO needs this same value as VITE_GOOGLE_CLIENT_ID.",
+    "ClientId": "YOUR_GOOGLE_OAUTH_CLIENT_ID.apps.googleusercontent.com"
+  },
+
+  "OpenAI": { "ApiKey": "YOUR_OPENAI_KEY_OR_LEAVE_BLANK" },
+  "Groq":   { "ApiKey": "gsk_YOUR_GROQ_KEY" },
+  "Gemini": {
+    "_comment": "Fallback AI provider. Free tier: 1500 req/day on gemini-1.5-flash. Get key from aistudio.google.com. Backend tries Groq first, falls back to Gemini on 429/5xx.",
+    "ApiKey":  "YOUR_GEMINI_KEY"
+  },
+
+  "Razorpay": {
+    "KeyId":         "rzp_test_YOUR_KEY",
+    "KeySecret":     "YOUR_KEY_SECRET",
+    "WebhookSecret": "YOUR_WEBHOOK_SECRET"
+  },
+
+  "LiveKit": {
+    "ApiKey":    "API_YOUR_KEY",
+    "ApiSecret": "YOUR_SECRET",
+    "ServerUrl": "wss://your-project.livekit.cloud"
+  },
+
+  "Ai": {
+    "_comment": "Feature flag for AiPersonaService. When true and Groq:ApiKey set, lightly-active rooms get an occasional message from a stable per-hour persona. Frontend renders 'AI' badge on the message.",
+    "EnablePresence": false
+  },
+
+  "VideoSettings": {
+    "_comment": "ALWAYS set EnableAgeBypass=false in production.",
+    "EnableAgeBypass":           false,
+    "MinimumTrustScoreRequired": 0,
+    "RequiredTier":              "Basic"
+  },
+
+  "Admin": {
+    "_comment": "Allow-listed UUIDs from user_auth.users that get admin dashboard access.",
+    "UserIds": []
+  },
+
+  "Cors": {
+    "_comment": "Production frontend URL(s). E.g. https://chatverse.vercel.app. In Render set as Cors__Origins__0=...",
+    "Origins": [ "https://your-frontend-domain.com" ]
+  },
+
+  "WebRtc": {
+    "_comment": "Xirsys credentials from dashboard → static auth tab.",
+    "StunUrls":       [ "stun:bn-turn2.xirsys.com" ],
+    "TurnUrls":       [
+      "turn:bn-turn2.xirsys.com:80?transport=udp",
+      "turn:bn-turn2.xirsys.com:3478?transport=udp",
+      "turn:bn-turn2.xirsys.com:80?transport=tcp",
+      "turn:bn-turn2.xirsys.com:3478?transport=tcp",
+      "turns:bn-turn2.xirsys.com:443?transport=tcp",
+      "turns:bn-turn2.xirsys.com:5349?transport=tcp"
+    ],
+    "TurnUsername":   "YOUR_XIRSYS_USERNAME",
+    "TurnCredential": "YOUR_XIRSYS_CREDENTIAL"
+  }
+}

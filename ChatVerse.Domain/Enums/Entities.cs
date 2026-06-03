@@ -216,6 +216,17 @@ public class Room
     public string? CreatedBy { get; set; }
     public RoomStats Stats { get; set; } = new();
     public bool IsActive { get; set; } = true;
+    /// <summary>
+    /// Hidden from the public room list. Visible only to users who
+    /// joined explicitly via an invite token. User-created rooms are
+    /// private by default.
+    /// </summary>
+    public bool IsPrivate { get; set; } = false;
+    /// <summary>
+    /// Shareable token for invite-based joining. NULL for seeded public
+    /// rooms (they don't need one). Stored as a non-guessable GUID.
+    /// </summary>
+    public string? InviteToken { get; set; }
     public DateTime CreatedAt { get; set; }
 }
 
@@ -278,4 +289,28 @@ public class NsfwFlag
     public string UserId { get; set; } = default!;
     public string Label { get; set; } = default!;
     public double Confidence { get; set; }
+}
+
+// ============================================================
+//  DM (direct message) entity. Lives in dm_messages collection.
+//  ConversationId is deterministic — see DmService.ConvIdFor.
+// ============================================================
+public class DmMessage
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    /// <summary>Stable id derived from sorted (sender, recipient) pair.</summary>
+    public string ConversationId { get; set; } = default!;
+    public string SenderId { get; set; } = default!;
+    public string SenderName { get; set; } = default!;
+    public string RecipientId { get; set; } = default!;
+    public string Content { get; set; } = default!;
+    public string Type { get; set; } = "text";
+    public string? MediaUrl { get; set; }
+    public bool IsRead { get; set; } = false;
+    public bool IsDeleted { get; set; } = false;
+    public DateTime CreatedAt { get; set; }
+    public DateTime? ReadAt { get; set; }
 }

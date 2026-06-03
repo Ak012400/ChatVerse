@@ -3,6 +3,7 @@ using Microsoft.EntityFrameworkCore;
 using Npgsql;
 using NpgsqlTypes;
 using System.Data;
+using System.Net;
 
 namespace ChatVerse.Infrastructure.Persistence.PostgreSQL;
 
@@ -151,6 +152,222 @@ public class PostgresProcService
     }
 
     // ============================================================
+    //  AUTH HELPERS — raw SQL for BCrypt-based login flow
+    //  The stored procs do exact-match hash comparison which BCrypt
+    //  can't support (per-hash random salts). These helpers let the
+    //  controller fetch the stored hash and verify in code instead.
+    // ============================================================
+
+    public record UserAuthRecord(
+        Guid UserId,
+        string Username,
+        string? PasswordHash,
+        short TrustScore,
+        bool IsEmailVerified,
+        bool AgeVerified,
+        string Status);
+
+    /// <summary>
+    /// Fetch the auth record for a registered user by email.
+    /// Returns null if no user found or the row belongs to a guest.
+    /// </summary>
+    public async Task<UserAuthRecord?> GetUserAuthByEmailAsync(string email)
+    {
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(
+            @"SELECT id, username, password_hash, trust_score, is_email_verified, age_verified, status::text
+              FROM user_auth.users
+              WHERE email = @p_email AND is_guest = false
+              LIMIT 1", conn);
+        cmd.Parameters.AddWithValue("p_email", email);
+
+        await using var reader = await cmd.ExecuteReaderAsync();
+        if (!await reader.ReadAsync()) return null;
+
+        return new UserAuthRecord(
+            UserId: reader.GetGuid(0),
+            Username: reader.GetString(1),
+            PasswordHash: reader.IsDBNull(2) ? null : reader.GetString(2),
+            TrustScore: reader.GetInt16(3),
+            IsEmailVerified: reader.GetBoolean(4),
+            AgeVerified: reader.GetBoolean(5),
+            Status: reader.GetString(6)
+        );
+    }
+
+    /// <summary>
+    /// Fetch a minimal user view by id — used after OTP verify when we
+    /// already know the userId and need the canonical username + flags
+    /// to mint a correct JWT.
+    /// </summary>
+    public async Task<UserAuthRecord?> GetUserAuthByIdAsync(Guid userId)
+    {
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(
+            @"SELECT id, username, password_hash, trust_score, is_email_verified, age_verified, status::text
+              FROM user_auth.users
+              WHERE id = @p_user_id
+              LIMIT 1", conn);
+        cmd.Parameters.AddWithValue("p_user_id", userId);
+
+        await using var reader = await cmd.ExecuteReaderAsync();
+        if (!await reader.ReadAsync()) return null;
+
+        return new UserAuthRecord(
+            UserId: reader.GetGuid(0),
+            Username: reader.GetString(1),
+            PasswordHash: reader.IsDBNull(2) ? null : reader.GetString(2),
+            TrustScore: reader.GetInt16(3),
+            IsEmailVerified: reader.GetBoolean(4),
+            AgeVerified: reader.GetBoolean(5),
+            Status: reader.GetString(6)
+        );
+    }
+
+    /// <summary>
+    /// Update a user's stored password hash. Used to silently re-hash
+    /// legacy SHA-256 passwords to BCrypt after a successful login.
+    /// </summary>
+    public async Task UpdatePasswordHashAsync(Guid userId, string newHash)
+    {
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(
+            @"UPDATE user_auth.users
+              SET password_hash = @p_hash, updated_at = NOW()
+              WHERE id = @p_user_id", conn);
+        cmd.Parameters.AddWithValue("p_hash", newHash);
+        cmd.Parameters.AddWithValue("p_user_id", userId);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>
+    /// Fast pre-check for email + username availability. Returns a flag
+    /// for each so we can fail fast in /register before bothering to
+    /// send an OTP. The real uniqueness guarantee still comes from the
+    /// proc's underlying constraint on insert.
+    /// </summary>
+    public async Task<(bool EmailTaken, bool UsernameTaken)> CheckRegistrationAvailabilityAsync(
+        string email, string username)
+    {
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(
+            @"SELECT
+                EXISTS(SELECT 1 FROM user_auth.users WHERE LOWER(email) = LOWER(@p_email)),
+                EXISTS(SELECT 1 FROM user_auth.users WHERE LOWER(username) = LOWER(@p_username))",
+            conn);
+        cmd.Parameters.AddWithValue("p_email", email);
+        cmd.Parameters.AddWithValue("p_username", username);
+
+        await using var reader = await cmd.ExecuteReaderAsync();
+        await reader.ReadAsync();
+        return (reader.GetBoolean(0), reader.GetBoolean(1));
+    }
+
+    /// <summary>
+    /// Update the user's display username. Returns false on conflict.
+    /// Username uniqueness is enforced by the DB UNIQUE constraint.
+    /// </summary>
+    public async Task<(bool Success, string? Error)> UpdateUsernameAsync(Guid userId, string newUsername)
+    {
+        if (string.IsNullOrWhiteSpace(newUsername) || newUsername.Length < 3 || newUsername.Length > 50)
+            return (false, "INVALID_USERNAME");
+
+        var conn = await GetOpenConnectionAsync();
+        try
+        {
+            await using var cmd = new NpgsqlCommand(
+                @"UPDATE user_auth.users
+                  SET username = @p_username, updated_at = NOW()
+                  WHERE id = @p_user_id", conn);
+            cmd.Parameters.AddWithValue("p_username", newUsername);
+            cmd.Parameters.AddWithValue("p_user_id", userId);
+            await cmd.ExecuteNonQueryAsync();
+            return (true, null);
+        }
+        catch (Npgsql.PostgresException ex) when (ex.SqlState == "23505")
+        {
+            // unique_violation
+            return (false, "USERNAME_TAKEN");
+        }
+    }
+
+    /// <summary>Update the avatar URL on the user record.</summary>
+    public async Task UpdateAvatarUrlAsync(Guid userId, string? avatarUrl)
+    {
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(
+            @"UPDATE user_auth.users
+              SET avatar_url = @p_avatar, updated_at = NOW()
+              WHERE id = @p_user_id", conn);
+        cmd.Parameters.AddWithValue("p_avatar", (object?)avatarUrl ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("p_user_id", userId);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>
+    /// Flip a user's is_email_verified flag to true. Used after the new
+    /// "OTP-first" registration flow creates the row.
+    /// </summary>
+    public async Task MarkEmailVerifiedAsync(Guid userId)
+    {
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(
+            @"UPDATE user_auth.users
+              SET is_email_verified = TRUE, updated_at = NOW()
+              WHERE id = @p_user_id", conn);
+        cmd.Parameters.AddWithValue("p_user_id", userId);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    // ============================================================
+    //  ADMIN REVIEW PROCS
+    // ============================================================
+
+    /// <summary>
+    /// Admin marks a user report as valid / invalid / dismissed.
+    /// Backing proc handles the trust delta side-effects.
+    /// </summary>
+    public async Task<(bool Success, string? Error)> ReviewReportAsync(
+        Guid reportId, Guid reviewerId, string outcome, string? note)
+    {
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = Proc(conn, "trust.usp_review_report");
+        cmd.Parameters.AddWithValue("p_report_id", reportId);
+        cmd.Parameters.AddWithValue("p_reviewer_id", reviewerId);
+        cmd.Parameters.Add(new NpgsqlParameter("p_outcome", NpgsqlDbType.Varchar) { Value = outcome });
+        cmd.Parameters.AddWithValue("p_review_note", (object?)note ?? DBNull.Value);
+        cmd.Parameters.Add(new NpgsqlParameter("p_success", NpgsqlDbType.Boolean) { Direction = ParameterDirection.Output });
+        cmd.Parameters.Add(new NpgsqlParameter("p_error", NpgsqlDbType.Varchar) { Direction = ParameterDirection.Output });
+        await cmd.ExecuteNonQueryAsync();
+        return (
+            (bool)cmd.Parameters["p_success"].Value!,
+            cmd.Parameters["p_error"].Value == DBNull.Value ? null : (string?)cmd.Parameters["p_error"].Value
+        );
+    }
+
+    /// <summary>
+    /// Admin approves/rejects a document verification. On approve, the
+    /// proc flips users.age_verified=true.
+    /// </summary>
+    public async Task<(bool Success, string? Error)> ReviewDocumentAsync(
+        Guid docId, Guid reviewerId, string outcome, string? rejectReason)
+    {
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = Proc(conn, "iam.usp_review_document_verification");
+        cmd.Parameters.AddWithValue("p_doc_id", docId);
+        cmd.Parameters.AddWithValue("p_reviewer_id", reviewerId);
+        cmd.Parameters.Add(new NpgsqlParameter("p_outcome", NpgsqlDbType.Varchar) { Value = outcome });
+        cmd.Parameters.AddWithValue("p_reject_reason", (object?)rejectReason ?? DBNull.Value);
+        cmd.Parameters.Add(new NpgsqlParameter("p_success", NpgsqlDbType.Boolean) { Direction = ParameterDirection.Output });
+        cmd.Parameters.Add(new NpgsqlParameter("p_error", NpgsqlDbType.Varchar) { Direction = ParameterDirection.Output });
+        await cmd.ExecuteNonQueryAsync();
+        return (
+            (bool)cmd.Parameters["p_success"].Value!,
+            cmd.Parameters["p_error"].Value == DBNull.Value ? null : (string?)cmd.Parameters["p_error"].Value
+        );
+    }
+
+    // ============================================================
     //  IAM PROCS
     // ============================================================
 
@@ -159,10 +376,18 @@ public class PostgresProcService
     {
         var conn = await GetOpenConnectionAsync();
         await using var cmd = Proc(conn, "iam.usp_submit_age_declaration");
-        cmd.Parameters.AddWithValue("p_user_id", userId);
-        cmd.Parameters.AddWithValue("p_dob", dob.ToDateTime(TimeOnly.MinValue));
-        cmd.Parameters.AddWithValue("p_ip_address", (object?)ipAddress ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("p_user_agent", (object?)userAgent ?? DBNull.Value);
+        cmd.Parameters.Add(new NpgsqlParameter("p_user_id", NpgsqlDbType.Uuid) { Value = userId });
+        // IMPORTANT: the proc's p_dob is DATE. Passing DateOnly.ToDateTime(...)
+        // via AddWithValue makes Npgsql infer `timestamp without time zone`,
+        // which doesn't match the proc signature and you get
+        //   42883: procedure iam.usp_submit_age_declaration(... p_dob => timestamp without time zone ...) does not exist
+        // Force the param type to Date so the function lookup succeeds.
+        cmd.Parameters.Add(new NpgsqlParameter("p_dob", NpgsqlDbType.Date) { Value = dob });
+
+        // Replace this line:
+        var ip = ipAddress == null ? (object)DBNull.Value : IPAddress.Parse(ipAddress);
+        cmd.Parameters.Add(new NpgsqlParameter("p_ip_address", NpgsqlDbType.Inet) { Value = ip });
+        cmd.Parameters.Add(new NpgsqlParameter("p_user_agent", NpgsqlDbType.Text) { Value = (object?)userAgent ?? DBNull.Value });
         cmd.Parameters.Add(new NpgsqlParameter("p_success", NpgsqlDbType.Boolean) { Direction = ParameterDirection.Output });
         cmd.Parameters.Add(new NpgsqlParameter("p_error", NpgsqlDbType.Varchar) { Direction = ParameterDirection.Output });
         await cmd.ExecuteNonQueryAsync();

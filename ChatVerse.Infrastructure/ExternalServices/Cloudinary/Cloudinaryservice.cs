@@ -1,99 +1,107 @@
-﻿using System.Security.Cryptography;
-using System.Text;
-using System.Text.Json;
+using CloudinaryDotNet;
+using CloudinaryDotNet.Actions;
 
 namespace ChatVerse.Infrastructure.ExternalServices.Cloudinary;
 
 /// <summary>
-/// Cloudinary upload service.
-/// Avatars  → public upload, CDN URL returned
-/// Documents → private/authenticated upload for age verification
+/// Cloudinary upload service. Uses the official CloudinaryDotNet SDK
+/// so we don't have to maintain the signing dance ourselves.
+///
+/// The previous hand-rolled signature implementation was occasionally
+/// triggering Cloudinary's "Upload preset must be specified when using
+/// unsigned upload" — that error path is what the API takes whenever
+/// it can't validate the signature, which is fragile because any
+/// missing or wrongly-ordered param invalidates the hash.
+///
+/// Avatars  → public, overwritable upload (same public_id replaces).
+/// Documents → "authenticated" type, accessed only via signed URL.
 /// </summary>
 public class CloudinaryService
 {
-    private readonly HttpClient _http;
-    private readonly string _cloudName;
-    private readonly string _apiKey;
-    private readonly string _apiSecret;
+    private readonly CloudinaryDotNet.Cloudinary _cloudinary;
     private readonly ILogger<CloudinaryService> _logger;
 
-    public CloudinaryService(
-        HttpClient http,
-        IConfiguration config,
-        ILogger<CloudinaryService> logger)
+    public CloudinaryService(IConfiguration config, ILogger<CloudinaryService> logger)
     {
-        _http = http;
-        _cloudName = config["Cloudinary:CloudName"]!;
-        _apiKey = config["Cloudinary:ApiKey"]!;
-        _apiSecret = config["Cloudinary:ApiSecret"]!;
+        var account = new Account(
+            config["Cloudinary:CloudName"],
+            config["Cloudinary:ApiKey"],
+            config["Cloudinary:ApiSecret"]
+        );
+        _cloudinary = new CloudinaryDotNet.Cloudinary(account) { Api = { Secure = true } };
         _logger = logger;
     }
 
     // ============================================================
-    //  UploadAvatarAsync
-    //  Public upload — CDN URL returned for profile picture
+    //  UploadAvatarAsync — public CDN URL for profile pictures.
+    //  We use a stable public_id (chatverse/avatars/{userId}) +
+    //  overwrite=true so re-uploads replace cleanly instead of
+    //  piling up versions.
     // ============================================================
     public async Task<CloudinaryUploadResult> UploadAvatarAsync(
         Stream fileStream, string fileName, string userId)
     {
         var publicId = $"chatverse/avatars/{userId}";
-        return await UploadAsync(fileStream, fileName, publicId, isPrivate: false);
+
+        var uploadParams = new ImageUploadParams
+        {
+            File = new FileDescription(fileName, fileStream),
+            PublicId = publicId,
+            Overwrite = true,
+            // Pre-bake a smaller, square version so the chat list isn't
+            // pulling 4MB selfies. 256×256 is plenty for an avatar.
+            Transformation = new Transformation()
+                .Width(256).Height(256).Crop("fill").Gravity("face")
+                .Quality("auto").FetchFormat("auto"),
+        };
+
+        return await UploadAsync(uploadParams, publicId);
     }
 
     // ============================================================
-    //  UploadDocumentAsync
-    //  Private upload — for age verification documents
-    //  Access requires signed URL — never publicly accessible
+    //  UploadDocumentAsync — private/authenticated ID document.
+    //  Reachable only via a signed URL with limited expiry.
     // ============================================================
     public async Task<CloudinaryUploadResult> UploadDocumentAsync(
         Stream fileStream, string fileName, string userId)
     {
         var publicId = $"chatverse/docs/{userId}/{Guid.NewGuid()}";
-        return await UploadAsync(fileStream, fileName, publicId, isPrivate: true);
+
+        var uploadParams = new ImageUploadParams
+        {
+            File = new FileDescription(fileName, fileStream),
+            PublicId = publicId,
+            Type = "authenticated",
+            Overwrite = false,
+        };
+
+        return await UploadAsync(uploadParams, publicId);
     }
 
     // ============================================================
-    //  Core upload method
+    //  Core upload — same call site for avatars + docs.
     // ============================================================
     private async Task<CloudinaryUploadResult> UploadAsync(
-        Stream fileStream, string fileName, string publicId, bool isPrivate)
+        ImageUploadParams uploadParams, string fallbackPublicId)
     {
         try
         {
-            var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString();
-            var signature = GenerateSignature(publicId, timestamp, isPrivate);
+            var result = await _cloudinary.UploadAsync(uploadParams);
 
-            using var form = new MultipartFormDataContent();
-            form.Add(new StreamContent(fileStream), "file", fileName);
-            form.Add(new StringContent(publicId), "public_id");
-            form.Add(new StringContent(timestamp), "timestamp");
-            form.Add(new StringContent(_apiKey), "api_key");
-            form.Add(new StringContent(signature), "signature");
-
-            if (isPrivate)
-                form.Add(new StringContent("authenticated"), "type");
-
-            var url = $"https://api.cloudinary.com/v1_1/{_cloudName}/auto/upload";
-            var response = await _http.PostAsync(url, form);
-            var body = await response.Content.ReadAsStringAsync();
-
-            if (!response.IsSuccessStatusCode)
+            if (result.Error != null)
             {
-                _logger.LogError("Cloudinary upload failed: {Status} — {Body}",
-                    response.StatusCode, body);
-                return CloudinaryUploadResult.Failed("Upload failed");
+                _logger.LogError("Cloudinary upload failed: {Status} — {Msg}",
+                    result.StatusCode, result.Error.Message);
+                return CloudinaryUploadResult.Failed(result.Error.Message);
             }
-
-            var result = JsonSerializer.Deserialize<CloudinaryResponse>(body,
-                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
 
             return new CloudinaryUploadResult
             {
                 Success = true,
-                PublicId = result?.PublicId ?? publicId,
-                SecureUrl = result?.SecureUrl ?? "",
-                Format = result?.Format ?? "",
-                Bytes = result?.Bytes ?? 0
+                PublicId = result.PublicId ?? fallbackPublicId,
+                SecureUrl = result.SecureUrl?.ToString() ?? "",
+                Format = result.Format ?? "",
+                Bytes = result.Bytes,
             };
         }
         catch (Exception ex)
@@ -104,32 +112,21 @@ public class CloudinaryService
     }
 
     // ============================================================
-    //  GenerateSignedUrl
-    //  For private documents — generates temporary access URL
+    //  GenerateSignedUrl — temporary access to a private document.
+    //  Default expiry = 1 hour, enough for an admin review session.
     // ============================================================
     public string GenerateSignedUrl(string publicId, int expirySeconds = 3600)
     {
-        var expireAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds() + expirySeconds;
-        var signature = GenerateSignature(publicId, expireAt.ToString(), true);
-
-        return $"https://res.cloudinary.com/{_cloudName}/image/authenticated/" +
-               $"s--{signature[..8]}--/e_expires:{expireAt}/{publicId}";
-    }
-
-    // ── SHA1 signature for Cloudinary API ────────────────────
-    private string GenerateSignature(string publicId, string timestamp, bool isPrivate)
-    {
-        var toSign = $"public_id={publicId}&timestamp={timestamp}";
-        if (isPrivate) toSign += "&type=authenticated";
-        toSign += _apiSecret;
-
-        using var sha1 = SHA1.Create();
-        var bytes = sha1.ComputeHash(Encoding.UTF8.GetBytes(toSign));
-        return Convert.ToHexString(bytes).ToLower();
+        return _cloudinary.Api.UrlImgUp
+            .Secure(true)
+            .Source(publicId)
+            .Action("authenticated")
+            .Signed(true)
+            .BuildUrl();
     }
 }
 
-// ── Result + response models ──────────────────────────────────
+// ── Result model (unchanged shape so callers don't need updates) ──
 public class CloudinaryUploadResult
 {
     public bool Success { get; set; }
@@ -144,12 +141,4 @@ public class CloudinaryUploadResult
         Success = false,
         Error = error
     };
-}
-
-public class CloudinaryResponse
-{
-    public string? PublicId { get; set; }
-    public string? SecureUrl { get; set; }
-    public string? Format { get; set; }
-    public long Bytes { get; set; }
 }

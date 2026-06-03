@@ -10,6 +10,22 @@ using Microsoft.AspNetCore.SignalR;
 
 namespace ChatVerse.API.Hubs;
 
+/// <summary>
+/// VideoHub — long-term home for random-1-on-1 WebRTC.
+///
+/// Backend is now COMPLETE — <see cref="ChatVerse.API.Services.MatchingService"/>
+/// runs as a hosted background service, polls the Redis queue every
+/// 500ms, dequeues pairs, persists a <see cref="Domain.Entities.VideoSession"/>
+/// in MongoDB, and emits "MatchFound" to both clients here.
+///
+/// Frontend migration is still pending: <c>VideoPage.tsx</c> currently
+/// drives video through <see cref="ChatHub"/>'s legacy in-memory queue
+/// (StartAutoMatch / SendWebRTCOffer/Answer/IceCandidate). When ready:
+///   1. Open a second SignalR connection at <c>/hubs/video</c>.
+///   2. Replace <c>StartAutoMatch</c> with <c>JoinQueue</c> here.
+///   3. Replace SendWebRTC* relays with the unified <c>SendSignal</c>.
+///   4. Remove the legacy methods from ChatHub.
+/// </summary>
 [Authorize]
 public class VideoHub : Hub
 {

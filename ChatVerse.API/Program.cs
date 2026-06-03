@@ -1,6 +1,8 @@
 ﻿using ChatVerse.API.Extensions;
 using ChatVerse.API.Hubs;
 using ChatVerse.API.Middleware;
+using ChatVerse.API.Models;
+using ChatVerse.API.Services;
 using ChatVerse.Infrastructure;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.SignalR;
@@ -13,6 +15,16 @@ using System.Text;
 try
 {
     var builder = WebApplication.CreateBuilder(args);
+
+    // ── Render / container PORT binding ───────────────────────────
+    // Render injects a dynamic PORT env var and expects the app to
+    // listen on http://0.0.0.0:$PORT. Locally we fall back to the
+    // ports declared in launchSettings.json so dev unchanged.
+    var portEnv = Environment.GetEnvironmentVariable("PORT");
+    if (!string.IsNullOrWhiteSpace(portEnv))
+    {
+        builder.WebHost.UseUrls($"http://0.0.0.0:{portEnv}");
+    }
 
     // ── Controllers ───────────────────────────────────────────────
     builder.Services.AddControllers();
@@ -45,6 +57,8 @@ try
 
     // ── Infrastructure (PostgreSQL + MongoDB + Redis) ─────────────
     builder.Services.AddInfrastructure(builder.Configuration);
+    // Program.cs
+    builder.Services.Configure<VideoSettings>(builder.Configuration.GetSection("VideoSettings"));
 
     // ── JwtService ────────────────────────────────────────────────
     builder.Services.AddSingleton<JwtService>();
@@ -135,7 +149,7 @@ try
     builder.Services.AddSignalR(options =>
     {
         options.EnableDetailedErrors = builder.Environment.IsDevelopment();
-        options.MaximumReceiveMessageSize = 32 * 1024;
+        options.MaximumReceiveMessageSize = 5 *1024 * 1024;
         options.ClientTimeoutInterval = TimeSpan.FromSeconds(60);
         options.KeepAliveInterval = TimeSpan.FromSeconds(15);
     })
@@ -150,20 +164,36 @@ try
     });
 
     // ── CORS ──────────────────────────────────────────────────────
+    // Production origins are config-driven so we don't have to rebuild the
+    // image whenever the frontend gets a new domain. Set "Cors:Origins"
+    // (string[]) in appsettings.Production.json OR via env var
+    // `Cors__Origins__0=https://yourdomain.com` (one per index).
     builder.Services.AddCors(options =>
     {
         options.AddPolicy("ChatVerseCors", policy =>
         {
             if (builder.Environment.IsDevelopment())
             {
-                policy.WithOrigins("http://localhost:5173", "https://localhost:5173", "http://localhost:5174", "https://localhost:5174")
+                policy.WithOrigins(
+                          "http://localhost:5173", "https://localhost:5173",
+                          "http://localhost:5174", "https://localhost:5174")
                       .AllowAnyHeader()
                       .AllowAnyMethod()
                       .AllowCredentials();
             }
             else
             {
-                policy.WithOrigins("https://chatverse.app")
+                var configured = builder.Configuration
+                    .GetSection("Cors:Origins")
+                    .Get<string[]>() ?? Array.Empty<string>();
+
+                // Fallback to a safe default if no config provided — keeps
+                // old behaviour, but log loudly so we notice.
+                var origins = configured.Length > 0
+                    ? configured
+                    : new[] { "https://chatverse.app" };
+
+                policy.WithOrigins(origins)
                       .AllowAnyHeader()
                       .AllowAnyMethod()
                       .AllowCredentials();
@@ -173,6 +203,15 @@ try
 
     // ── HttpClient ────────────────────────────────────────────────
     builder.Services.AddHttpClient();
+
+    // ── Background services ───────────────────────────────────────
+    // Drives VideoHub's random-1-on-1 queue. Safe to run on multiple
+    // replicas — the Redis LPOP is atomic.
+    builder.Services.AddHostedService<MatchingService>();
+
+    // AI host that posts in lightly-active rooms. No-op unless
+    // Ai:EnablePresence=true AND a Groq key is set, so safe to register.
+    builder.Services.AddHostedService<AiPersonaService>();
 
     var app = builder.Build();
 
@@ -187,22 +226,37 @@ try
         });
     }
 
-    app.UseHttpsRedirection();
+    // HTTPS redirect only in dev — Render terminates SSL upstream,
+    // so the container itself speaks plain HTTP. Forcing a redirect
+    // inside the container causes redirect loops behind the LB.
+    if (app.Environment.IsDevelopment())
+    {
+        app.UseHttpsRedirection();
+    }
+
     app.UseGlobalExceptionHandler();
     app.UseCors("ChatVerseCors");
     app.UseAuthentication();
     app.UseAuthorization();
 
+    // Health check — Render hits this to know the container is alive.
+    // Returns plain text so it's cheap and proxy-friendly.
+    app.MapGet("/healthz", () => Results.Ok(new { status = "ok", time = DateTime.UtcNow }))
+       .AllowAnonymous();
+
     app.MapControllers();
     app.MapHub<ChatHub>("/hubs/chat");
-    app.MapHub<VideoHub>("/hubs/video"); // uncomment when ready
+    app.MapHub<VideoHub>("/hubs/video");
 
     app.Run();
 }
 catch (Exception ex)
 {
-    Console.WriteLine("STARTUP ERROR: " + ex.Message);
-    Console.WriteLine(ex.StackTrace);
-    Console.ReadKey();
+    // Don't ReadKey() in containerised hosts — it hangs forever
+    // waiting on a stdin that never arrives. Just log + exit non-zero
+    // so Render shows the crash and restarts.
+    Console.Error.WriteLine("STARTUP ERROR: " + ex.Message);
+    Console.Error.WriteLine(ex.StackTrace);
+    Environment.Exit(1);
 }
 

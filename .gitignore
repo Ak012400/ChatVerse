@@ -361,3 +361,29 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# ──────────────────────────────────────────────────────────────
+# ChatVerse — secrets / local config
+# NEVER commit appsettings.json to git. It has Postgres/Mongo/
+# Redis passwords, JWT secret, Cloudinary keys, etc.
+# Use appsettings.json.example as the public template instead,
+# and load real values via Render/Vercel env vars in production.
+# ──────────────────────────────────────────────────────────────
+appsettings.json
+appsettings.*.json
+!appsettings.json.example
+
+# Local override files devs may keep
+appsettings.Development.json
+appsettings.Local.json
+
+# Frontend env files
+chatverse-client/.env
+chatverse-client/.env.local
+chatverse-client/.env.*.local
+.env
+.env.local
+
+# OS junk
+.DS_Store
+Thumbs.db
