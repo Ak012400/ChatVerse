@@ -31,11 +31,14 @@
     "ApiSecret": "YOUR_API_SECRET"
   },
 
-  "Resend": {
-    "_comment": "Transactional email via Resend (https://resend.com). Free tier: 3,000/mo + 100/day, no IP allow-list. Create API key at resend.com/api-keys. For prod, verify your domain and use a sender from it (e.g. no-reply@chatverse.app); for testing, leave SenderEmail as onboarding@resend.dev which Resend pre-verifies.",
-    "ApiKey":      "re_YOUR_RESEND_API_KEY",
-    "SenderEmail": "onboarding@resend.dev",
-    "SenderName":  "ChatVerse"
+  "Smtp": {
+    "_comment": "Transactional email via SMTP. Defaults below are for Gmail (free 500/day, no domain required). To use Gmail: enable 2-Step Verification on your Google account, then https://myaccount.google.com/apppasswords → create an app password, paste the 16-char value as Smtp:Password (no spaces). Switch to any other provider by changing only Host / Port / Username / Password.",
+    "Host":      "smtp.gmail.com",
+    "Port":      "587",
+    "Username":  "your-gmail@gmail.com",
+    "Password":  "YOUR_16_CHAR_APP_PASSWORD",
+    "FromEmail": "your-gmail@gmail.com",
+    "FromName":  "ChatVerse"
   },
 
   "Google": {

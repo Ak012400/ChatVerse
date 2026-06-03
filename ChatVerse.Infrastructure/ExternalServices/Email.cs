@@ -1,28 +1,32 @@
-using Resend;
+using MailKit.Net.Smtp;
+using MailKit.Security;
+using MimeKit;
 
 namespace ChatVerse.Infrastructure.ExternalServices.Email;
 
 /// <summary>
-/// Transactional email service using Resend's REST API
-/// (https://resend.com). Class name is kept as BrevoEmailService for
-/// backward compatibility with existing callers — internally it's
-/// fully Resend now.
+/// Transactional email service via plain SMTP. Default config targets
+/// Gmail SMTP (free 500/day, no domain required) but Smtp:Host /
+/// Smtp:Port / Smtp:Username / Smtp:Password env vars override so we
+/// can swap to any provider (Brevo, SendGrid, Mailgun, Postmark, AWS
+/// SES) without touching code. Class name kept as BrevoEmailService
+/// for backward compatibility with the AuthController dependency.
 ///
-/// Why Resend (vs Brevo / SendGrid):
-/// • No IP allow-list — works from Render / any serverless host out
-///   of the box. Brevo's free tier requires whitelisted IPs which
-///   isn't viable on Render's rotating egress IPs.
-/// • 3,000 emails/month + 100/day free, no card required.
-/// • Excellent deliverability, modern API, official .NET SDK.
-///
-/// To swap to another provider (Postmark, SendGrid, Mailgun) only
-/// the SendEmailAsync internals need to change — the public surface
-/// (SendOtpEmailAsync, SendWelcomeEmailAsync) and the HTML/plain
-/// templates stay the same.
+/// Gmail App Password setup:
+///   1. Enable 2-Step Verification on Google account
+///   2. https://myaccount.google.com/apppasswords → name "ChatVerse"
+///   3. Copy 16-char password (remove spaces)
+///   4. Smtp:Username = your gmail address, Smtp:Password = the 16-char
 /// </summary>
 public class BrevoEmailService
 {
-    private readonly IResend _resend;
+    private readonly string _smtpHost;
+    private readonly int _smtpPort;
+    private readonly string _smtpUser;
+    private readonly string _smtpPass;
+
+    // Header-level "From" identity. For Gmail this MUST equal the
+    // authenticated username — Gmail rejects mismatches as spoofing.
     private readonly string _senderEmail;
     private readonly string _senderName;
     private readonly ILogger<BrevoEmailService> _logger;
@@ -36,22 +40,19 @@ public class BrevoEmailService
 
     public BrevoEmailService(IConfiguration config, ILogger<BrevoEmailService> logger)
     {
-        // Prefer Resend:ApiKey but fall back to legacy Brevo:ApiKey so
-        // we don't blow up at startup if env vars haven't been swapped yet.
-        var apiKey = config["Resend:ApiKey"]
-                  ?? config["Brevo:ApiKey"]
-                  ?? throw new InvalidOperationException(
-                       "Resend:ApiKey is missing. Set the Resend__ApiKey env var.");
+        _smtpHost = config["Smtp:Host"] ?? "smtp.gmail.com";
+        _smtpPort = int.TryParse(config["Smtp:Port"], out var p) ? p : 587;
+        _smtpUser = config["Smtp:Username"] ?? "";
+        _smtpPass = config["Smtp:Password"] ?? "";
 
-        _resend = ResendClient.Create(apiKey);
-
-        // Sender identity. For testing, use Resend's pre-verified
-        // onboarding@resend.dev. For production, verify your domain
-        // and switch this to e.g. no-reply@chatverse.app.
-        _senderEmail = config["Resend:SenderEmail"]
+        // Sender defaults to the SMTP username — that's what Gmail
+        // requires anyway. Explicit Smtp:FromEmail / Brevo:SenderEmail
+        // overrides win if set (e.g. for SendGrid where sender may
+        // differ from API key owner).
+        _senderEmail = config["Smtp:FromEmail"]
                     ?? config["Brevo:SenderEmail"]
-                    ?? "onboarding@resend.dev";
-        _senderName = config["Resend:SenderName"]
+                    ?? _smtpUser;
+        _senderName = config["Smtp:FromName"]
                    ?? config["Brevo:SenderName"]
                    ?? CompanyName;
         _logger = logger;
@@ -92,42 +93,54 @@ public class BrevoEmailService
     }
 
     // ============================================================
-    //  Core send — Resend EmailSendAsync
+    //  Core send — builds a MIME message (text + HTML) and ships
+    //  it through the SMTP relay. STARTTLS on 587 (Gmail default),
+    //  or SSL-on-connect on 465.
     // ============================================================
     private async Task<bool> SendEmailAsync(
         string toEmail, string subject, string htmlContent, string textContent)
     {
+        if (string.IsNullOrWhiteSpace(_smtpUser) || string.IsNullOrWhiteSpace(_smtpPass))
+        {
+            _logger.LogError(
+                "SMTP credentials missing (Smtp:Username / Smtp:Password). Email NOT sent to {Email}",
+                toEmail);
+            return false;
+        }
+
         try
         {
-            var msg = new EmailMessage
-            {
-                From = $"{_senderName} <{_senderEmail}>",
-                Subject = subject,
-                HtmlBody = htmlContent,
-                TextBody = textContent,
-            };
-            msg.To.Add(toEmail);
-            msg.ReplyTo.Add(SupportEmail);
+            var msg = new MimeMessage();
+            msg.From.Add(new MailboxAddress(_senderName, _senderEmail));
+            msg.To.Add(MailboxAddress.Parse(toEmail));
+            msg.ReplyTo.Add(new MailboxAddress($"{CompanyName} Support", SupportEmail));
+            msg.Subject = subject;
 
             // List-Unsubscribe + custom mailer header → Gmail trust signals.
-            msg.Headers ??= new Dictionary<string, string>();
-            msg.Headers["X-Mailer"] = "ChatVerse-Transactional";
-            msg.Headers["List-Unsubscribe"] = $"<mailto:{SupportEmail}?subject=Unsubscribe>";
+            msg.Headers.Add("X-Mailer", "ChatVerse-Transactional");
+            msg.Headers.Add("List-Unsubscribe", $"<mailto:{SupportEmail}?subject=Unsubscribe>");
 
-            var resp = await _resend.EmailSendAsync(msg);
-
-            if (resp.Success)
+            // multipart/alternative — clients pick whichever they prefer.
+            msg.Body = new BodyBuilder
             {
-                _logger.LogInformation(
-                    "Email sent to {Email} — Subject: {Subject} (Resend id: {Id})",
-                    toEmail, subject, resp.Content);
-                return true;
-            }
+                TextBody = textContent,
+                HtmlBody = htmlContent,
+            }.ToMessageBody();
 
-            _logger.LogError(
-                "Resend email failed for {Email}: {Status}",
-                toEmail, resp.Exception?.Message ?? "unknown");
-            return false;
+            using var client = new SmtpClient();
+            // 465 = implicit SSL; 587 = STARTTLS (Gmail default).
+            var secureOpts = _smtpPort == 465
+                ? SecureSocketOptions.SslOnConnect
+                : SecureSocketOptions.StartTls;
+
+            await client.ConnectAsync(_smtpHost, _smtpPort, secureOpts);
+            await client.AuthenticateAsync(_smtpUser, _smtpPass);
+            await client.SendAsync(msg);
+            await client.DisconnectAsync(true);
+
+            _logger.LogInformation(
+                "Email sent to {Email} — Subject: {Subject}", toEmail, subject);
+            return true;
         }
         catch (Exception ex)
         {

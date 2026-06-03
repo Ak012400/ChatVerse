@@ -9,10 +9,9 @@
   <ItemGroup>
     <PackageReference Include="CloudinaryDotNet" Version="1.29.1" />
     <PackageReference Include="FluentValidation.AspNetCore" Version="11.3.1" />
-    <!-- Transactional email via Resend. Resend's REST API has no
-         IP allow-list (unlike Brevo free tier) so it works out of
-         the box from Render / any cloud host. -->
-    <PackageReference Include="Resend" Version="0.1.0" />
+    <!-- Transactional email via plain SMTP (Gmail in current setup, but
+         host is config-driven so swap to any provider without code). -->
+    <PackageReference Include="MailKit" Version="4.7.1.1" />
     <PackageReference Include="Livekit.Server.Sdk.Dotnet" Version="1.2.2" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="8.0.10">
       <PrivateAssets>all</PrivateAssets>
