@@ -18,6 +18,7 @@ public class AuthController : ControllerBase
     private readonly RedisService _redis;
     private readonly JwtService _jwt;
     private readonly BrevoEmailService _email;
+    private readonly IConfiguration _config;
     private readonly ILogger<AuthController> _logger;
 
     public AuthController(
@@ -25,12 +26,14 @@ public class AuthController : ControllerBase
         RedisService redis,
         JwtService jwt,
         BrevoEmailService email,
+        IConfiguration config,
         ILogger<AuthController> logger)
     {
         _postgres = postgres;
         _redis = redis;
         _jwt = jwt;
         _email = email;
+        _config = config;
         _logger = logger;
     }
 
@@ -270,6 +273,184 @@ public class AuthController : ControllerBase
 
     // Deserialised shape of the Redis-staged registration intent.
     private record RegistrationIntent(string Username, string Email, string PasswordHash);
+
+    // ============================================================
+    //  POST /api/auth/google
+    //  Sign-in (or auto-register) with a Google ID token from the
+    //  @react-oauth/google button. Google verifies the email on its
+    //  side, so we skip OTP entirely for these accounts.
+    //
+    //  Flow:
+    //   1. Verify the ID token against our Google client ID.
+    //   2. Look up the user by email.
+    //      - exists → mint JWT, return.
+    //      - new    → auto-create with random unusable password hash,
+    //                 generate a guest-style username from the Google name,
+    //                 mark email_verified=true, apply +10 OTP-verified-equivalent
+    //                 trust delta (Google's verification is at least as strong).
+    // ============================================================
+    [HttpPost("google")]
+    [AllowAnonymous]
+    public async Task<IActionResult> GoogleSignIn([FromBody] GoogleSignInRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.Credential))
+            return BadRequest(ApiResponse.Fail("Missing Google credential"));
+
+        // Verify the ID token. The audience must match the OAuth client
+        // ID we configured in Google Cloud Console; otherwise anyone with
+        // a Google token (from any app) could authenticate.
+        var clientId = _config["Google:ClientId"];
+        if (string.IsNullOrWhiteSpace(clientId) || clientId.StartsWith("YOUR_"))
+            return StatusCode(503, ApiResponse.Fail("Google sign-in is not configured on the server."));
+
+        Google.Apis.Auth.GoogleJsonWebSignature.Payload payload;
+        try
+        {
+            payload = await Google.Apis.Auth.GoogleJsonWebSignature.ValidateAsync(
+                req.Credential,
+                new Google.Apis.Auth.GoogleJsonWebSignature.ValidationSettings
+                {
+                    Audience = new[] { clientId }
+                });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Google token validation failed");
+            return Unauthorized(ApiResponse.Fail("Invalid Google credential"));
+        }
+
+        if (string.IsNullOrWhiteSpace(payload.Email))
+            return BadRequest(ApiResponse.Fail("Google account is missing an email"));
+        if (!payload.EmailVerified)
+            return BadRequest(ApiResponse.Fail("Your Google email is not verified yet."));
+
+        // Step 1 — already-registered user? Just log them in.
+        var existing = await _postgres.GetUserAuthByEmailAsync(payload.Email);
+        if (existing != null)
+        {
+            if (string.Equals(existing.Status, "banned", StringComparison.OrdinalIgnoreCase))
+                return StatusCode(403, ApiResponse.Fail("Your account has been banned"));
+            if (string.Equals(existing.Status, "suspended", StringComparison.OrdinalIgnoreCase))
+                return StatusCode(403, ApiResponse.Fail("Your account is suspended"));
+
+            await _postgres.MarkUserActiveDayAsync(existing.UserId);
+            // If the email wasn't verified before (legacy account), Google has now done it.
+            if (!existing.IsEmailVerified)
+            {
+                try { await _postgres.MarkEmailVerifiedAsync(existing.UserId); } catch { /* best-effort */ }
+            }
+
+            var loginToken = _jwt.GenerateToken(
+                userId: existing.UserId,
+                username: existing.Username,
+                isGuest: false,
+                trustScore: existing.TrustScore,
+                isEmailVerified: true,
+                ageVerified: existing.AgeVerified);
+
+            await _redis.SetSessionAsync(existing.UserId.ToString(), new
+            {
+                userId = existing.UserId.ToString(),
+                username = existing.Username,
+                isGuest = false
+            });
+            await _redis.SetUserOnlineAsync(existing.UserId.ToString());
+
+            return Ok(ApiResponse<object>.Ok(new
+            {
+                token = loginToken,
+                userId = existing.UserId.ToString(),
+                username = existing.Username,
+                trustScore = existing.TrustScore,
+                isEmailVerified = true,
+                ageVerified = existing.AgeVerified,
+                isNew = false
+            }, "Signed in with Google"));
+        }
+
+        // Step 2 — brand new user. Auto-generate username from name/email.
+        var baseName = !string.IsNullOrWhiteSpace(payload.Name)
+            ? new string(payload.Name.Where(char.IsLetterOrDigit).ToArray())
+            : payload.Email.Split('@')[0];
+        if (string.IsNullOrWhiteSpace(baseName)) baseName = "User";
+        var username = baseName + Random.Shared.Next(100, 999);
+
+        // Random unusable password — they sign in via Google. If they later
+        // want a password they can use the "forgot password" flow.
+        var randomPwd = PasswordHasher.Hash(Guid.NewGuid().ToString("N") + Guid.NewGuid().ToString("N"));
+
+        var (newId, error) = await _postgres.RegisterUserAsync(username, payload.Email, randomPwd);
+        if (error != null)
+        {
+            // Username collision is the most likely cause — retry once with extra entropy.
+            if (error == "USERNAME_TAKEN")
+            {
+                username = baseName + Random.Shared.Next(1000, 99999);
+                (newId, error) = await _postgres.RegisterUserAsync(username, payload.Email, randomPwd);
+            }
+            if (error != null)
+            {
+                _logger.LogWarning("Google sign-in: register failed with {Error}", error);
+                return Conflict(ApiResponse.Fail(error switch
+                {
+                    "EMAIL_TAKEN" => "This email is already linked to a different account.",
+                    _ => "Could not create your account."
+                }));
+            }
+        }
+
+        await _postgres.MarkEmailVerifiedAsync(newId!.Value);
+
+        // Equivalent to OTP-verified trust delta — Google verified the email.
+        short trust = 60;
+        try
+        {
+            var (after, _) = await _postgres.ApplyTrustEventAsync(
+                userId: newId.Value,
+                eventType: TrustEventType.OtpVerified,
+                delta: (short)TrustDeltas.OtpVerified,
+                reason: "Google-verified email at registration",
+                refSource: "auth");
+            trust = after;
+        }
+        catch (Exception ex) { _logger.LogWarning(ex, "Trust delta failed for Google signup"); }
+
+        await _postgres.MarkUserActiveDayAsync(newId.Value);
+
+        var token = _jwt.GenerateToken(
+            userId: newId.Value,
+            username: username,
+            isGuest: false,
+            trustScore: trust,
+            isEmailVerified: true,
+            ageVerified: false);
+
+        await _redis.SetSessionAsync(newId.Value.ToString(), new
+        {
+            userId = newId.Value.ToString(),
+            username,
+            isGuest = false
+        });
+        await _redis.SetUserOnlineAsync(newId.Value.ToString());
+
+        // Fire-and-forget welcome email — uses the same template as OTP-verified.
+        _ = Task.Run(async () =>
+        {
+            try { await _email.SendWelcomeEmailAsync(payload.Email, username); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Welcome email failed"); }
+        });
+
+        return Ok(ApiResponse<object>.Ok(new
+        {
+            token,
+            userId = newId.Value.ToString(),
+            username,
+            trustScore = trust,
+            isEmailVerified = true,
+            ageVerified = false,
+            isNew = true
+        }, "Account created with Google"));
+    }
 
     // ============================================================
     //  POST /api/auth/login
@@ -604,4 +785,8 @@ public record ResetPasswordRequest(
     [System.ComponentModel.DataAnnotations.Required] string Email,
     [System.ComponentModel.DataAnnotations.Required] string Code,
     [System.ComponentModel.DataAnnotations.Required] string NewPassword
+);
+
+public record GoogleSignInRequest(
+    [System.ComponentModel.DataAnnotations.Required] string Credential
 );

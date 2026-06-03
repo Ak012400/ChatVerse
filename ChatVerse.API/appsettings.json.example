@@ -37,6 +37,11 @@
     "SenderName":  "ChatVerse"
   },
 
+  "Google": {
+    "_comment": "OAuth Client ID from console.cloud.google.com → Credentials → Web application. Used to validate id_token from @react-oauth/google on the frontend. Frontend ALSO needs this same value as VITE_GOOGLE_CLIENT_ID.",
+    "ClientId": "YOUR_GOOGLE_OAUTH_CLIENT_ID.apps.googleusercontent.com"
+  },
+
   "OpenAI": { "ApiKey": "YOUR_OPENAI_KEY_OR_LEAVE_BLANK" },
   "Groq":   { "ApiKey": "gsk_YOUR_GROQ_KEY" },
 
@@ -50,6 +55,11 @@
     "ApiKey":    "API_YOUR_KEY",
     "ApiSecret": "YOUR_SECRET",
     "ServerUrl": "wss://your-project.livekit.cloud"
+  },
+
+  "Ai": {
+    "_comment": "Feature flag for AiPersonaService. When true and Groq:ApiKey set, lightly-active rooms get an occasional message from a stable per-hour persona. Frontend renders 'AI' badge on the message.",
+    "EnablePresence": false
   },
 
   "VideoSettings": {

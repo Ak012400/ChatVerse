@@ -56,6 +56,14 @@ public class RedisService
     //  TTL auto-expires after 5 min — heartbeat renews it
     // ============================================================
 
+    // Global presence set keyed by userId. SADD on online, SREM on
+    // offline. SCARD is O(1) so we can publish a live "1,247 online"
+    // count without scanning keys.
+    private const string PresenceGlobalSet = "presence:global";
+    // Per-room presence sets so each chat room can report its own
+    // "12 active" badge without touching Postgres or Mongo.
+    private static string PresenceRoomSet(string roomSlug) => $"presence:room:{roomSlug}";
+
     public async Task SetUserOnlineAsync(string userId)
     {
         await _db.StringSetAsync(
@@ -63,11 +71,16 @@ public class RedisService
             "1",
             RedisTTL.UserOnline
         );
+        // Add to the global set. We intentionally don't TTL the set
+        // itself — individual membership is removed on disconnect /
+        // by the periodic janitor below.
+        await _db.SetAddAsync(PresenceGlobalSet, userId);
     }
 
     public async Task SetUserOfflineAsync(string userId)
     {
         await _db.KeyDeleteAsync(RedisKeys.UserOnline(userId));
+        await _db.SetRemoveAsync(PresenceGlobalSet, userId);
     }
 
     public async Task<bool> IsUserOnlineAsync(string userId)
@@ -77,10 +90,54 @@ public class RedisService
 
     /// <summary>
     /// Renew online TTL — called every 2 min from SignalR heartbeat.
+    /// Also re-adds the user to the global set in case the prior
+    /// disconnect was a crash that left the set stale.
     /// </summary>
     public async Task RenewOnlineStatusAsync(string userId)
     {
         await _db.KeyExpireAsync(RedisKeys.UserOnline(userId), RedisTTL.UserOnline);
+        await _db.SetAddAsync(PresenceGlobalSet, userId);
+    }
+
+    /// <summary>
+    /// O(1) read of currently-online users. Note: counts logical
+    /// users, not connections — so a user with 3 tabs counts once.
+    /// </summary>
+    public async Task<long> GetGlobalOnlineCountAsync()
+    {
+        return await _db.SetLengthAsync(PresenceGlobalSet);
+    }
+
+    public async Task JoinRoomPresenceAsync(string roomSlug, string userId)
+    {
+        await _db.SetAddAsync(PresenceRoomSet(roomSlug), userId);
+    }
+
+    public async Task LeaveRoomPresenceAsync(string roomSlug, string userId)
+    {
+        await _db.SetRemoveAsync(PresenceRoomSet(roomSlug), userId);
+    }
+
+    public async Task<long> GetRoomOnlineCountAsync(string roomSlug)
+    {
+        return await _db.SetLengthAsync(PresenceRoomSet(roomSlug));
+    }
+
+    /// <summary>
+    /// Returns the current online count for every requested room slug
+    /// in one round-trip. Used by the rooms list to populate badges.
+    /// </summary>
+    public async Task<Dictionary<string, long>> GetRoomOnlineCountsAsync(IEnumerable<string> roomSlugs)
+    {
+        var slugs = roomSlugs.ToArray();
+        if (slugs.Length == 0) return new();
+
+        var batch = _db.CreateBatch();
+        var tasks = slugs.Select(s => batch.SetLengthAsync(PresenceRoomSet(s))).ToArray();
+        batch.Execute();
+        var results = await Task.WhenAll(tasks);
+        return slugs.Zip(results, (slug, count) => (slug, count))
+                    .ToDictionary(p => p.slug, p => p.count);
     }
 
     // ============================================================

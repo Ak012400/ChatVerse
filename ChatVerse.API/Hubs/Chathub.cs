@@ -75,6 +75,7 @@ public class ChatHub : Hub
         if (roomSlug != null)
         {
             await _redis.DecrementRoomCountAsync(roomSlug);
+            await _redis.LeaveRoomPresenceAsync(roomSlug, userId);
             await _redis.DeleteKeyAsync($"conn:room:{Context.ConnectionId}");
             await Clients.Group(roomSlug).SendAsync("UserLeft", new
             {
@@ -127,6 +128,10 @@ public class ChatHub : Hub
         await Groups.AddToGroupAsync(Context.ConnectionId, roomSlug);
         await _redis.SetStringAsync($"conn:room:{Context.ConnectionId}", roomSlug, TimeSpan.FromHours(24));
         await _redis.IncrementRoomCountAsync(roomSlug);
+        // Set-based presence dedups across multiple tabs from the same user.
+        // The legacy counter above is kept for backward compat with anything
+        // still polling RoomActiveCount.
+        await _redis.JoinRoomPresenceAsync(roomSlug, userId);
 
         var messages = await _mongo.GetRoomMessagesAsync(roomSlug, 0, 50);
         await Clients.Caller.SendAsync("RoomHistory", new
@@ -156,6 +161,7 @@ public class ChatHub : Hub
         await Groups.RemoveFromGroupAsync(Context.ConnectionId, roomSlug);
         await _redis.DecrementRoomCountAsync(roomSlug);
         await _redis.DeleteKeyAsync($"conn:room:{Context.ConnectionId}");
+        await _redis.LeaveRoomPresenceAsync(roomSlug, userId);
 
         await Clients.OthersInGroup(roomSlug).SendAsync("UserLeft", new
         {

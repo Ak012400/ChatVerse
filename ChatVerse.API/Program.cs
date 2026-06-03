@@ -209,6 +209,10 @@ try
     // replicas — the Redis LPOP is atomic.
     builder.Services.AddHostedService<MatchingService>();
 
+    // AI host that posts in lightly-active rooms. No-op unless
+    // Ai:EnablePresence=true AND a Groq key is set, so safe to register.
+    builder.Services.AddHostedService<AiPersonaService>();
+
     var app = builder.Build();
 
     // ── Middleware pipeline ───────────────────────────────────────
