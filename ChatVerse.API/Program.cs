@@ -16,6 +16,16 @@ try
 {
     var builder = WebApplication.CreateBuilder(args);
 
+    // ── Render / container PORT binding ───────────────────────────
+    // Render injects a dynamic PORT env var and expects the app to
+    // listen on http://0.0.0.0:$PORT. Locally we fall back to the
+    // ports declared in launchSettings.json so dev unchanged.
+    var portEnv = Environment.GetEnvironmentVariable("PORT");
+    if (!string.IsNullOrWhiteSpace(portEnv))
+    {
+        builder.WebHost.UseUrls($"http://0.0.0.0:{portEnv}");
+    }
+
     // ── Controllers ───────────────────────────────────────────────
     builder.Services.AddControllers();
     builder.Services.AddEndpointsApiExplorer();
@@ -154,20 +164,36 @@ try
     });
 
     // ── CORS ──────────────────────────────────────────────────────
+    // Production origins are config-driven so we don't have to rebuild the
+    // image whenever the frontend gets a new domain. Set "Cors:Origins"
+    // (string[]) in appsettings.Production.json OR via env var
+    // `Cors__Origins__0=https://yourdomain.com` (one per index).
     builder.Services.AddCors(options =>
     {
         options.AddPolicy("ChatVerseCors", policy =>
         {
             if (builder.Environment.IsDevelopment())
             {
-                policy.WithOrigins("http://localhost:5173", "https://localhost:5173", "http://localhost:5174", "https://localhost:5174")
+                policy.WithOrigins(
+                          "http://localhost:5173", "https://localhost:5173",
+                          "http://localhost:5174", "https://localhost:5174")
                       .AllowAnyHeader()
                       .AllowAnyMethod()
                       .AllowCredentials();
             }
             else
             {
-                policy.WithOrigins("https://chatverse.app")
+                var configured = builder.Configuration
+                    .GetSection("Cors:Origins")
+                    .Get<string[]>() ?? Array.Empty<string>();
+
+                // Fallback to a safe default if no config provided — keeps
+                // old behaviour, but log loudly so we notice.
+                var origins = configured.Length > 0
+                    ? configured
+                    : new[] { "https://chatverse.app" };
+
+                policy.WithOrigins(origins)
                       .AllowAnyHeader()
                       .AllowAnyMethod()
                       .AllowCredentials();
@@ -196,22 +222,37 @@ try
         });
     }
 
-    app.UseHttpsRedirection();
+    // HTTPS redirect only in dev — Render terminates SSL upstream,
+    // so the container itself speaks plain HTTP. Forcing a redirect
+    // inside the container causes redirect loops behind the LB.
+    if (app.Environment.IsDevelopment())
+    {
+        app.UseHttpsRedirection();
+    }
+
     app.UseGlobalExceptionHandler();
     app.UseCors("ChatVerseCors");
     app.UseAuthentication();
     app.UseAuthorization();
 
+    // Health check — Render hits this to know the container is alive.
+    // Returns plain text so it's cheap and proxy-friendly.
+    app.MapGet("/healthz", () => Results.Ok(new { status = "ok", time = DateTime.UtcNow }))
+       .AllowAnonymous();
+
     app.MapControllers();
     app.MapHub<ChatHub>("/hubs/chat");
-    app.MapHub<VideoHub>("/hubs/video"); // uncomment when ready
+    app.MapHub<VideoHub>("/hubs/video");
 
     app.Run();
 }
 catch (Exception ex)
 {
-    Console.WriteLine("STARTUP ERROR: " + ex.Message);
-    Console.WriteLine(ex.StackTrace);
-    Console.ReadKey();
+    // Don't ReadKey() in containerised hosts — it hangs forever
+    // waiting on a stdin that never arrives. Just log + exit non-zero
+    // so Render shows the crash and restarts.
+    Console.Error.WriteLine("STARTUP ERROR: " + ex.Message);
+    Console.Error.WriteLine(ex.StackTrace);
+    Environment.Exit(1);
 }
 

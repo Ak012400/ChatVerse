@@ -413,25 +413,63 @@ because we serialize with anonymous-object camelCase but deserialize into Pascal
 
 ---
 
-## 11. Pending Work (Next Session's Punch List)
+## 11. Pre-Hosting Checklist (Hosting TODAY — Arun, do these FIRST)
 
-### High value, small effort
-1. **`SubscriptionExpiryService`** — daily `BackgroundService` HostedService that calls `billing.usp_expire_subscriptions`. Pattern: copy from `MatchingService.cs`. Register in `Program.cs` via `AddHostedService<>`. Probe block in `postgres-init.sql` will tell you if proc isn't deployed.
-2. **`UsersController.Search` → trigram proc switchover.** Currently does raw `LOWER(username) LIKE LOWER(@q) || '%'` (prefix). Switch to calling `user_auth.usp_search_users(p_query, p_me_id, p_limit)` — trigram-backed via the GIN index. Proc already deployed via `postgres-init.sql`. Returns `user_id, username, trust_score, age_verified, rank` ordered by similarity DESC.
-3. **`ChatHub.RemoveReaction`** — companion to existing `ReactToMessage`. Should mirror the same Mongo update path (push to a Set, then pull on remove). Frontend needs a corresponding click-again-to-remove flow.
-4. **DM read-receipt event end-to-end check.** Backend emits `DmRead`; frontend `useChatHub.ts` listens but doesn't render a "Seen/Delivered" indicator. Add one below sent messages on `DmsPage`.
+Items prefixed **[ARUN]** = Arun must do (3rd-party signups, secret rotation, hosting setup). Items prefixed **[CODE]** = already handled in code, just listed for awareness.
 
-### Medium effort
-5. **Message reactions picker UI.** Hover bubble → "+" → emoji-picker popover → click reacts. Chips render under bubble showing each emoji + count. Use `lucide-react` for the trigger; lightweight inline emoji array (8–12 common ones) for the picker — no need for a heavyweight library.
-6. **More profile preferences.** Notifications toggle, autoplay toggle, language already done.
+### Blockers — without these, features WILL break in prod
 
-### Config / housekeeping
-7. **Cloudinary real keys** — add to `appsettings.json`. Avatar + document upload won't work until then.
-8. **Razorpay real keys** — Pricing page is built but checkout will reject.
-9. **Admin UserIds** — populate with Arun's UUID to unlock `/admin`.
+1. **[ARUN] Cloudinary real keys** — currently `YOUR_CLOUD_NAME` placeholders. Sign up at cloudinary.com → Dashboard → Settings → Access Keys → copy Cloud Name + API Key + API Secret → set as `Cloudinary__CloudName` / `Cloudinary__ApiKey` / `Cloudinary__ApiSecret` env vars. **Without this:** avatar upload + ID doc upload both return 401.
+2. **[ARUN] Razorpay test keys** — currently `YOUR_RAZORPAY_*` placeholders. Razorpay dashboard → API Keys → test mode (`rzp_test_*`). Also generate Webhook secret. Set `Razorpay__KeyId` / `Razorpay__KeySecret` / `Razorpay__WebhookSecret`. **Without this:** pricing page checkout fails.
+3. **[ARUN] Own UUID in Admin:UserIds** — `SELECT id FROM user_auth.users WHERE email='arunkumaramba84@gmail.com'`. Add UUID to `Admin__UserIds__0` env var. **Without this:** `/admin` returns 403 even for Arun.
+4. **[ARUN] Rotate JWT SecretKey for prod** — dev one is leaked. Generate fresh 64+ char random secret (`openssl rand -base64 64`). Set `Jwt__SecretKey`. All existing dev JWTs invalidate.
+5. **[ARUN] VideoSettings:EnableAgeBypass=false in prod** — currently `true` for dev convenience. MUST be `false` in prod or users access video without verification.
+6. **[ARUN] Set frontend `VITE_API_BASE_URL`** — in Vercel/Netlify env vars, point to deployed backend URL. Without it, frontend tries `localhost:7001` from production.
+7. **[ARUN] Set backend `Cors__Origins__0=<frontend URL>`** — CORS is now config-driven (CHANGED in Program.cs this session). Without setting, falls back to `https://chatverse.app` — won't match your real domain.
 
-### Explicitly DEFERRED (not in scope right now)
-- VideoHub frontend migration (was discussed earlier; Arun said "chhod ke").
+### Hosting setup steps
+
+8. **[ARUN] Decide platforms + create accounts:**
+   - Backend → Railway or Render (both have free .NET tier). Azure App Service if you want Microsoft stack.
+   - Frontend → Vercel or Cloudflare Pages (both auto-deploy from GitHub).
+   - Domain → optional for v1; platform subdomains work fine initially.
+9. **[ARUN] Push final code to GitHub** — make sure `appsettings.json` with real secrets is NOT committed. Use `appsettings.Production.json` (gitignored) OR env vars on the hosting platform.
+10. **[ARUN] Connect repo to hosting platforms** — both Railway and Vercel just need GitHub repo + branch. Auto-deploys on push.
+
+### Post-deploy smoke test
+
+11. Open prod URL → register → check email → enter OTP → confirm user_auth row created with `is_email_verified=true`.
+12. Login → /chat → join a public room → send message → reload to confirm persisted.
+13. /video → try Random 1-on-1 in 2 incognito tabs (or 2 devices).
+14. /admin → confirm dashboard loads (after adding UUID to Admin:UserIds).
+
+---
+
+## 12. Pending Features (POST-HOSTING — do NOT ship same-day as deploy)
+
+### Recently requested by Arun (deferred for safe baseline launch)
+
+1. **Online presence count + UI badges**
+   - Backend: Redis Set `presence:global` + `presence:room:{slug}` via SADD on ChatHub.OnConnectedAsync / SREM on OnDisconnectedAsync. SCARD for O(1) count. Add `GET /api/presence/stats` → `{globalOnline, byRoom}`. 60s TTL + 30s client heartbeat.
+   - Frontend: top-bar badge global count + per-room dot+number in ChatSidebar.
+   - Why deferred: low-risk but new code in critical realtime path. Ship after deploy is stable.
+
+2. **AiPresenceService — AI host in empty rooms**
+   - BackgroundService scanning rooms every 30s. If 0–1 real users AND last message > 45s old → spawn AI with persona from pool. 1.5–3s typing delay before each message. Groq prompt with last 5 messages as context.
+   - Feature flag `Ai:EnablePresence` (default false).
+   - **Legal/ethical:** add small "AI" badge next to persona name + landing-page disclosure "some hosts are AI to keep rooms active." Reduces legal exposure + builds trust.
+   - Why deferred: needs careful persona tuning + prompt iteration. Don't rush it under launch pressure.
+
+### Originally pending (from last session)
+
+3. **`SubscriptionExpiryService`** — daily HostedService calling `billing.usp_expire_subscriptions`. Pattern: copy from `MatchingService.cs`.
+4. **`UsersController.Search` → trigram proc switchover** — proc already deployed (`user_auth.usp_search_users`). Switch controller to call it instead of raw `LIKE` prefix.
+5. **`ChatHub.RemoveReaction`** — companion to existing `ReactToMessage`.
+6. **DM read-receipt UI** — backend emits `DmRead`; frontend doesn't render "Seen/Delivered" yet.
+7. **Message reactions picker UI** — hover → "+" → emoji popover → chips below bubble.
+
+### Explicitly DEFERRED (not in scope)
+- VideoHub frontend migration (Arun said "chhod ke").
 - Self-hosted nsfwjs model (Arun said "chhod ke").
 - Voice rooms / audio-only mode.
 - Mobile app (web-first MVP).

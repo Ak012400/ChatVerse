@@ -1,0 +1,31 @@
+# Don't ship build artefacts or local config into the image.
+**/bin
+**/obj
+**/.vs
+**/.idea
+**/.git
+**/.gitignore
+**/*.user
+**/*.suo
+
+# Local config / secrets
+**/appsettings.json
+**/appsettings.*.json
+!**/appsettings.json.example
+**/.env
+**/.env.*
+
+# Docs / scratch
+**/HANDOFF.md
+**/README.md
+**/.dockerignore
+**/Dockerfile*
+
+# Frontend lives in a separate folder anyway, but belt-and-braces:
+chatverse-client/
+ChatVerse__FrontEnd/
+node_modules/
+
+# Logs
+*.log
+logs/

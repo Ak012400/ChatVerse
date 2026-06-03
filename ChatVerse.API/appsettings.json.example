@@ -1,0 +1,86 @@
+{
+  "_comment": "Public template — copy to appsettings.json (which is gitignored) and fill in real values. In production (Render), set these as environment variables instead — Render auto-maps ENV__KEY → ENV:KEY in .NET config.",
+
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  },
+  "AllowedHosts": "*",
+
+  "ConnectionStrings": {
+    "PostgreSQL": "Host=YOUR_SUPABASE_HOST;Database=postgres;Username=postgres;Password=YOUR_PASSWORD;SSL Mode=Require;Trust Server Certificate=true",
+    "Redis":      "rediss://default:YOUR_TOKEN@YOUR_UPSTASH_HOST:6379",
+    "MongoDB":    "mongodb+srv://YOUR_USER:YOUR_PASS@YOUR_CLUSTER.mongodb.net/?retryWrites=true&w=majority"
+  },
+
+  "MongoDB": { "DatabaseName": "chatverse" },
+
+  "Jwt": {
+    "_comment": "Generate a 64+ char random secret for production. Never reuse dev secret.",
+    "SecretKey":   "REPLACE_WITH_64_CHAR_RANDOM_SECRET",
+    "Issuer":      "ChatVerse",
+    "Audience":    "ChatVerseUsers",
+    "ExpiryHours": 24
+  },
+
+  "Cloudinary": {
+    "CloudName": "YOUR_CLOUD_NAME",
+    "ApiKey":    "YOUR_API_KEY",
+    "ApiSecret": "YOUR_API_SECRET"
+  },
+
+  "Brevo": {
+    "ApiKey":      "xkeysib-YOUR_KEY",
+    "SenderEmail": "you@example.com",
+    "SenderName":  "ChatVerse"
+  },
+
+  "OpenAI": { "ApiKey": "YOUR_OPENAI_KEY_OR_LEAVE_BLANK" },
+  "Groq":   { "ApiKey": "gsk_YOUR_GROQ_KEY" },
+
+  "Razorpay": {
+    "KeyId":         "rzp_test_YOUR_KEY",
+    "KeySecret":     "YOUR_KEY_SECRET",
+    "WebhookSecret": "YOUR_WEBHOOK_SECRET"
+  },
+
+  "LiveKit": {
+    "ApiKey":    "API_YOUR_KEY",
+    "ApiSecret": "YOUR_SECRET",
+    "ServerUrl": "wss://your-project.livekit.cloud"
+  },
+
+  "VideoSettings": {
+    "_comment": "ALWAYS set EnableAgeBypass=false in production.",
+    "EnableAgeBypass":           false,
+    "MinimumTrustScoreRequired": 0,
+    "RequiredTier":              "Basic"
+  },
+
+  "Admin": {
+    "_comment": "Allow-listed UUIDs from user_auth.users that get admin dashboard access.",
+    "UserIds": []
+  },
+
+  "Cors": {
+    "_comment": "Production frontend URL(s). E.g. https://chatverse.vercel.app. In Render set as Cors__Origins__0=...",
+    "Origins": [ "https://your-frontend-domain.com" ]
+  },
+
+  "WebRtc": {
+    "_comment": "Xirsys credentials from dashboard → static auth tab.",
+    "StunUrls":       [ "stun:bn-turn2.xirsys.com" ],
+    "TurnUrls":       [
+      "turn:bn-turn2.xirsys.com:80?transport=udp",
+      "turn:bn-turn2.xirsys.com:3478?transport=udp",
+      "turn:bn-turn2.xirsys.com:80?transport=tcp",
+      "turn:bn-turn2.xirsys.com:3478?transport=tcp",
+      "turns:bn-turn2.xirsys.com:443?transport=tcp",
+      "turns:bn-turn2.xirsys.com:5349?transport=tcp"
+    ],
+    "TurnUsername":   "YOUR_XIRSYS_USERNAME",
+    "TurnCredential": "YOUR_XIRSYS_CREDENTIAL"
+  }
+}
