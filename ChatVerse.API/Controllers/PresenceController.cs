@@ -1,3 +1,4 @@
+using ChatVerse.API.Extensions;
 using ChatVerse.API.Models;
 using ChatVerse.Infrastructure.Persistence.Redis;
 using Microsoft.AspNetCore.Authorization;

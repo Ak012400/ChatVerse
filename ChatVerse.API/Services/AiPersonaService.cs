@@ -1,7 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using ChatVerse.API.Hubs;
-using ChatVerse.Infrastructure.Persistence.Mongo;
+using ChatVerse.Infrastructure.Persistence.MongoDB;
 using ChatVerse.Infrastructure.Persistence.Redis;
 using Microsoft.AspNetCore.SignalR;
 
@@ -82,7 +82,7 @@ public class AiPersonaService : BackgroundService
         var redis = scope.ServiceProvider.GetRequiredService<RedisService>();
 
         // Public rooms only — never AI-spam a private/invite room.
-        var rooms = await mongo.GetActiveRoomsAsync(50);
+        var rooms = await mongo.GetActiveRoomsAsync();
         var now = DateTime.UtcNow;
 
         foreach (var room in rooms)
@@ -92,7 +92,7 @@ public class AiPersonaService : BackgroundService
 
             try
             {
-                await MaybePostInRoomAsync(room.Slug, room.Name, mongo, redis, apiKey, now);
+                await MaybePostInRoomAsync(room.Slug, room.DisplayName, mongo, redis, apiKey, now);
             }
             catch (Exception ex)
             {
@@ -180,7 +180,7 @@ public class AiPersonaService : BackgroundService
     private async Task<string> GenerateReplyAsync(
         PersonaPool.Persona persona,
         string roomName,
-        IReadOnlyList<ChatVerse.Domain.Enums.Message> recent,
+        IReadOnlyList<ChatVerse.Domain.Entities.Message> recent,
         string apiKey)
     {
         var system = $$"""
