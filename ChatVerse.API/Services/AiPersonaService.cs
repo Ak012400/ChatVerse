@@ -29,17 +29,18 @@ public class AiPersonaService : BackgroundService
     private readonly IConfiguration _config;
 
     // Scan cadence — chosen so a lonely user never waits more than this
-    // before the AI persona shows up. 6s feels near-instant in UX terms.
+    // before an AI persona reacts. 6s feels near-instant in UX terms.
     private const int ScanIntervalMs = 6_000;
 
     // For rooms with multiple humans, AI doesn't barge in mid-conversation —
     // it only chimes in after this long of silence.
     private const int IdleThresholdSecsActive = 45;
 
-    // For rooms with ≤1 humans (the "lonely" path), we skip the idle gate
-    // entirely. The cooldown below is what stops the AI from spamming.
-    private const int CooldownSecsLonely = 75;     // AI posts at most once / 75s when alone
-    private const int CooldownSecsActive = 150;    // longer when humans are talking
+    // Per-PERSONA cooldown (each room hosts 2 personas, each on its own
+    // timer). Lonely: short, so back-and-forth feels lively. Active: longer
+    // so the AI hosts don't drown out actual humans.
+    private const int CooldownSecsLonelyPerPersona = 25;
+    private const int CooldownSecsActivePerPersona = 90;
 
     public AiPersonaService(
         IServiceProvider services,
@@ -116,15 +117,19 @@ public class AiPersonaService : BackgroundService
     // ============================================================
     //  Should this room get an AI message right now?
     //
+    //  Each public room is hosted by TWO deterministic AI personas
+    //  (PersonaPool.PickPairFor). Both can speak; each has its own
+    //  cooldown so they alternate naturally — feels like two regulars
+    //  hanging out in the room rather than one bot interrupting.
+    //
     //  Decision tree (online = real human users in the room):
     //
     //    online == 0  →  skip (no one's looking, don't burn quota)
-    //    online == 1  →  LONELY path — fast, no idle gate. Single user
-    //                    gets an AI companion within one scan tick (~6s).
-    //                    Throttled only by the 75-second cooldown.
-    //    online >  1  →  ACTIVE path — only chime in after 45s of silence
-    //                    so we never barge in on a real conversation.
-    //                    Throttled by the 150-second cooldown.
+    //    online == 1  →  LONELY path — fast back-and-forth. Each persona
+    //                    cools down for 25s independently so the room
+    //                    sees a new AI message every ~12s on average.
+    //    online >  1  →  ACTIVE path — wait for 45s of silence first,
+    //                    then post; each persona is throttled at 90s.
     // ============================================================
     private async Task MaybePostInRoomAsync(
         string slug, string roomName,
@@ -135,35 +140,33 @@ public class AiPersonaService : BackgroundService
         if (onlineCount == 0) return; // nobody to see it
 
         var isLonely = onlineCount == 1;
+        var (personaA, personaB) = PersonaPool.PickPairFor(slug, now);
 
-        // Cooldown check first — cheap, avoids hitting Mongo + Groq
-        // if we just posted. Uses a real string key with explicit TTL
-        // rather than the old "abuse UserOnline helper" approach which
-        // pinned the cooldown to UserOnline's TTL (~5 min) regardless.
-        var cooldownKey = $"ai:cooldown:{slug}";
-        if (await redis.GetStringAsync(cooldownKey) != null) return;
-
-        // Pull recent messages — used both for idle gating (active rooms)
+        // Pull recent messages — used for idle gating, persona selection,
         // and as conversational context for Groq/Gemini.
-        var recent = await mongo.GetRoomMessagesAsync(slug, 0, 8);
+        var recent = await mongo.GetRoomMessagesAsync(slug, 0, 10);
 
         if (!isLonely && recent.Count > 0)
         {
-            // ACTIVE room — only chime in once the humans have gone quiet.
+            // ACTIVE room — only chime in once humans have gone quiet.
             var last = recent[0]; // proc returns newest-first
             if ((now - last.CreatedAt).TotalSeconds < IdleThresholdSecsActive) return;
         }
-        // Lonely path: no idle gate. We post even if the user just sent
-        // a message a second ago — the AI is there to keep them company.
 
-        // Acquire the cooldown lock with an explicit TTL. The cooldown
-        // is different for lonely vs active rooms so a single user gets
-        // more company than a chatty group.
-        var cooldownSecs = isLonely ? CooldownSecsLonely : CooldownSecsActive;
+        // Decide which of the two personas should speak this tick.
+        // Prefer the one whose cooldown has expired AND who didn't just
+        // speak — keeps the conversation feeling like two distinct people.
+        var chosen = await PickAvailablePersonaAsync(slug, personaA, personaB, recent, redis);
+        if (chosen == null) return; // both still cooling down
+
+        // Lock the chosen persona's cooldown immediately so two replicas
+        // (or the next tick) don't both pick this one.
+        var cooldownKey = $"ai:cooldown:{slug}:{chosen.Username.ToLowerInvariant()}";
+        var cooldownSecs = isLonely ? CooldownSecsLonelyPerPersona : CooldownSecsActivePerPersona;
         await redis.SetStringAsync(cooldownKey, "1", TimeSpan.FromSeconds(cooldownSecs));
 
-        var persona = PersonaPool.PickFor(slug, now);
-        var reply = await GenerateReplyAsync(persona, roomName, recent, ai, ct);
+        var persona = chosen;
+        var reply = await GenerateReplyAsync(persona, roomName, recent, personaA, personaB, ai, ct);
         if (string.IsNullOrWhiteSpace(reply))
         {
             // Provider failed — release the lock so we can try again
@@ -211,6 +214,41 @@ public class AiPersonaService : BackgroundService
         => $"ai-host:{p.Username.ToLowerInvariant()}";
 
     // ============================================================
+    //  Persona selection — return the persona that should speak next,
+    //  or null if both are still cooling down.
+    //
+    //  Rules:
+    //   • A persona on cooldown can't speak.
+    //   • If the LAST message was from one of the personas, prefer
+    //     the OTHER one — keeps the room feeling like two voices.
+    //   • Otherwise return whichever is available (A first as tiebreak).
+    // ============================================================
+    private static async Task<PersonaPool.Persona?> PickAvailablePersonaAsync(
+        string slug,
+        PersonaPool.Persona a, PersonaPool.Persona b,
+        IReadOnlyList<ChatVerse.Domain.Entities.Message> recent,
+        RedisService redis)
+    {
+        var aCooldown = await redis.GetStringAsync($"ai:cooldown:{slug}:{a.Username.ToLowerInvariant()}");
+        var bCooldown = await redis.GetStringAsync($"ai:cooldown:{slug}:{b.Username.ToLowerInvariant()}");
+        var aFree = aCooldown == null;
+        var bFree = bCooldown == null;
+
+        if (!aFree && !bFree) return null;
+        if (aFree && !bFree) return a;
+        if (!aFree && bFree) return b;
+
+        // Both free — pick the one who DIDN'T speak last, so the two
+        // personas alternate naturally.
+        if (recent.Count > 0)
+        {
+            var lastFromB = recent[0].SenderName == b.Username;
+            return lastFromB ? a : b;
+        }
+        return a;
+    }
+
+    // ============================================================
     //  Build chat-completion request and delegate to AiChatProvider
     //  (which handles Groq → Gemini fallback transparently).
     // ============================================================
@@ -218,26 +256,44 @@ public class AiPersonaService : BackgroundService
         PersonaPool.Persona persona,
         string roomName,
         IReadOnlyList<ChatVerse.Domain.Entities.Message> recent,
+        PersonaPool.Persona companionA,
+        PersonaPool.Persona companionB,
         AiChatProvider ai,
         CancellationToken ct)
     {
-        // System prompt is dynamic — when the room is empty / brand-new
-        // user just joined, the persona should greet warmly rather than
-        // reply-to-a-message-that-doesn't-exist.
+        // System prompt adapts to context:
+        //   • brand-new room (no messages)  → warm greeting
+        //   • last message was from a real user → reply to them
+        //   • last message was from the OTHER persona → banter, agree,
+        //     extend the thread (this is what makes two personas feel
+        //     like a real conversation, not parallel monologues)
         var isOpening = recent.Count == 0;
-        var sceneRule = isOpening
-            ? "- The room is quiet right now. Greet the room warmly with one short line that fits the theme — make a stranger feel welcome, ask something casual they can answer in one sentence."
-            : "- Reply naturally to what people are saying. Don't repeat them. One short message, one open-ended hook at most.";
+        var lastSender = recent.Count > 0 ? recent[0].SenderName : null;
+        var otherPersona = persona.Username == companionA.Username ? companionB : companionA;
+        var lastWasOtherAi = lastSender == otherPersona.Username;
+
+        string sceneRule;
+        if (isOpening)
+            sceneRule = $"- The room is quiet. You just walked in alongside your friend {otherPersona.Username}. Drop a single warm greeting that fits the room theme — make any stranger feel welcome.";
+        else if (lastWasOtherAi)
+            sceneRule = $"- {otherPersona.Username} just said something. React naturally — agree, tease, extend, or pivot. You two are friends who hang out here.";
+        else
+            sceneRule = "- Reply naturally to what the human just said. Don't echo them back. Keep it short and warm.";
 
         var system = $$"""
-        You are a casual user named {{persona.Username}} hanging out in the chat
-        room "{{roomName}}". Your background: {{persona.Description}} You're from {{persona.City}}.
+        You are a casual user named {{persona.Username}} in the chat room "{{roomName}}".
+        Background: {{persona.Description}} You're from {{persona.City}}.
+
+        You share this room with your friend {{otherPersona.Username}} — sometimes you'll
+        be replying to them, sometimes to other people in the room. Treat them like a
+        familiar buddy. Don't @-mention them every time; just talk naturally.
 
         Rules:
-        - Keep replies short (1-2 sentences max).
-        - Match the room's tone — casual, warm.
+        - Keep replies SHORT (1-2 sentences max). Never longer.
+        - Match the room's tone — casual, warm, Hindi-English mix is fine if the room uses it.
         - Don't mention you are an AI, but never claim to be human if asked directly —
           deflect with humour. Never give medical, legal, or financial advice.
+        - Don't open every message with "Hey" or with the other person's name.
         {{sceneRule}}
         """;
 
@@ -252,8 +308,10 @@ public class AiPersonaService : BackgroundService
             msgs.Add(new("user", $"{m.SenderName}: {m.Content}"));
 
         msgs.Add(new("user", isOpening
-            ? "(You just walked into the room. There's one person here. Greet warmly with one short line that fits the theme.)"
-            : "(Reply to the last message naturally.)"));
+            ? "(You just walked into the room. Greet warmly with one short line that fits the theme.)"
+            : lastWasOtherAi
+                ? $"(React to what your friend {otherPersona.Username} just said. Keep it short and natural.)"
+                : "(Reply to what the human just said. Keep it short and warm.)"));
 
         var reply = await ai.CompleteAsync(
             new AiChatProvider.ChatRequest(msgs, Temperature: 0.8, MaxTokens: 80),
