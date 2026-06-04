@@ -43,10 +43,28 @@ public static class PersonaPool
     /// </summary>
     public static Persona PickFor(string roomSlug, DateTime utcNow)
     {
-        // Deterministic by (slug + hour) so multiple replicas pick the same.
         var bucket = $"{roomSlug}|{utcNow:yyyyMMddHH}";
         var hash = unchecked((uint)bucket.GetHashCode());
         return All[(int)(hash % (uint)All.Count)];
+    }
+
+    /// <summary>
+    /// Pick a stable PAIR of distinct personas per (roomSlug, hour).
+    /// Two AI hosts give the room a livelier feel — they can react to
+    /// the user AND talk to each other, mimicking an organic conversation.
+    /// </summary>
+    public static (Persona A, Persona B) PickPairFor(string roomSlug, DateTime utcNow)
+    {
+        var bucket = $"{roomSlug}|{utcNow:yyyyMMddHH}";
+        var hash = unchecked((uint)bucket.GetHashCode());
+
+        var first = (int)(hash % (uint)All.Count);
+        // Offset by a coprime-ish step (7) so the second persona is
+        // deterministic but reliably different from the first.
+        var second = (first + 7) % All.Count;
+        if (second == first) second = (first + 1) % All.Count;
+
+        return (All[first], All[second]);
     }
 
     /// <summary>Truly random pick — for one-off responses if needed.</summary>
