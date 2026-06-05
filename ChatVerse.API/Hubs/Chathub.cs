@@ -505,11 +505,17 @@ public class ChatHub : Hub
         var inviteId = Guid.NewGuid().ToString("N")[..12];
         var roomName = $"dc-{inviteId}";
 
-        // 60s TTL — invite auto-expires if no response.
+        // 180s TTL — invite auto-expires if no response. 60s was too tight:
+        // a cold Render container takes 30-60s to wake up, leaving little
+        // headroom for the recipient to actually click Accept before the
+        // invite expires. The IncomingCallModal already shows a 60-second
+        // visual countdown to the user (still the soft UX limit), but the
+        // backend gives an extra 2 minutes of grace so a slow accept
+        // doesn't fail with "expired_or_invalid".
         await _redis.SetStringAsync(
             $"directcall:invite:{inviteId}",
             $"{callerId}:{targetUserId}:{roomName}",
-            TimeSpan.FromSeconds(60));
+            TimeSpan.FromSeconds(180));
 
         await Clients.User(targetUserId).SendAsync("IncomingCall", new
         {

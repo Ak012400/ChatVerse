@@ -150,8 +150,14 @@ try
     {
         options.EnableDetailedErrors = builder.Environment.IsDevelopment();
         options.MaximumReceiveMessageSize = 5 *1024 * 1024;
-        options.ClientTimeoutInterval = TimeSpan.FromSeconds(60);
-        options.KeepAliveInterval = TimeSpan.FromSeconds(15);
+        // ClientTimeoutInterval bumped 60 → 120s and KeepAliveInterval
+        // 15 → 10s so a heavy JS thread on the client (e.g. NSFW model
+        // loading, large file scan) doesn't trigger a spurious server-
+        // side disconnect during a video call. The keepalive cadence
+        // is also a bit tighter so we notice real drops sooner.
+        options.ClientTimeoutInterval = TimeSpan.FromSeconds(120);
+        options.KeepAliveInterval = TimeSpan.FromSeconds(10);
+        options.HandshakeTimeout = TimeSpan.FromSeconds(30);
     })
     .AddStackExchangeRedis(options =>
     {
