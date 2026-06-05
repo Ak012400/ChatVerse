@@ -28,9 +28,12 @@ public class AiPersonaService : BackgroundService
     private readonly ILogger<AiPersonaService> _logger;
     private readonly IConfiguration _config;
 
-    // Scan cadence — chosen so a lonely user never waits more than this
-    // before an AI persona reacts. 6s feels near-instant in UX terms.
-    private const int ScanIntervalMs = 6_000;
+    // Scan cadence — 25s strikes a balance: lonely users still feel
+    // attended to (under half a minute is psychologically "fast"),
+    // while the background loop only spends 4 Redis SCARD calls/minute
+    // per room instead of 10. At 10 active rooms that's a 6,000 cmd/day
+    // saving — important on the Upstash free tier's 10k/day cap.
+    private const int ScanIntervalMs = 25_000;
 
     // For rooms with multiple humans, AI doesn't barge in mid-conversation —
     // it only chimes in after this long of silence.

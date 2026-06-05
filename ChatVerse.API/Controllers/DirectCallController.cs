@@ -22,7 +22,15 @@ public class DirectCallController : ControllerBase
     private readonly RedisService _redis;
     private readonly ILogger<DirectCallController> _logger;
 
-    private const int EmptyTimeoutSeconds = 60;
+    // LiveKit deletes a room after it has been empty for this many seconds.
+    // "Empty" means no participants connected. A 60-second value was too
+    // aggressive: a single network blip on either side could leave the
+    // room temporarily empty, trip the 60-second timer, and permanently
+    // destroy the room — preventing reconnection. Bumping to 10 minutes
+    // gives both sides plenty of grace for transient drops without
+    // meaningfully increasing LiveKit Cloud resource usage (empty rooms
+    // cost almost nothing on the free tier).
+    private const int EmptyTimeoutSeconds = 600;
     private const int MaxParticipants = 2;
 
     public DirectCallController(
