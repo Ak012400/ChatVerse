@@ -210,6 +210,21 @@ try
     // ── HttpClient ────────────────────────────────────────────────
     builder.Services.AddHttpClient();
 
+    // ── Gaming Hall (quiz/jokes/trivia rooms) ─────────────────────
+    // QuizQuestionProvider needs its own typed HttpClient — gives it
+    // an isolated lifetime so its 6s timeout doesn't bleed into other
+    // outbound calls (Groq, Cloudinary, etc).
+    builder.Services.AddHttpClient<ChatVerse.API.Services.Games.QuizQuestionProvider>();
+    // Registry is per-process; singleton so the hub + ticker + REST
+    // controller all share the same in-memory cache of active sessions.
+    builder.Services.AddSingleton<ChatVerse.API.Services.Games.GameSessionRegistry>();
+    // Hosted ticker drives deadline-based question advancement.
+    // Also exposes BroadcastAsync to the hub; we register it once and
+    // resolve in both AddHostedService and via direct DI.
+    builder.Services.AddSingleton<ChatVerse.API.Services.Games.GameTickerService>();
+    builder.Services.AddHostedService(sp =>
+        sp.GetRequiredService<ChatVerse.API.Services.Games.GameTickerService>());
+
     // ── Background services ───────────────────────────────────────
     // Drives VideoHub's random-1-on-1 queue. Safe to run on multiple
     // replicas — the Redis LPOP is atomic.
@@ -253,6 +268,7 @@ try
     app.MapControllers();
     app.MapHub<ChatHub>("/hubs/chat");
     app.MapHub<VideoHub>("/hubs/video");
+    app.MapHub<GameHub>("/hubs/game");
 
     app.Run();
 }
