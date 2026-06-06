@@ -52,6 +52,29 @@ public sealed class GameRoomController : ControllerBase
     }
 
     // ───────────────────────────────────────────────────────────────
+    //  GET /api/game-rooms/health
+    //  Anonymous diagnostic endpoint. If this returns 200 with the
+    //  expected version string, we know the Gaming Hall assembly is
+    //  loaded and routed — which also means GameHub (same assembly,
+    //  registered side-by-side in Program.cs) IS in this build.
+    //
+    //  Bump `version` on each deploy that ships meaningful changes
+    //  so we can tell, from a single fetch, whether we're hitting a
+    //  fresh build or a stale cached image.
+    // ───────────────────────────────────────────────────────────────
+    [HttpGet("health")]
+    [AllowAnonymous]
+    public IActionResult Health()
+    {
+        return Ok(new
+        {
+            gameHubRegistered = true,
+            timestamp = DateTime.UtcNow,
+            version = "phase1-gaming-v1",
+        });
+    }
+
+    // ───────────────────────────────────────────────────────────────
     //  GET /api/game-rooms
     //  List currently-active rooms (lobby + playing). Ended rooms
     //  are filtered out — they'd be dead ends for new joiners.
