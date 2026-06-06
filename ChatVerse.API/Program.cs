@@ -270,6 +270,19 @@ try
     app.MapHub<VideoHub>("/hubs/video");
     app.MapHub<GameHub>("/hubs/game");
 
+    // ── Startup banner ────────────────────────────────────────────
+    // Emit a clear, grep-friendly summary of WHICH hubs got mapped.
+    // Render's deploy logs make this the fastest way to confirm a
+    // fresh binary is running: if the GameHub line isn't visible at
+    // startup, we know the deployed DLL doesn't contain the route —
+    // before any client even tries to connect.
+    var startupLogger = app.Services.GetRequiredService<ILogger<Program>>();
+    startupLogger.LogInformation("=== ChatVerse SignalR hubs registered ===");
+    startupLogger.LogInformation("  ChatHub  @ /hubs/chat");
+    startupLogger.LogInformation("  VideoHub @ /hubs/video");
+    startupLogger.LogInformation("  GameHub  @ /hubs/game");
+    startupLogger.LogInformation("=== Build version: phase1-gaming-v1 — app ready ===");
+
     app.Run();
 }
 catch (Exception ex)

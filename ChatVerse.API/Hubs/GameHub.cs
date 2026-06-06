@@ -71,9 +71,14 @@ public class GameHub : Hub
     public override async Task OnConnectedAsync()
     {
         var username = JwtService.GetUsername(Context.User!);
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+        // Richer connection-arrival log — the userId helps cross-reference
+        // with REST audit trails when debugging multi-tab / multi-device
+        // sessions, and the explicit "GameHub" prefix makes filtering in
+        // Render's log search a single-keyword job.
         _logger.LogInformation(
-            "GameHub: {Username} connected [{ConnectionId}]",
-            username, Context.ConnectionId);
+            "GameHub: {Username} (userId={UserId}) connected [conn={ConnectionId}]",
+            username, userId, Context.ConnectionId);
         await base.OnConnectedAsync();
     }
 
