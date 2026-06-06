@@ -2,6 +2,16 @@ using System.Text.Json.Serialization;
 
 namespace ChatVerse.API.Models.Games;
 
+// NOTE on enum serialisation:
+// System.Text.Json's default behaviour ships enums as integers. That
+// works fine inside the .NET process but is a terrible wire format
+// for a React client — every "status === 2" check would be opaque.
+// Each enum below carries a [JsonConverter(typeof(JsonStringEnumConverter))]
+// attribute so it flows over both REST and SignalR as PascalCase
+// strings ("Playing", "Spectator", etc.). Adding the attribute on
+// each enum is safer than configuring a global MVC option because
+// it doesn't touch any of the existing controllers' wire formats.
+
 // ============================================================
 //  GAMING HALL — shared types
 //
@@ -22,6 +32,7 @@ namespace ChatVerse.API.Models.Games;
 ///   3) register the implementation in GameSessionFactory
 /// The hub + controller don't need to change.
 /// </summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
 public enum GameType
 {
     Quiz,
@@ -37,6 +48,7 @@ public enum GameType
 /// players without limiting audience size — critical for "viral" rooms
 /// where one quiz might attract 50+ watchers.
 /// </summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
 public enum GameRole
 {
     Player,
@@ -49,6 +61,7 @@ public enum GameRole
 ///   Playing — round in progress; submits accepted
 ///   Ended   — final scoreboard frozen; room read-only until reset
 /// </summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
 public enum GameStatus
 {
     Lobby,
@@ -56,6 +69,7 @@ public enum GameStatus
     Ended,
 }
 
+[JsonConverter(typeof(JsonStringEnumConverter))]
 public enum QuizDifficulty
 {
     Any,
@@ -68,6 +82,7 @@ public enum QuizDifficulty
 /// OpenTriviaDB categories we expose. Keep this list curated rather
 /// than dumping all 24 — too many options paralyse first-time users.
 /// </summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
 public enum QuizCategory
 {
     Any,
