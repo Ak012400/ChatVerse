@@ -270,16 +270,59 @@ public class AiPersonaService : BackgroundService
         //   • last message was from the OTHER persona → banter, agree,
         //     extend the thread (this is what makes two personas feel
         //     like a real conversation, not parallel monologues)
-        var isOpening = recent.Count == 0;
-        var lastSender = recent.Count > 0 ? recent[0].SenderName : null;
         var otherPersona = persona.Username == companionA.Username ? companionB : companionA;
+
+        // Identify which recent messages came from humans vs from AI hosts.
+        // The previous version fed every recent message back into the model
+        // as context, which produced a runaway feedback loop: an AI host
+        // mentions a topic once, that line lands in the next scan's context,
+        // the model dutifully continues the same topic, and the chat ends up
+        // talking about (e.g.) "Japan" for twenty straight messages with no
+        // human input. The fix is to be smarter about what gets included:
+        //   • If the last message is a real human, build the full context
+        //     and reply.
+        //   • If the LAST few messages are all AI, pretend the room is
+        //     fresh — open a new line instead of extending the old thread.
+        var aiUsernames = new HashSet<string>(StringComparer.Ordinal)
+        {
+            companionA.Username, companionB.Username,
+        };
+        var lastSender = recent.Count > 0 ? recent[0].SenderName : null;
         var lastWasOtherAi = lastSender == otherPersona.Username;
+        var lastWasHuman = recent.Count > 0 && !aiUsernames.Contains(recent[0].SenderName);
+
+        // "Effectively opening" = either the room is genuinely empty, or the
+        // last 4 messages are all AI hosts with no human in between. In that
+        // case the model should pivot to a fresh topic rather than reply to
+        // a dead AI thread.
+        var aiOnlyTrail = recent.Count > 0
+            && recent.Take(4).All(m => aiUsernames.Contains(m.SenderName));
+        var isOpening = recent.Count == 0;
+        var pivotToFresh = !isOpening && aiOnlyTrail;
+
+        // Topic pool to nudge the model away from sticky topics. Picked
+        // deterministically per scan tick so neither persona can lock onto
+        // a single theme.
+        var freshTopics = new[]
+        {
+            "your weekend plans", "something funny that happened today",
+            "a song you can't get out of your head", "your favourite chai/coffee spot",
+            "a tiny life-hack you wish you knew earlier",
+            "what you'd cook tonight if guests were coming",
+            "a hobby you've been meaning to start",
+            "a movie or show you'd rewatch tomorrow",
+            "a small win from this week",
+            "a quirky observation about your city",
+        };
+        var freshTopic = freshTopics[(int)(((uint)(roomName + ":" + DateTime.UtcNow.ToString("yyyyMMddHHmm")).GetHashCode()) % (uint)freshTopics.Length)];
 
         string sceneRule;
         if (isOpening)
             sceneRule = $"- The room is quiet. You just walked in alongside your friend {otherPersona.Username}. Drop a single warm greeting that fits the room theme — make any stranger feel welcome.";
+        else if (pivotToFresh)
+            sceneRule = $"- The room has been quiet (no one has spoken for a while). Pivot to a FRESH topic — try something like \"{freshTopic}\". Do NOT continue the previous topic, that thread is over. One short line, casual tone.";
         else if (lastWasOtherAi)
-            sceneRule = $"- {otherPersona.Username} just said something. React naturally — agree, tease, extend, or pivot. You two are friends who hang out here.";
+            sceneRule = $"- {otherPersona.Username} just said something. React naturally — agree briefly then add NEW information or pivot. Do NOT just rephrase what they said. One short line.";
         else
             sceneRule = "- Reply naturally to what the human just said. Don't echo them back. Keep it short and warm.";
 
@@ -297,6 +340,11 @@ public class AiPersonaService : BackgroundService
         - Don't mention you are an AI, but never claim to be human if asked directly —
           deflect with humour. Never give medical, legal, or financial advice.
         - Don't open every message with "Hey" or with the other person's name.
+        - CRITICAL: Do NOT repeat or extend the dominant topic of the previous
+          messages unless a human just brought it up. Vary topics actively —
+          if the last 2-3 lines were about one subject, switch to something new.
+        - Avoid naming specific countries / places / brands unless a human has
+          just mentioned them. Stay grounded in your own persona's background.
         {{sceneRule}}
         """;
 
@@ -305,16 +353,25 @@ public class AiPersonaService : BackgroundService
             new("system", system)
         };
 
-        // Recent messages oldest-first, formatted "name: text" so the model
-        // has speaker attribution without needing structured turns.
-        foreach (var m in recent.OrderBy(m => m.CreatedAt))
-            msgs.Add(new("user", $"{m.SenderName}: {m.Content}"));
+        // Context construction:
+        //   • If a human spoke recently, include all recent context so the AI
+        //     can respond meaningfully.
+        //   • Otherwise (pivoting to fresh), include NOTHING from the AI-only
+        //     trail — the prompt above tells the model to start fresh, and
+        //     including the stale thread would just tempt it to continue.
+        if (!pivotToFresh)
+        {
+            foreach (var m in recent.OrderBy(m => m.CreatedAt))
+                msgs.Add(new("user", $"{m.SenderName}: {m.Content}"));
+        }
 
         msgs.Add(new("user", isOpening
             ? "(You just walked into the room. Greet warmly with one short line that fits the theme.)"
-            : lastWasOtherAi
-                ? $"(React to what your friend {otherPersona.Username} just said. Keep it short and natural.)"
-                : "(Reply to what the human just said. Keep it short and warm.)"));
+            : pivotToFresh
+                ? $"(The previous topic is dead. Open a fresh line — try {freshTopic}. One short casual sentence.)"
+                : lastWasOtherAi
+                    ? $"(React to what your friend {otherPersona.Username} just said in ONE short line — add a new angle, don't restate.)"
+                    : "(Reply to what the human just said. Keep it short and warm.)"));
 
         var reply = await ai.CompleteAsync(
             new AiChatProvider.ChatRequest(msgs, Temperature: 0.8, MaxTokens: 80),
