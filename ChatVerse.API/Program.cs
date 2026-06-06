@@ -88,7 +88,22 @@ try
             ClockSkew = TimeSpan.Zero
         };
 
-        // SignalR sends JWT via query string
+        // SignalR sends JWT via query string.
+        //
+        // WebSocket upgrade requests can't carry Authorization headers
+        // (browsers don't expose the API), so SignalR's JS client falls
+        // back to passing the token as `?access_token=…`. We grab that
+        // here and feed it into the bearer pipeline.
+        //
+        // The path guard ensures we don't accept query-string tokens for
+        // regular HTTP endpoints (where headers ARE available and abuse
+        // via leaked URLs is a real concern — query strings end up in
+        // server access logs, referer headers, etc.).
+        //
+        // Using "/hubs" as the umbrella prefix instead of hard-coding
+        // each hub name. Every new hub we add (GameHub today, more
+        // tomorrow) auto-inherits the auth path rule with no edit here
+        // — which is exactly the bug that made /hubs/game 401 before.
         options.Events = new JwtBearerEvents
         {
             OnMessageReceived = context =>
@@ -96,8 +111,7 @@ try
                 var accessToken = context.Request.Query["access_token"];
                 var path = context.HttpContext.Request.Path;
                 if (!string.IsNullOrEmpty(accessToken) &&
-                   (path.StartsWithSegments("/hubs/chat") ||
-                    path.StartsWithSegments("/hubs/video")))
+                    path.StartsWithSegments("/hubs"))
                 {
                     context.Token = accessToken;
                 }
