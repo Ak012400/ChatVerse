@@ -134,8 +134,29 @@ public class AuthController : ControllerBase
         var otpCode = GenerateOtpCode();
         await _redis.SetRegistrationOtpAsync(req.Email, otpCode);
 
-        await _email.SendOtpEmailAsync(req.Email, otpCode, "email_verification");
-        _logger.LogInformation("Registration OTP sent to {Email}", req.Email);
+        // Fire-and-forget the SMTP send so a slow / unreachable mail
+        // provider can't block the HTTP response. If SendOtpEmailAsync
+        // returns false (timeout, auth failure, etc.) the error is logged
+        // by the email service itself. The user still gets a 200 OK
+        // immediately — they'll discover the missing email via the
+        // VerifyOtp page's "didn't get a code?" resend button.
+        var bgEmail = req.Email;
+        var bgCode = otpCode;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var ok = await _email.SendOtpEmailAsync(bgEmail, bgCode, "email_verification");
+                if (ok)
+                    _logger.LogInformation("Registration OTP delivered to {Email}", bgEmail);
+                else
+                    _logger.LogWarning("Registration OTP send FAILED for {Email}", bgEmail);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Background OTP send threw for {Email}", bgEmail);
+            }
+        });
 
         return Ok(ApiResponse<object>.Ok(new
         {
@@ -566,8 +587,22 @@ public class AuthController : ControllerBase
         var otpCode = GenerateOtpCode();
         await _redis.SetRegistrationOtpAsync(req.Email, otpCode);
 
-        await _email.SendOtpEmailAsync(req.Email, otpCode, "email_verification");
-        _logger.LogInformation("Registration OTP resent to {Email}", req.Email);
+        // Fire-and-forget — same rationale as Register. Respond immediately.
+        var bgEmail = req.Email;
+        var bgCode = otpCode;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var ok = await _email.SendOtpEmailAsync(bgEmail, bgCode, "email_verification");
+                _logger.Log(ok ? LogLevel.Information : LogLevel.Warning,
+                    "Registration OTP resend {Status} for {Email}", ok ? "OK" : "FAILED", bgEmail);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Background OTP resend threw for {Email}", bgEmail);
+            }
+        });
 
         return Ok(ApiResponse.Ok("OTP resent successfully"));
     }
@@ -597,15 +632,25 @@ public class AuthController : ControllerBase
         {
             var code = GenerateOtpCode();
             await _redis.SetPasswordResetCodeAsync(req.Email, code);
-            try
+            // Fire-and-forget (see Register). The endpoint must respond in
+            // constant time anyway to avoid account-enumeration leaks via
+            // timing, so blocking on SMTP would be a bug regardless of
+            // performance considerations.
+            var bgEmail = req.Email;
+            var bgCode = code;
+            _ = Task.Run(async () =>
             {
-                await _email.SendOtpEmailAsync(req.Email, code, "password_reset");
-                _logger.LogInformation("Password reset code sent to {Email}", req.Email);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Password reset email failed");
-            }
+                try
+                {
+                    var ok = await _email.SendOtpEmailAsync(bgEmail, bgCode, "password_reset");
+                    _logger.Log(ok ? LogLevel.Information : LogLevel.Warning,
+                        "Password reset {Status} for {Email}", ok ? "OK" : "FAILED", bgEmail);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Password reset email failed");
+                }
+            });
         }
 
         // Generic message regardless.
@@ -700,8 +745,22 @@ public class AuthController : ControllerBase
             var otpCode = GenerateOtpCode();
             var expiresAt = DateTime.UtcNow.AddMinutes(Otp.ExpiryMinutes);
             await _postgres.UpsertOtpAsync(req.Email, otpCode, OtpPurpose.EmailVerification, expiresAt);
-            await _email.SendOtpEmailAsync(req.Email, otpCode, "email_verification");
-            _logger.LogInformation("Upgrade OTP sent to {Email}", req.Email);
+            // Fire-and-forget — same pattern as Register / Resend.
+            var bgEmail = req.Email;
+            var bgCode = otpCode;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var ok = await _email.SendOtpEmailAsync(bgEmail, bgCode, "email_verification");
+                    _logger.Log(ok ? LogLevel.Information : LogLevel.Warning,
+                        "Upgrade OTP {Status} for {Email}", ok ? "OK" : "FAILED", bgEmail);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Background upgrade OTP send threw for {Email}", bgEmail);
+                }
+            });
         }
 
         return Ok(ApiResponse.Ok("Account upgraded. Please verify your email."));

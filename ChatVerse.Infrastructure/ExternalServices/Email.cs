@@ -128,19 +128,34 @@ public class BrevoEmailService
             }.ToMessageBody();
 
             using var client = new SmtpClient();
+            // 15-second timeout on each socket op. Default MailKit timeout
+            // is effectively the OS default (~2 minutes), which is far too
+            // long when the SMTP host is unreachable — it ties up the API
+            // worker and the user's HTTP request waits forever. With 15s
+            // we surface the failure quickly enough that the caller can
+            // log + move on, while still being generous for slow handshakes.
+            client.Timeout = 15_000;
+
             // 465 = implicit SSL; 587 = STARTTLS (Gmail default).
             var secureOpts = _smtpPort == 465
                 ? SecureSocketOptions.SslOnConnect
                 : SecureSocketOptions.StartTls;
 
-            await client.ConnectAsync(_smtpHost, _smtpPort, secureOpts);
-            await client.AuthenticateAsync(_smtpUser, _smtpPass);
-            await client.SendAsync(msg);
-            await client.DisconnectAsync(true);
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            await client.ConnectAsync(_smtpHost, _smtpPort, secureOpts, cts.Token);
+            await client.AuthenticateAsync(_smtpUser, _smtpPass, cts.Token);
+            await client.SendAsync(msg, cts.Token);
+            await client.DisconnectAsync(true, cts.Token);
 
             _logger.LogInformation(
                 "Email sent to {Email} — Subject: {Subject}", toEmail, subject);
             return true;
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogError("SMTP send to {Email} timed out (host={Host}:{Port})",
+                toEmail, _smtpHost, _smtpPort);
+            return false;
         }
         catch (Exception ex)
         {
