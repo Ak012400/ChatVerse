@@ -232,6 +232,16 @@ try
     // JokesProvider hits icanhazdadjoke.com. Same typed-client pattern
     // so its 5s timeout + UA header don't leak into other outbound calls.
     builder.Services.AddHttpClient<ChatVerse.API.Services.Games.JokesProvider>();
+    // Tech Talk news feed — pulls HN + dev.to, caches in Redis.
+    builder.Services.AddHttpClient<ChatVerse.API.Services.Games.TechNewsProvider>();
+    // Ambient-question feed: wraps QuizQuestionProvider for MCQs and a
+    // curated bank for discussion prompts. Scoped because the wrapped
+    // provider already lives at a defined lifetime.
+    builder.Services.AddScoped<ChatVerse.API.Services.Games.AmbientQuestionProvider>();
+    // Background ticker that pushes ambient questions into themed chat
+    // rooms via the ChatHub. Safe to register unconditionally — does
+    // nothing harmful when nobody's in the rooms.
+    builder.Services.AddHostedService<ChatVerse.API.Services.AmbientQuestionService>();
     // Registry is per-process; singleton so the hub + ticker + REST
     // controller all share the same in-memory cache of active sessions.
     builder.Services.AddSingleton<ChatVerse.API.Services.Games.GameSessionRegistry>();

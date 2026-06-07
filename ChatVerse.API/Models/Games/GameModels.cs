@@ -317,3 +317,27 @@ public record JokeFinalStat(
     int LaughCount,
     int TotalReactions);
 
+// ============================================================
+//  AMBIENT QUESTIONS — the background trivia ticker that runs
+//  in gameable chat rooms (Gaming Lounge, Mini Game) to seed
+//  conversation. NOT tied to game sessions — these are just
+//  one-shot prompts pushed via the existing ChatHub.
+// ============================================================
+
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum AmbientQuestionMode
+{
+    /// <summary>4-option MCQ. Tapping an option seeds a chat reply.</summary>
+    Mcq,
+    /// <summary>Open-ended prompt. Users reply via normal chat.</summary>
+    Discussion,
+}
+
+public record AmbientQuestion(
+    string Id,
+    AmbientQuestionMode Mode,
+    string Text,
+    IReadOnlyList<string>? Options,
+    string Category,
+    DateTime EmittedAtUtc);
+
