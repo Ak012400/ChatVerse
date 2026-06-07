@@ -536,3 +536,19 @@ public record JoinRequestResolved(
     string UserId,
     JoinRequestStatus Status);
 
+// ─── Host invites (any game type) ──────────────────────────────
+
+/// <summary>
+/// Pushed to a SPECIFIC target user when a host invites them.
+/// Frontend renders a toast/modal with "Accept" → navigates to
+/// /play/{slug} and the JoinAsync flow admits them as Player
+/// (the invite token short-circuits the private-room request gate).
+/// </summary>
+public record GameRoomInvite(
+    string InviteId,
+    string Slug,
+    string RoomName,
+    GameType Type,
+    string FromUsername,
+    DateTime SentAtUtc);
+

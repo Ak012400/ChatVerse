@@ -70,6 +70,11 @@ public static class RedisKeys
     // every client of the Tech Talk room.
     public const string TechNewsCache = "tech-news:cache:global";
 
+    // Game-room invitation token. Set with TTL = 10 min so links
+    // shared but not used expire automatically.
+    // {inviteId} → "fromUserId:targetUserId:slug"
+    public static string GameInvite(string inviteId) => $"game:invite:{inviteId}";
+
     // Rolling quiz — always-on quiz in #general. Sessions roll
     // daily by UTC date (yyyyMMdd) so leaderboards reset cleanly.
     /// <summary>Current live question (full state including correct answer).</summary>
