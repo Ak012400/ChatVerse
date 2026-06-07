@@ -101,7 +101,10 @@ public sealed class GameSessionRegistry
         string hostUserId,
         string hostUsername,
         QuizSettings settings,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool isPublic = true,
+        string? sourceChatSlug = null,
+        bool isRandom = false)
     {
         var meta = new QuizRoomMeta
         {
@@ -112,12 +115,73 @@ public sealed class GameSessionRegistry
             CreatedAtUtc = DateTime.UtcNow,
             Settings = settings,
             Type = type,
+            IsPublic = isPublic,
+            SourceChatSlug = sourceChatSlug,
+            IsRandom = isRandom,
         };
         await SaveMetaAsync(meta);
         await AddToIndexAsync(slug);
 
         var session = await CreateAsync(slug, meta, ct);
         _sessions.TryAdd(slug, session);
+        return session;
+    }
+
+    /// <summary>
+    /// Get or create the always-on random room for a (chat slug, game
+    /// type) pair. Concurrency: uses a Redis pointer key with NX
+    /// semantics so two simultaneous callers don't both create rooms.
+    /// </summary>
+    public async Task<IGameSession> GetOrCreateRandomAsync(
+        string sourceChatSlug,
+        GameType type,
+        string requestingUserId,
+        string requestingUsername,
+        CancellationToken ct)
+    {
+        var pointerKey = RedisKeys.GameRandomPointer(sourceChatSlug, type.ToString());
+
+        // First read — fast path when the random room already exists.
+        var existingSlug = await _redis.GetStringAsync(pointerKey);
+        if (!string.IsNullOrEmpty(existingSlug))
+        {
+            var existing = await GetOrLoadAsync(existingSlug, ct);
+            // Pointer might be stale (room TTL'd out from Redis but
+            // pointer hasn't expired yet). If the session truly is
+            // gone or has ended, fall through to create a fresh one.
+            if (existing is not null && existing.Status != GameStatus.Ended)
+                return existing;
+            await _redis.DeleteKeyAsync(pointerKey);
+        }
+
+        // Slow path — create a new random room.
+        var defaultSettings = new QuizSettings
+        {
+            Category = QuizCategory.Any,
+            Difficulty = QuizDifficulty.Any,
+            QuestionCount = type == GameType.Jokes ? 10 : 10,
+            SecondsPerQuestion = type == GameType.Jokes ? 30 : 15,
+            MaxPlayers = 8,
+        };
+        var slug = $"r-{sourceChatSlug}-{type.ToString().ToLowerInvariant()}-{Guid.NewGuid().ToString("N")[..6]}";
+        var name = type == GameType.Jokes
+            ? "🎲 Random Jokes Roast"
+            : "🎲 Random Quiz";
+
+        var session = await CreateAsync(
+            slug, type, name,
+            requestingUserId, requestingUsername,
+            defaultSettings, ct,
+            isPublic: true,
+            sourceChatSlug: sourceChatSlug,
+            isRandom: true);
+
+        // Save the pointer with the same TTL as the room state so they
+        // expire together. NOT using NX here because we already lost
+        // the race if another caller created concurrently — they win;
+        // we still hand back OUR session for this call but the next
+        // call will hit their pointer. Tiny window, low cost.
+        await _redis.SetStringAsync(pointerKey, slug, RedisTTL.GameRoom);
         return session;
     }
 
@@ -135,10 +199,21 @@ public sealed class GameSessionRegistry
     }
 
     /// <summary>
-    /// List active rooms for the lobby page. Reads ONLY meta — never
-    /// hydrates full sessions — so this is cheap even at 100+ rooms.
+    /// List active rooms. Reads ONLY meta — never hydrates full
+    /// sessions — so this is cheap even at 100+ rooms.
+    ///
+    /// Filters:
+    ///   • <paramref name="sourceChatSlug"/> — when non-null, only
+    ///     rooms with matching SourceChatSlug are returned. Used by
+    ///     the chat-embedded Active Games panel.
+    ///   • <paramref name="publicOnly"/> — when true (default), private
+    ///     rooms are filtered out. The standalone Gaming Hall page
+    ///     passes false to show its own private rooms to their hosts.
     /// </summary>
-    public async Task<List<GameRoomDto>> ListActiveAsync(CancellationToken ct)
+    public async Task<List<GameRoomDto>> ListActiveAsync(
+        CancellationToken ct,
+        string? sourceChatSlug = null,
+        bool publicOnly = true)
     {
         var slugs = await ReadIndexAsync();
         var rooms = new List<GameRoomDto>(slugs.Count);
@@ -147,6 +222,14 @@ public sealed class GameSessionRegistry
         {
             var meta = await LoadMetaAsync(slug);
             if (meta is null) continue;
+
+            // Apply filters BEFORE the expensive hot-session lookups —
+            // most rooms won't survive the filter, so do the cheap
+            // gate first.
+            if (publicOnly && !meta.IsPublic) continue;
+            if (sourceChatSlug is not null &&
+                !string.Equals(meta.SourceChatSlug, sourceChatSlug, StringComparison.OrdinalIgnoreCase))
+                continue;
 
             // For room counts, prefer the hot session (most up-to-date)
             // but fall back to the persisted state for rooms that aren't
@@ -162,7 +245,12 @@ public sealed class GameSessionRegistry
                     MaxPlayers: meta.Settings.MaxPlayers,
                     SpectatorCount: hot.SpectatorCount,
                     HostUsername: meta.HostUsername,
-                    CreatedAtUtc: meta.CreatedAtUtc));
+                    CreatedAtUtc: meta.CreatedAtUtc)
+                {
+                    IsPublic = meta.IsPublic,
+                    IsRandom = meta.IsRandom,
+                    SourceChatSlug = meta.SourceChatSlug,
+                });
             }
             else
             {
@@ -176,13 +264,21 @@ public sealed class GameSessionRegistry
                     MaxPlayers: meta.Settings.MaxPlayers,
                     SpectatorCount: snap?.SpectatorCount ?? 0,
                     HostUsername: meta.HostUsername,
-                    CreatedAtUtc: meta.CreatedAtUtc));
+                    CreatedAtUtc: meta.CreatedAtUtc)
+                {
+                    IsPublic = meta.IsPublic,
+                    IsRandom = meta.IsRandom,
+                    SourceChatSlug = meta.SourceChatSlug,
+                });
             }
         }
 
-        // Most recent first — easier to scan for "is my friend's room
-        // up yet" without scrolling.
-        return rooms.OrderByDescending(r => r.CreatedAtUtc).ToList();
+        // Random rooms float to the top so users see the always-on
+        // option first; remaining rooms sort by creation time.
+        return rooms
+            .OrderByDescending(r => r.IsRandom)
+            .ThenByDescending(r => r.CreatedAtUtc)
+            .ToList();
     }
 
     // ───────────────────────────────────────────────────────────────

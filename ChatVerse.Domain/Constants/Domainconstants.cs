@@ -58,6 +58,13 @@ public static class RedisKeys
     // icanhazdadjoke cache. Single global pool — no per-difficulty
     // segmentation since dad jokes don't have difficulty levels.
     public const string JokesCache = "jokes:cache:global";
+
+    // Random-room pointer. One pointer per (chatSlug, gameType) tuple
+    // → slug of the currently-active random room. Set with NX so a
+    // race between two simultaneous "Join Random" requests still
+    // results in exactly one room being created.
+    public static string GameRandomPointer(string chatSlug, string gameType)
+        => $"game:random:{chatSlug}:{gameType.ToLowerInvariant()}";
 }
 
 public static class RedisTTL
