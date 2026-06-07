@@ -692,6 +692,13 @@ public sealed class QuizRoomMeta
     public string HostUsername { get; set; } = "";
     public DateTime CreatedAtUtc { get; set; }
     public QuizSettings Settings { get; set; } = new();
+    /// <summary>
+    /// Game type — selected at create time, persisted with the meta so
+    /// the registry can hydrate the right session impl on restart.
+    /// Defaults to Quiz for backward compatibility with Phase 1 rooms
+    /// that were persisted before this field existed.
+    /// </summary>
+    public GameType Type { get; set; } = GameType.Quiz;
 }
 
 public sealed class QuizSettings

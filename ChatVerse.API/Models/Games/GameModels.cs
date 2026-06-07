@@ -212,3 +212,72 @@ public record GameChatMessage(
     DateTime AtUtc);
 
 public record SendChatRequest(string Text);
+
+// ============================================================
+//  JOKES MODE — DTOs for the second game type.
+//
+//  Reuses QuizRoomMeta + QuizSettings on the meta side (QuestionCount
+//  doubles as JokeCount, SecondsPerQuestion as SecondsPerJoke) so the
+//  REST controller and registry need zero schema changes. Only the
+//  in-flight event payloads are unique to Jokes.
+// ============================================================
+
+/// <summary>
+/// Four-emoji reaction palette for jokes. Wide enough that everyone
+/// finds a button that fits their taste, narrow enough that the bar
+/// chart stays readable.
+/// </summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum JokeReactionType
+{
+    Laugh,      // 😂
+    Meh,        // 😐
+    Skull,      // 💀  ("dead"-funny / cringe — context-dependent)
+    EyeRoll,    // 🙄
+}
+
+/// <summary>
+/// What the client sees when a fresh joke is pushed by the bot.
+/// </summary>
+public record JokePushed(
+    string Id,
+    string Text,
+    int JokeNumber,
+    int TotalJokes,
+    DateTime DeadlineUtc);
+
+/// <summary>
+/// Live reaction counts — broadcast on every submission so the bar
+/// chart animates in near-real-time. Keys are reaction enum names.
+/// </summary>
+public record JokeReactionsUpdated(
+    string JokeId,
+    Dictionary<JokeReactionType, int> Counts,
+    int TotalReactions);
+
+/// <summary>
+/// Per-player reaction submission. Last write wins — players can
+/// change their pick until the deadline.
+/// </summary>
+public record JokeReactSubmit(string JokeId, JokeReactionType Reaction);
+
+/// <summary>
+/// What the client sees when the joke is finished — final counts
+/// plus the "winner" reaction so the UI can show "Most people: 😂".
+/// </summary>
+public record JokeRevealed(
+    string JokeId,
+    string Text,
+    Dictionary<JokeReactionType, int> Counts,
+    JokeReactionType TopReaction);
+
+/// <summary>
+/// One row in the final Funny Stats leaderboard. Sort by LaughCount
+/// (descending) to declare the "funniest joke" of the round.
+/// </summary>
+public record JokeFinalStat(
+    string JokeId,
+    string Text,
+    int LaughCount,
+    int TotalReactions);
+

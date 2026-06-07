@@ -33,6 +33,7 @@ public sealed class GameSessionRegistry
 {
     private readonly RedisService _redis;
     private readonly QuizQuestionProvider _questions;
+    private readonly JokesProvider _jokes;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<GameSessionRegistry> _logger;
 
@@ -48,11 +49,13 @@ public sealed class GameSessionRegistry
     public GameSessionRegistry(
         RedisService redis,
         QuizQuestionProvider questions,
+        JokesProvider jokes,
         ILoggerFactory loggerFactory,
         ILogger<GameSessionRegistry> logger)
     {
         _redis = redis;
         _questions = questions;
+        _jokes = jokes;
         _loggerFactory = loggerFactory;
         _logger = logger;
     }
@@ -108,6 +111,7 @@ public sealed class GameSessionRegistry
             HostUsername = hostUsername,
             CreatedAtUtc = DateTime.UtcNow,
             Settings = settings,
+            Type = type,
         };
         await SaveMetaAsync(meta);
         await AddToIndexAsync(slug);
@@ -166,7 +170,7 @@ public sealed class GameSessionRegistry
                 rooms.Add(new GameRoomDto(
                     Slug: slug,
                     Name: meta.Name,
-                    Type: GameType.Quiz,
+                    Type: meta.Type,
                     Status: snap?.Status ?? GameStatus.Lobby,
                     PlayerCount: snap?.PlayerCount ?? 0,
                     MaxPlayers: meta.Settings.MaxPlayers,
@@ -188,11 +192,21 @@ public sealed class GameSessionRegistry
     private async Task<IGameSession> CreateAsync(
         string slug, QuizRoomMeta meta, CancellationToken ct)
     {
-        // Today: every room is a Quiz. The factory dispatch lives
-        // here, so adding Chess later is a single switch arm.
-        IGameSession session = new QuizSession(
-            slug, meta, _redis, _questions,
-            _loggerFactory.CreateLogger<QuizSession>());
+        // Factory dispatch keyed off the persisted meta.Type. Adding a
+        // new game (Chess, Ludo, …) is a single switch arm here plus a
+        // new IGameSession implementation — the hub and ticker don't
+        // need to know about specific game types.
+        IGameSession session = meta.Type switch
+        {
+            GameType.Jokes => new JokesSession(
+                slug, meta, _redis, _jokes,
+                _loggerFactory.CreateLogger<JokesSession>()),
+            // Quiz, Trivia, and anything else default to QuizSession.
+            // (Trivia is a frontend preset that reuses Quiz mechanics.)
+            _ => new QuizSession(
+                slug, meta, _redis, _questions,
+                _loggerFactory.CreateLogger<QuizSession>()),
+        };
         await session.InitializeAsync(ct);
         return session;
     }

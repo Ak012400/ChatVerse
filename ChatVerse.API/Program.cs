@@ -229,6 +229,9 @@ try
     // an isolated lifetime so its 6s timeout doesn't bleed into other
     // outbound calls (Groq, Cloudinary, etc).
     builder.Services.AddHttpClient<ChatVerse.API.Services.Games.QuizQuestionProvider>();
+    // JokesProvider hits icanhazdadjoke.com. Same typed-client pattern
+    // so its 5s timeout + UA header don't leak into other outbound calls.
+    builder.Services.AddHttpClient<ChatVerse.API.Services.Games.JokesProvider>();
     // Registry is per-process; singleton so the hub + ticker + REST
     // controller all share the same in-memory cache of active sessions.
     builder.Services.AddSingleton<ChatVerse.API.Services.Games.GameSessionRegistry>();

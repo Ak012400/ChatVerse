@@ -110,6 +110,15 @@ public interface IGameSession : IAsyncDisposable
         GameRole senderRole,
         string text,
         CancellationToken ct);
+
+    /// <summary>
+    /// Pop accumulated GameEvent items emitted since the previous
+    /// call. The hub + ticker poll this after every state-changing
+    /// invocation and broadcast each event to the room's SignalR
+    /// group. Implementations must guarantee each event is yielded
+    /// exactly once (typically via a ConcurrentQueue).
+    /// </summary>
+    IReadOnlyList<GameEvent> DrainEvents();
 }
 
 /// <summary>
