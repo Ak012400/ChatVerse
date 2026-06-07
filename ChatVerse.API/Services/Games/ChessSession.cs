@@ -363,19 +363,17 @@ public sealed class ChessSession : IGameSession
             if (p is null) return;
 
             _state.Participants.Remove(p);
+            var hostLeft = p.IsHost;
+
             // Vacate seat if a Player walks away — counts as a resign
             // mid-game (the other side wins by default), or just frees
             // the seat if still in lobby.
             if (p.Role == GameRole.Player && _state.Status == GameStatus.Playing)
             {
                 if (userId == _state.WhitePlayerId)
-                {
                     _state.Result = ChessResult.BlackWins;
-                }
                 else if (userId == _state.BlackPlayerId)
-                {
                     _state.Result = ChessResult.WhiteWins;
-                }
                 _state.Status = GameStatus.Ended;
                 _pendingEvents.Enqueue(new GameEndedEvent(
                     new List<ScoreEntry>(), $"{p.Username} disconnected — game forfeited."));
@@ -386,6 +384,25 @@ public sealed class ChessSession : IGameSession
                 if (userId == _state.WhitePlayerId) { _state.WhitePlayerId = null; _state.WhitePlayerName = null; }
                 if (userId == _state.BlackPlayerId) { _state.BlackPlayerId = null; _state.BlackPlayerName = null; }
             }
+
+            // HOST-LEAVES POLICY (the consistency the user asked for):
+            //  • Lobby → kill room immediately. A creator who walked out
+            //    before the game began isn't coming back; the slug is
+            //    dead weight in the active-rooms index. Spectators get
+            //    a clean "host disconnected" message and bounce back.
+            //  • Playing → already ended above as a forfeit; downgrade
+            //    the persistence TTL so the result page stays visible
+            //    for a few minutes but doesn't clutter discovery.
+            //  • Ended → nothing to do (will be GC'd by TTL anyway).
+            if (hostLeft && _state.Status == GameStatus.Lobby)
+            {
+                _state.Status = GameStatus.Ended;
+                _state.Result = ChessResult.Aborted;
+                _pendingEvents.Enqueue(new GameEndedEvent(
+                    new List<ScoreEntry>(),
+                    "Host disconnected before the game began."));
+            }
+
             await PersistStateUnsafeAsync();
             _pendingEvents.Enqueue(new ParticipantLeftEvent(userId));
         }
