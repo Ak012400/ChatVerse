@@ -209,6 +209,107 @@ public class GameHub : Hub
     }
 
     // ───────────────────────────────────────────────────────────────
+    //  CHESS — move submission, resign, snapshot pull, join requests
+    //
+    //  All chess actions guard against guest auth — we re-check the
+    //  JWT's "is_guest" claim before any mutating call.
+    // ───────────────────────────────────────────────────────────────
+
+    public async Task SubmitChessMove(string slug, string san, string uci, string fenAfter)
+    {
+        // Guests can connect to the hub and chat, but mutations are
+        // strictly registered-only.
+        if (IsGuest()) {
+            await Clients.Caller.SendAsync("Error",
+                new { message = "Sign in to make moves." });
+            return;
+        }
+
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is null) return;
+
+        var payload = JsonSerializer.SerializeToElement(new ChessMoveSubmit(san, uci, fenAfter));
+        var result = await session.SubmitMoveAsync(userId, payload, Context.ConnectionAborted);
+
+        await Clients.Caller.SendAsync("ChessMoveAck",
+            new { accepted = result.Accepted, reason = result.Reason });
+        await FlushSessionEventsAsync(session, Context.ConnectionAborted);
+    }
+
+    public async Task ResignChess(string slug)
+    {
+        if (IsGuest()) return;
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is not ChessSession chess) return;
+
+        var result = await chess.ResignAsync(userId, Context.ConnectionAborted);
+        await Clients.Caller.SendAsync("ChessMoveAck",
+            new { accepted = result.Accepted, reason = result.Reason });
+        await FlushSessionEventsAsync(session, Context.ConnectionAborted);
+    }
+
+    /// <summary>
+    /// Late-joiner pulls full chess board state (FEN + history +
+    /// seating) so the page can paint without waiting for the next
+    /// broadcast.
+    /// </summary>
+    public async Task GetChessState(string slug)
+    {
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is not ChessSession chess) return;
+        var snap = await chess.GetChessSnapshotAsync(Context.ConnectionAborted);
+        await Clients.Caller.SendAsync("ChessStateSnapshot", snap);
+    }
+
+    /// <summary>
+    /// Host pulls the current pending-request list (e.g. on opening
+    /// the requests panel).
+    /// </summary>
+    public async Task GetPendingRequests(string slug)
+    {
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is not ChessSession chess) return;
+        var list = await chess.GetPendingRequestsAsync(Context.ConnectionAborted);
+        await Clients.Caller.SendAsync("PendingRequests", list);
+    }
+
+    public async Task ApproveJoinRequest(string slug, string requestId)
+    {
+        if (IsGuest()) return;
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is not ChessSession chess) return;
+
+        var result = await chess.ApproveJoinRequestAsync(userId, requestId, Context.ConnectionAborted);
+        await Clients.Caller.SendAsync("JoinRequestAck",
+            new { accepted = result.Accepted, reason = result.Reason });
+        await FlushSessionEventsAsync(session, Context.ConnectionAborted);
+    }
+
+    public async Task DeclineJoinRequest(string slug, string requestId)
+    {
+        if (IsGuest()) return;
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is not ChessSession chess) return;
+
+        var result = await chess.DeclineJoinRequestAsync(userId, requestId, Context.ConnectionAborted);
+        await Clients.Caller.SendAsync("JoinRequestAck",
+            new { accepted = result.Accepted, reason = result.Reason });
+        await FlushSessionEventsAsync(session, Context.ConnectionAborted);
+    }
+
+    // Pull "is_guest" from the JWT. Existing JwtClaims constant
+    // already defines this — see Domainconstants.cs.
+    private bool IsGuest()
+    {
+        var claim = Context.User?.FindFirst(ChatVerse.Domain.Constants.JwtClaims.IsGuest)?.Value;
+        return string.Equals(claim, "true", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // ───────────────────────────────────────────────────────────────
     //  SendChat — players + spectators
     // ───────────────────────────────────────────────────────────────
 

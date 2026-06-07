@@ -141,11 +141,11 @@ public sealed class GameRoomController : ControllerBase
         if (req.Name.Length > 40)
             return BadRequest(ApiResponse.Fail("Room name too long (40 max)."));
 
-        // Allow the launched game types only. Chess / Ludo remain
-        // gated until their sessions land in Phase 3.
-        if (req.Type != GameType.Quiz && req.Type != GameType.Jokes)
+        // Allow the launched game types. Ludo remains gated until
+        // its session lands in Sprint B.
+        if (req.Type != GameType.Quiz && req.Type != GameType.Jokes && req.Type != GameType.Chess)
             return BadRequest(ApiResponse.Fail(
-                $"Game type '{req.Type}' is not available yet. Try Quiz or Jokes."));
+                $"Game type '{req.Type}' is not available yet. Try Quiz, Jokes, or Chess."));
 
         if (req.MaxPlayers < MinPlayers || req.MaxPlayers > MaxPlayers)
             return BadRequest(ApiResponse.Fail(

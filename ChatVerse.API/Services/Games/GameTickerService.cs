@@ -173,6 +173,24 @@ public sealed class GameTickerService : BackgroundService
                     ct);
                 break;
 
+            // ─── Chess events ──────────────────────────────────────
+            case ChessGameStartedEvent cg:
+                await _hub.Clients.Group(group).SendAsync(
+                    "ChessGameStarted", cg.Snapshot, ct);
+                break;
+            case ChessMovePushedEvent cm:
+                await _hub.Clients.Group(group).SendAsync(
+                    "ChessMovePushed", cm.Move, ct);
+                break;
+            case JoinRequestedEvent jrq:
+                await _hub.Clients.Group(group).SendAsync(
+                    "JoinRequested", jrq.Request, ct);
+                break;
+            case JoinRequestResolvedEvent jrr:
+                await _hub.Clients.Group(group).SendAsync(
+                    "JoinRequestResolved", jrr.Resolution, ct);
+                break;
+
             default:
                 _logger.LogWarning("Unhandled GameEvent type {Type}", ev.GetType().Name);
                 break;

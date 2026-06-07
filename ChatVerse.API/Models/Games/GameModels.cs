@@ -418,3 +418,121 @@ public record RollingQuizLeaderboard(
     IReadOnlyList<RollingQuizLeaderEntry> Top,
     RollingQuizLeaderEntry? YouRow);
 
+// ============================================================
+//  CHESS — DTOs for the 2-player real-time chess game.
+//
+//  Server is move-RELAY authoritative (turn order + state
+//  tracking) but NOT validation-authoritative for v1 — clients
+//  use chess.js for move legality. If cheating becomes an
+//  issue, v2 will add server-side validation via a NuGet
+//  chess library. Casual two-friend matches don't need this yet.
+// ============================================================
+
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum ChessColor
+{
+    White,
+    Black,
+}
+
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum ChessResult
+{
+    /// <summary>Game is still in progress.</summary>
+    InProgress,
+    WhiteWins,
+    BlackWins,
+    Draw,
+    Aborted,
+}
+
+/// <summary>
+/// One half-ply move. SAN ("e4", "Nxf3", "O-O") is what chess.js
+/// exposes for display + history; UCI ("e2e4", "g1f3", "e1g1") is
+/// what we feed back into chess.js on reconnect to replay state.
+/// We send both rather than reconstructing one from the other
+/// because both libraries already produce both for free.
+/// </summary>
+public record ChessMove(
+    string San,
+    string Uci,
+    /// <summary>FEN string AFTER this move was applied. Lets new
+    /// joiners paint the current position instantly without
+    /// replaying every move.</summary>
+    string FenAfter,
+    /// <summary>Who made this move — for spectators rendering
+    /// "Alice played e4".</summary>
+    ChessColor By,
+    DateTime AtUtc);
+
+/// <summary>
+/// Pushed to all room members when a move is accepted. Includes
+/// updated game-end state if the move triggered checkmate /
+/// stalemate / threefold / 50-move.
+/// </summary>
+public record ChessMovePushed(
+    ChessMove Move,
+    int MoveNumber,
+    /// <summary>Whose turn it is AFTER this move.</summary>
+    ChessColor TurnAfter,
+    ChessResult Result,
+    /// <summary>Reason text when Result != InProgress
+    /// (e.g. "Checkmate", "Stalemate", "Resigned").</summary>
+    string? ResultDetail);
+
+public record ChessMoveSubmit(string San, string Uci, string FenAfter);
+
+/// <summary>
+/// Snapshot the client paints from on join / reconnect. Empty
+/// MoveHistory + starting FEN means the game hasn't begun.
+/// </summary>
+public record ChessStateSnapshot(
+    /// <summary>Current FEN. The "starting" FEN for an empty board
+    /// is the standard "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".</summary>
+    string Fen,
+    ChessColor Turn,
+    ChessResult Result,
+    IReadOnlyList<ChessMove> MoveHistory,
+    /// <summary>userId of the White player. Null if not yet seated.</summary>
+    string? WhitePlayerId,
+    string? WhitePlayerName,
+    string? BlackPlayerId,
+    string? BlackPlayerName);
+
+// ============================================================
+//  JOIN REQUEST FLOW — private rooms gate joiners through the
+//  host's approval list. Public rooms skip this entirely.
+//
+//  Lifecycle:
+//   1. User clicks Join on a private room
+//   2. Server enqueues JoinRequest, broadcasts JoinRequested
+//   3. Host sees a "Requests" panel, taps Approve / Decline
+//   4. Server updates state, broadcasts JoinRequestResolved
+//   5. On Approve: requesting user is moved into participants
+//                  as a Player (or Spectator if seats full)
+//
+//  Scope: per-room, per-session. Resolved requests aren't kept;
+//  declined users can re-request after a cooldown (60s) to
+//  avoid spam.
+// ============================================================
+
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum JoinRequestStatus
+{
+    Pending,
+    Approved,
+    Declined,
+}
+
+public record JoinRequest(
+    string Id,
+    string UserId,
+    string Username,
+    DateTime RequestedAtUtc,
+    JoinRequestStatus Status);
+
+public record JoinRequestResolved(
+    string RequestId,
+    string UserId,
+    JoinRequestStatus Status);
+
