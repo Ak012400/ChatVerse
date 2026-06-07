@@ -1,0 +1,58 @@
+# ─────────────────────────────────────────────────────────────
+#  CI — backend build verification
+#
+#  Runs on every push to `dev` and every PR targeting `master`
+#  or `dev`. The auto-merge workflow watches for THIS workflow's
+#  success on `dev` and fast-forwards `master` for you.
+#
+#  Add `dotnet test` here when you wire up a Tests project.
+# ─────────────────────────────────────────────────────────────
+name: CI
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [master, dev]
+
+# Concurrency: a fresh push to dev cancels any in-flight CI for
+# the previous commit so we don't waste runner minutes on stale code.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      # NuGet packages don't change as often as source — cache them
+      # to shave 30-60s off most builds. The key is keyed on the
+      # solution file (rare churn) so cache stays valid for weeks.
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/*.sln') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      - name: Restore dependencies
+        run: dotnet restore ChatVerse.sln
+
+      - name: Build (Release)
+        run: dotnet build ChatVerse.sln --configuration Release --no-restore
+
+      # No tests yet — uncomment when ChatVerse.Tests lands.
+      # - name: Test
+      #   run: dotnet test --no-build --configuration Release --verbosity normal

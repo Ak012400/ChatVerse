@@ -1,0 +1,81 @@
+# ─────────────────────────────────────────────────────────────
+#  Auto-merge dev → master
+#
+#  Triggered when the CI workflow finishes on the `dev` branch.
+#  If CI was green, fast-forward `master` to match `dev` and push
+#  — which in turn triggers Render's master-branch auto-deploy.
+#
+#  Safety: we use --ff-only so the merge fails loud if master and
+#  dev have diverged (e.g. someone pushed a hotfix directly to
+#  master). In that case you'd merge manually after reviewing.
+#
+#  Branch protection on master: keep it OFF, OR allow the default
+#  GITHUB_TOKEN to bypass. If you turn protection on later, swap
+#  the token for a fine-grained PAT stored as MERGE_PAT secret.
+# ─────────────────────────────────────────────────────────────
+name: Auto-merge dev → master
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [dev]
+
+permissions:
+  contents: write
+
+jobs:
+  merge:
+    name: Fast-forward master
+    runs-on: ubuntu-latest
+    # Only proceed when CI passed on a push to dev (not PRs).
+    if: >
+      ${{
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == 'dev' &&
+        github.event.workflow_run.event == 'push'
+      }}
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout master with full history
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          # Default GITHUB_TOKEN is enough as long as master isn't
+          # protected. If you add protection, swap for ${{ secrets.MERGE_PAT }}.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch dev
+        run: git fetch origin dev:dev
+
+      - name: Fast-forward merge
+        # --ff-only refuses to create a merge commit. If dev hasn't
+        # actually moved past master (e.g. CI ran on a PR), the merge
+        # is a no-op which exits 0. If branches diverged, we exit 1
+        # and the job goes red — you investigate manually.
+        run: |
+          set -e
+          if git merge-base --is-ancestor master dev; then
+            git merge --ff-only dev
+            echo "✅ master fast-forwarded to dev"
+          else
+            echo "::error::master and dev have diverged. Manual merge required."
+            exit 1
+          fi
+
+      - name: Push master
+        run: git push origin master
+
+      - name: Summarise
+        run: |
+          echo "## Auto-merge complete ✅" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Triggering CI run: ${{ github.event.workflow_run.html_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Render will redeploy in ~5-7 minutes." >> $GITHUB_STEP_SUMMARY
