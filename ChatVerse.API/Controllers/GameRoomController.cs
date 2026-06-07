@@ -75,16 +75,54 @@ public sealed class GameRoomController : ControllerBase
     }
 
     // ───────────────────────────────────────────────────────────────
-    //  GET /api/game-rooms
-    //  List currently-active rooms (lobby + playing). Ended rooms
-    //  are filtered out — they'd be dead ends for new joiners.
+    //  GET /api/game-rooms?source={chatSlug}
+    //  List currently-active rooms. Optional `source` query param
+    //  scopes the list to games launched from a specific chat room
+    //  (used by the chat-embedded Active Games panel). Ended rooms
+    //  are filtered out and private rooms are hidden.
     // ───────────────────────────────────────────────────────────────
     [HttpGet]
-    public async Task<IActionResult> ListActive(CancellationToken ct)
+    public async Task<IActionResult> ListActive(
+        [FromQuery] string? source,
+        CancellationToken ct)
     {
-        var rooms = await _registry.ListActiveAsync(ct);
+        var rooms = await _registry.ListActiveAsync(ct, sourceChatSlug: source, publicOnly: true);
         rooms = rooms.Where(r => r.Status != GameStatus.Ended).ToList();
         return Ok(ApiResponse<List<GameRoomDto>>.Ok(rooms));
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    //  GET /api/game-rooms/random?source={chatSlug}&type={Quiz|Jokes}
+    //  Get-or-create the always-on random room for this (chat, type)
+    //  pair. Caller is auto-added as Player (or Spectator if full).
+    //  Idempotent: repeat calls return the same slug.
+    // ───────────────────────────────────────────────────────────────
+    [HttpGet("random")]
+    public async Task<IActionResult> GetOrJoinRandom(
+        [FromQuery] string source,
+        [FromQuery] GameType type,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(source))
+            return BadRequest(ApiResponse.Fail("source query param is required."));
+        if (type != GameType.Quiz && type != GameType.Jokes)
+            return BadRequest(ApiResponse.Fail("Random rooms only support Quiz and Jokes."));
+
+        var userId = JwtService.GetUserId(User).ToString();
+        var username = JwtService.GetUsername(User);
+
+        var session = await _registry.GetOrCreateRandomAsync(source, type, userId, username, ct);
+
+        // Always attempt to add the caller — JoinAsync is idempotent
+        // and handles the "you were already in" case cleanly.
+        var join = await session.JoinAsync(userId, username, GameRole.Player, ct);
+
+        return Ok(ApiResponse<object>.Ok(new
+        {
+            slug = session.Slug,
+            assignedRole = join.AssignedRole.ToString(),
+            note = join.Reason,
+        }));
     }
 
     // ───────────────────────────────────────────────────────────────
@@ -134,21 +172,25 @@ public sealed class GameRoomController : ControllerBase
         };
 
         var session = await _registry.CreateAsync(
-            slug, req.Type, req.Name.Trim(), userId, username, settings, ct);
+            slug, req.Type, req.Name.Trim(), userId, username, settings, ct,
+            isPublic: req.IsPublic,
+            sourceChatSlug: req.SourceChatSlug,
+            isRandom: false);
 
         // Auto-join the host as a Player so they don't have to
         // double-tap (create → join).
         await session.JoinAsync(userId, username, GameRole.Player, ct);
 
         _logger.LogInformation(
-            "Game room {Slug} created by {User} (type={Type}, qCount={QC})",
-            slug, username, req.Type, req.QuestionCount);
+            "Game room {Slug} created by {User} (type={Type}, isPublic={IsPublic}, source={Source})",
+            slug, username, req.Type, req.IsPublic, req.SourceChatSlug ?? "(none)");
 
         return Ok(ApiResponse<object>.Ok(new
         {
             slug,
             name = req.Name.Trim(),
             type = req.Type,
+            isPublic = req.IsPublic,
         }));
     }
 

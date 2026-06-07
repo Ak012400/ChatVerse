@@ -699,6 +699,24 @@ public sealed class QuizRoomMeta
     /// that were persisted before this field existed.
     /// </summary>
     public GameType Type { get; set; } = GameType.Quiz;
+    /// <summary>
+    /// Public rooms show up in the chat's Active Games panel; private
+    /// rooms only join via direct URL. Default true (legacy rooms had
+    /// no concept of private so treating them as public is correct).
+    /// </summary>
+    public bool IsPublic { get; set; } = true;
+    /// <summary>
+    /// Marks the "always-on" random room. Exactly one random room
+    /// per (chatSlug, gameType) tuple at any time, tracked via a
+    /// pointer key in Redis (see <c>RedisKeys.GameRandomPointer</c>).
+    /// </summary>
+    public bool IsRandom { get; set; }
+    /// <summary>
+    /// Parent chat slug. Required for public-room discovery filter.
+    /// Null = "global / not chat-bound" (currently created via the
+    /// standalone Gaming Hall page, which we still keep alive).
+    /// </summary>
+    public string? SourceChatSlug { get; set; }
 }
 
 public sealed class QuizSettings

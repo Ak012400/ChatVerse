@@ -109,7 +109,25 @@ public record CreateGameRoomRequest(
     QuizCategory Category,
     QuizDifficulty Difficulty,
     int QuestionCount,
-    int SecondsPerQuestion);
+    int SecondsPerQuestion)
+{
+    /// <summary>
+    /// Public rooms appear in the chat's Active Games panel — anyone
+    /// in the source chat can browse + join. Private rooms are hidden
+    /// from the panel and only discoverable via the slug-URL the host
+    /// explicitly shares. Defaults to public for backward-compat with
+    /// pre-Phase-2 callers that don't send this field.
+    /// </summary>
+    public bool IsPublic { get; init; } = true;
+
+    /// <summary>
+    /// The chat-room slug this game was launched from (e.g.
+    /// "gaming-lounge"). Active-games discovery filters on this so
+    /// games started in Gaming Lounge don't bleed into Mini Game's
+    /// panel and vice-versa. Null for direct /games-page creates.
+    /// </summary>
+    public string? SourceChatSlug { get; init; }
+}
 
 public record JoinGameRoomRequest(GameRole Role);
 
@@ -126,7 +144,25 @@ public record GameRoomDto(
     int MaxPlayers,
     int SpectatorCount,
     string HostUsername,
-    DateTime CreatedAtUtc);
+    DateTime CreatedAtUtc)
+{
+    /// <summary>
+    /// Mirrors the meta flag. Frontend filters here too, defensively —
+    /// the backend already drops private rooms from ListActive, but
+    /// future direct-link previews can still distinguish the pill.
+    /// </summary>
+    public bool IsPublic { get; init; } = true;
+
+    /// <summary>
+    /// Marks the always-on random room so the UI can show a special
+    /// "🎲 Always on" badge and treat it differently (e.g. "Join" vs
+    /// "Watch" depending on slot availability).
+    /// </summary>
+    public bool IsRandom { get; init; }
+
+    /// <summary>Source chat slug — surfaced so the panel can verify match.</summary>
+    public string? SourceChatSlug { get; init; }
+}
 
 // ─── Quiz-specific payloads ────────────────────────────────────
 
