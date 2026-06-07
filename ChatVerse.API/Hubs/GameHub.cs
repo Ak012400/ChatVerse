@@ -310,6 +310,118 @@ public class GameHub : Hub
     }
 
     // ───────────────────────────────────────────────────────────────
+    //  Spectator → Player seat request
+    //
+    //  Works for any IGameSession that implements the upgrade path.
+    //  Chess uses it; Quiz/Jokes fall back to a friendly "wait for
+    //  next round" message until we add similar logic to them.
+    // ───────────────────────────────────────────────────────────────
+    public async Task RequestPlayerSeat(string slug)
+    {
+        if (IsGuest()) {
+            await Clients.Caller.SendAsync("Error",
+                new { message = "Sign in to request a player seat." });
+            return;
+        }
+
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+        var username = JwtService.GetUsername(Context.User!);
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is null) return;
+
+        if (session is ChessSession chess)
+        {
+            var result = await chess.RequestPlayerSeatAsync(userId, username, Context.ConnectionAborted);
+            await Clients.Caller.SendAsync("SeatRequestAck",
+                new { accepted = result.Accepted, reason = result.Reason });
+            await FlushSessionEventsAsync(session, Context.ConnectionAborted);
+            return;
+        }
+
+        await Clients.Caller.SendAsync("SeatRequestAck",
+            new { accepted = false, reason = "Wait for the next round to join as a player." });
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    //  Host invites
+    //
+    //  Host sends a targeted notification; recipient gets a toast
+    //  with Accept/Decline; Accept resolves the invite token and
+    //  returns the slug so the page can navigate to /play/{slug}.
+    //  10-min TTL on Redis token; one-shot consumption.
+    // ───────────────────────────────────────────────────────────────
+    public async Task InviteToGameRoom(string targetUserId, string slug)
+    {
+        if (IsGuest()) return;
+        var fromUserId = JwtService.GetUserId(Context.User!).ToString();
+        var fromUsername = JwtService.GetUsername(Context.User!);
+
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is null)
+        {
+            await Clients.Caller.SendAsync("Error",
+                new { message = "Room not found." });
+            return;
+        }
+        if (session.HostUserId != fromUserId)
+        {
+            await Clients.Caller.SendAsync("Error",
+                new { message = "Only the host can invite." });
+            return;
+        }
+
+        var snap = await session.GetSnapshotAsync(fromUserId, Context.ConnectionAborted);
+        var inviteId = Guid.NewGuid().ToString("N")[..12];
+        var token = $"{fromUserId}:{targetUserId}:{slug}";
+        await _redis.SetStringAsync(
+            ChatVerse.Domain.Constants.RedisKeys.GameInvite(inviteId),
+            token,
+            TimeSpan.FromMinutes(10));
+
+        var invite = new GameRoomInvite(
+            InviteId: inviteId,
+            Slug: slug,
+            RoomName: snap.Room.Name,
+            Type: snap.Room.Type,
+            FromUsername: fromUsername,
+            SentAtUtc: DateTime.UtcNow);
+
+        // Per-user push — only the targeted user sees this. SignalR's
+        // Clients.User(...) routes by the NameIdentifier claim, which
+        // our JwtService already populates with the user UUID.
+        await Clients.User(targetUserId).SendAsync("GameRoomInvite", invite);
+        await Clients.Caller.SendAsync("InviteSent",
+            new { inviteId, targetUserId });
+    }
+
+    public async Task AcceptInvite(string inviteId)
+    {
+        if (IsGuest()) return;
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+
+        var token = await _redis.GetStringAsync(
+            ChatVerse.Domain.Constants.RedisKeys.GameInvite(inviteId));
+        if (string.IsNullOrEmpty(token))
+        {
+            await Clients.Caller.SendAsync("InviteAck",
+                new { accepted = false, reason = "Invite expired or invalid." });
+            return;
+        }
+        var parts = token.Split(':');
+        if (parts.Length != 3 || parts[1] != userId)
+        {
+            await Clients.Caller.SendAsync("InviteAck",
+                new { accepted = false, reason = "Invite was not addressed to you." });
+            return;
+        }
+        var slug = parts[2];
+        await _redis.DeleteKeyAsync(ChatVerse.Domain.Constants.RedisKeys.GameInvite(inviteId));
+
+        await Clients.Caller.SendAsync("InviteAck",
+            new { accepted = true, slug });
+    }
+
+    // ───────────────────────────────────────────────────────────────
     //  SendChat — players + spectators
     // ───────────────────────────────────────────────────────────────
 

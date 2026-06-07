@@ -262,6 +262,70 @@ public sealed class ChessSession : IGameSession
         finally { _lock.Release(); }
     }
 
+    /// <summary>
+    /// Spectator asks for a Player seat. Decision tree:
+    ///   1. Already a Player → no-op success.
+    ///   2. Not in room → reject (must join the room first).
+    ///   3. Empty seat exists → admit immediately (upgrades role).
+    ///   4. Both seats taken → enqueue as JoinRequest for host
+    ///      approval. Host decides whether to swap the existing
+    ///      player out or keep them.
+    /// </summary>
+    public async Task<ActionResult> RequestPlayerSeatAsync(
+        string userId, string username, CancellationToken ct)
+    {
+        await EnsureInitialisedAsync(ct);
+        await _lock.WaitAsync(ct);
+        try
+        {
+            var p = _state.Participants.FirstOrDefault(x => x.UserId == userId);
+            if (p is null)
+                return new ActionResult(false, "Join the room first.");
+            if (p.Role == GameRole.Player)
+                return new ActionResult(true, "You're already a player.");
+
+            // Empty seat path — upgrade silently.
+            if (_state.Status == GameStatus.Lobby &&
+                (_state.WhitePlayerId is null || _state.BlackPlayerId is null))
+            {
+                p.Role = GameRole.Player;
+                if (_state.WhitePlayerId is null)
+                {
+                    _state.WhitePlayerId = userId;
+                    _state.WhitePlayerName = username;
+                }
+                else
+                {
+                    _state.BlackPlayerId = userId;
+                    _state.BlackPlayerName = username;
+                }
+                await PersistStateUnsafeAsync();
+                _pendingEvents.Enqueue(new ParticipantJoinedEvent(
+                    new GameParticipant(userId, username, GameRole.Player, p.IsHost, true)));
+                return new ActionResult(true, "Seat taken.");
+            }
+
+            // Full / mid-game path — enqueue for host approval.
+            if (_state.PendingRequests.Any(r => r.UserId == userId && r.Status == JoinRequestStatus.Pending))
+                return new ActionResult(true, "Request already pending.");
+
+            var req = new JoinRequestRecord
+            {
+                Id = Guid.NewGuid().ToString("N")[..12],
+                UserId = userId,
+                Username = username,
+                RequestedAtUtc = DateTime.UtcNow,
+                Status = JoinRequestStatus.Pending,
+            };
+            _state.PendingRequests.Add(req);
+            await PersistStateUnsafeAsync();
+            _pendingEvents.Enqueue(new JoinRequestedEvent(
+                new JoinRequest(req.Id, req.UserId, req.Username, req.RequestedAtUtc, req.Status)));
+            return new ActionResult(true, "Request sent to host.");
+        }
+        finally { _lock.Release(); }
+    }
+
     public async Task<ActionResult> DeclineJoinRequestAsync(
         string requestingUserId, string requestId, CancellationToken ct)
     {
