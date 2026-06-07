@@ -69,6 +69,23 @@ public static class RedisKeys
     // Tech Talk news feed cache. Single global key — same feed for
     // every client of the Tech Talk room.
     public const string TechNewsCache = "tech-news:cache:global";
+
+    // Rolling quiz — always-on quiz in #general. Sessions roll
+    // daily by UTC date (yyyyMMdd) so leaderboards reset cleanly.
+    /// <summary>Current live question (full state including correct answer).</summary>
+    public const string RollingQuizCurrent = "rolling-quiz:current";
+    /// <summary>Per-question submissions (hash: userId -> "choiceIndex|atTicks|isCorrect").</summary>
+    public static string RollingQuizSubmissions(string questionId)
+        => $"rolling-quiz:submissions:{questionId}";
+    /// <summary>Ordered list of userIds who answered correctly (for rank-based scoring).</summary>
+    public static string RollingQuizCorrectOrder(string questionId)
+        => $"rolling-quiz:correct:{questionId}";
+    /// <summary>Sorted set: userId → score for the day-bucket session.</summary>
+    public static string RollingQuizLeaderboard(string sessionId)
+        => $"rolling-quiz:leaderboard:{sessionId}";
+    /// <summary>Hash: userId → "username|correct|attempts" for richer leader rows.</summary>
+    public static string RollingQuizStats(string sessionId)
+        => $"rolling-quiz:stats:{sessionId}";
 }
 
 public static class RedisTTL

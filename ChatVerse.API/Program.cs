@@ -242,6 +242,9 @@ try
     // rooms via the ChatHub. Safe to register unconditionally — does
     // nothing harmful when nobody's in the rooms.
     builder.Services.AddHostedService<ChatVerse.API.Services.AmbientQuestionService>();
+    // Rolling quiz in #general — pushes a fresh MCQ every ~2 min,
+    // tallies submissions, broadcasts a per-day UTC leaderboard.
+    builder.Services.AddHostedService<ChatVerse.API.Services.RollingQuizService>();
     // Registry is per-process; singleton so the hub + ticker + REST
     // controller all share the same in-memory cache of active sessions.
     builder.Services.AddSingleton<ChatVerse.API.Services.Games.GameSessionRegistry>();

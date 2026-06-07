@@ -1,4 +1,6 @@
 ﻿using ChatVerse.API.Extensions;
+using ChatVerse.API.Models.Games;
+using ChatVerse.API.Services;
 using ChatVerse.Domain.Constants;
 using ChatVerse.Domain.Entities;
 using ChatVerse.Infrastructure.ExternalServices.OpenAI;
@@ -9,6 +11,8 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.DependencyInjection;
 using System.Collections.Concurrent;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace ChatVerse.API.Hubs;
 
@@ -583,6 +587,225 @@ public class ChatHub : Hub
 
         await _redis.DeleteKeyAsync($"directcall:invite:{inviteId}");
         await Clients.User(callerId).SendAsync("CallDeclined", new { inviteId, declinerId });
+    }
+
+    // ============================================================
+    //  ROLLING QUIZ — #general's always-on quiz round
+    //
+    //  Driven by the RollingQuizService BackgroundService. This RPC
+    //  only accepts user submissions and tallies them; the question
+    //  push + reveal happen entirely server-side on the service's
+    //  cadence. Method name "SubmitRollingQuizAnswer" matches what
+    //  useChatHub.submitRollingQuizAnswer invokes.
+    // ============================================================
+
+    private static readonly JsonSerializerOptions _rqJson = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        PropertyNameCaseInsensitive = true,
+        Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) },
+    };
+
+    public async Task SubmitRollingQuizAnswer(string questionId, int choiceIndex)
+    {
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+        var username = JwtService.GetUsername(Context.User!);
+
+        // 1) Load the current question. If id mismatches or the
+        //    deadline has already passed, reject cleanly.
+        var rawCurrent = await _redis.GetStringAsync(RedisKeys.RollingQuizCurrent);
+        if (string.IsNullOrEmpty(rawCurrent))
+        {
+            await Clients.Caller.SendAsync("RollingQuizAck",
+                new { accepted = false, reason = "No live question." });
+            return;
+        }
+
+        var current = JsonSerializer.Deserialize<RollingQuizService.RollingQuizState>(rawCurrent, _rqJson);
+        if (current is null || current.Id != questionId)
+        {
+            await Clients.Caller.SendAsync("RollingQuizAck",
+                new { accepted = false, reason = "Stale question." });
+            return;
+        }
+        if (DateTime.UtcNow > current.DeadlineUtc)
+        {
+            await Clients.Caller.SendAsync("RollingQuizAck",
+                new { accepted = false, reason = "Deadline passed." });
+            return;
+        }
+        if (choiceIndex < 0 || choiceIndex >= current.Options.Count)
+        {
+            await Clients.Caller.SendAsync("RollingQuizAck",
+                new { accepted = false, reason = "Choice out of range." });
+            return;
+        }
+
+        var subsKey = RedisKeys.RollingQuizSubmissions(current.Id);
+        var orderKey = RedisKeys.RollingQuizCorrectOrder(current.Id);
+        var statsKey = RedisKeys.RollingQuizStats(current.SessionId);
+
+        // 2) Reject duplicates so users can't spam-tap to hunt for
+        //    correctness. ONE submission per question per user.
+        var rawSubs = await _redis.GetStringAsync(subsKey);
+        var subs = string.IsNullOrEmpty(rawSubs)
+            ? new Dictionary<string, RollingQuizService.RollingQuizSubmission>()
+            : JsonSerializer.Deserialize<Dictionary<string, RollingQuizService.RollingQuizSubmission>>(rawSubs, _rqJson)
+              ?? new();
+        if (subs.ContainsKey(userId))
+        {
+            await Clients.Caller.SendAsync("RollingQuizAck",
+                new { accepted = false, reason = "Already answered." });
+            return;
+        }
+
+        var isCorrect = choiceIndex == current.CorrectIndex;
+        subs[userId] = new RollingQuizService.RollingQuizSubmission
+        {
+            ChoiceIndex = choiceIndex,
+            AtTicks = DateTime.UtcNow.Ticks,
+            IsCorrect = isCorrect,
+        };
+        await _redis.SetStringAsync(subsKey, JsonSerializer.Serialize(subs, _rqJson),
+            TimeSpan.FromMinutes(10));
+
+        // 3) Personal ack — let the UI lock in the choice instantly.
+        await Clients.Caller.SendAsync("RollingQuizAck",
+            new { accepted = true, isCorrect, choiceIndex });
+
+        // 4) If correct, append to the rank-order list and award
+        //    rank-based points. Append is read-modify-write rather
+        //    than RPUSH because we don't expose list ops via
+        //    RedisService; the contention window per question is
+        //    tiny (a single round = at most a few hundred subs).
+        if (isCorrect)
+        {
+            var rawOrder = await _redis.GetStringAsync(orderKey);
+            var order = string.IsNullOrEmpty(rawOrder)
+                ? new List<string>()
+                : JsonSerializer.Deserialize<List<string>>(rawOrder) ?? new();
+
+            if (!order.Contains(userId))
+            {
+                order.Add(userId);
+                await _redis.SetStringAsync(orderKey, JsonSerializer.Serialize(order),
+                    TimeSpan.FromMinutes(10));
+            }
+
+            var rank = order.IndexOf(userId) + 1;
+            var points = rank switch
+            {
+                1 => 100,
+                2 => 70,
+                3 => 50,
+                _ => 30,
+            };
+
+            // 5) Bump per-day leaderboard stats hash.
+            var rawStats = await _redis.GetStringAsync(statsKey);
+            var stats = string.IsNullOrEmpty(rawStats)
+                ? new Dictionary<string, RollingQuizService.RollingQuizUserStats>()
+                : JsonSerializer.Deserialize<Dictionary<string, RollingQuizService.RollingQuizUserStats>>(rawStats, _rqJson)
+                  ?? new();
+
+            if (!stats.TryGetValue(userId, out var entry))
+            {
+                entry = new RollingQuizService.RollingQuizUserStats
+                {
+                    UserId = userId,
+                    Username = username,
+                    Score = 0,
+                    Correct = 0,
+                    Attempts = 0,
+                };
+                stats[userId] = entry;
+            }
+            entry.Username = username; // update display name if changed
+            entry.Score += points;
+            entry.Correct += 1;
+            entry.Attempts += 1;
+            await _redis.SetStringAsync(statsKey, JsonSerializer.Serialize(stats, _rqJson),
+                TimeSpan.FromDays(2));
+
+            // 6) Broadcast the scoring event so the room can render
+            //    "🥇 Alice +100" notifications. Includes the running
+            //    total so we don't need a separate leaderboard fetch.
+            await Clients.Group("general").SendAsync("RollingQuizScored",
+                new RollingQuizScored(userId, username, rank, points, entry.Score));
+        }
+        else
+        {
+            // Wrong answers still count toward attempts so accuracy
+            // can be displayed honestly on the leaderboard later.
+            var rawStats = await _redis.GetStringAsync(statsKey);
+            var stats = string.IsNullOrEmpty(rawStats)
+                ? new Dictionary<string, RollingQuizService.RollingQuizUserStats>()
+                : JsonSerializer.Deserialize<Dictionary<string, RollingQuizService.RollingQuizUserStats>>(rawStats, _rqJson)
+                  ?? new();
+
+            if (!stats.TryGetValue(userId, out var entry))
+            {
+                entry = new RollingQuizService.RollingQuizUserStats
+                {
+                    UserId = userId,
+                    Username = username,
+                };
+                stats[userId] = entry;
+            }
+            entry.Username = username;
+            entry.Attempts += 1;
+            await _redis.SetStringAsync(statsKey, JsonSerializer.Serialize(stats, _rqJson),
+                TimeSpan.FromDays(2));
+        }
+    }
+
+    /// <summary>
+    /// Called by the client on entering #general so the panel
+    /// can render the current question + today's leaderboard
+    /// without waiting for the next 4-min tick.
+    /// </summary>
+    public async Task GetRollingQuizState()
+    {
+        var rawCurrent = await _redis.GetStringAsync(RedisKeys.RollingQuizCurrent);
+        if (!string.IsNullOrEmpty(rawCurrent))
+        {
+            var st = JsonSerializer.Deserialize<RollingQuizService.RollingQuizState>(rawCurrent, _rqJson);
+            if (st is not null && DateTime.UtcNow < st.DeadlineUtc)
+            {
+                await Clients.Caller.SendAsync("RollingQuizQuestion",
+                    new RollingQuizQuestion(
+                        Id: st.Id,
+                        Category: st.Category,
+                        Difficulty: st.Difficulty,
+                        Question: st.Question,
+                        Options: st.Options,
+                        DeadlineUtc: st.DeadlineUtc,
+                        SessionId: st.SessionId));
+            }
+        }
+
+        var sessionId = RollingQuizService.SessionIdForUtc(DateTime.UtcNow);
+        var rawStats = await _redis.GetStringAsync(RedisKeys.RollingQuizStats(sessionId));
+        var stats = string.IsNullOrEmpty(rawStats)
+            ? new Dictionary<string, RollingQuizService.RollingQuizUserStats>()
+            : JsonSerializer.Deserialize<Dictionary<string, RollingQuizService.RollingQuizUserStats>>(rawStats, _rqJson)
+              ?? new();
+
+        var top = stats.Values
+            .OrderByDescending(s => s.Score)
+            .ThenByDescending(s => s.Correct)
+            .Take(10)
+            .Select(s => new RollingQuizLeaderEntry(
+                s.UserId, s.Username, s.Score, s.Correct, s.Attempts))
+            .ToList();
+
+        var youUserId = JwtService.GetUserId(Context.User!).ToString();
+        var youRow = stats.TryGetValue(youUserId, out var you)
+            ? new RollingQuizLeaderEntry(you.UserId, you.Username, you.Score, you.Correct, you.Attempts)
+            : null;
+
+        await Clients.Caller.SendAsync("RollingQuizLeaderboard",
+            new RollingQuizLeaderboard(sessionId, top, youRow));
     }
 
     // ── Map message to client DTO ─────────────────────────────
