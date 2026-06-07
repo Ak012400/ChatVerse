@@ -98,37 +98,12 @@ public sealed class GameTickerService : BackgroundService
                 foreach (var ev in session.DrainEvents())
                     await BroadcastAsync(session.Slug, ev, ct);
 
-                // Lifecycle GC — once a session ends, it has at most
-                // 30 seconds of "result page" visibility before we drop
-                // it from the registry + remove from the active index
-                // (so Active Games panel + ListActive endpoint stop
-                // surfacing it). The Redis state TTL still preserves
-                // the snapshot for late re-loaders who already have the
-                // URL — they just see "Game has ended."
-                //
-                // Fire-and-forget: we DON'T await DropAsync, because
-                // the ticker is on a 1s budget per round and we don't
-                // want one slow Redis call to back up scoring for
-                // every other game.
-                if (session.Status == GameStatus.Ended)
-                {
-                    _ = Task.Run(async () =>
-                    {
-                        try
-                        {
-                            // Brief grace so clients can render the
-                            // final scoreboard before the room vanishes.
-                            await Task.Delay(TimeSpan.FromSeconds(30), CancellationToken.None);
-                            await _registry.DropAsync(session.Slug);
-                        }
-                        catch (Exception dropEx)
-                        {
-                            _logger.LogWarning(dropEx,
-                                "Auto-drop failed for {Slug} — TTL will GC it eventually",
-                                session.Slug);
-                        }
-                    });
-                }
+                // NB: no auto-drop on Ended status. The user explicitly
+                // requested that ended rooms persist until the creator
+                // ends them — so post-game review (board replay,
+                // scoreboard, chat) stays available indefinitely. Redis
+                // TTL still GC's abandoned rooms after RedisTTL.GameRoom
+                // (1hr) as a backstop.
             }
             catch (Exception ex)
             {
