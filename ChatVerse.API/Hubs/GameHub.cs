@@ -177,6 +177,38 @@ public class GameHub : Hub
     }
 
     // ───────────────────────────────────────────────────────────────
+    //  ReactToJoke — Jokes-mode equivalent of SubmitAnswer.
+    //
+    //  Reaction is last-write-wins, so players can change their mind
+    //  inside the 30-second window. The session's broadcast cadence
+    //  handles UI updates; this method just bridges the RPC.
+    // ───────────────────────────────────────────────────────────────
+    public async Task ReactToJoke(string slug, string jokeId, string reaction)
+    {
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is null) return;
+
+        // Defensive enum parse — don't crash the hub if a client sends
+        // a malformed reaction name, just reject with an ack.
+        if (!Enum.TryParse<JokeReactionType>(reaction, ignoreCase: true, out var parsed))
+        {
+            await Clients.Caller.SendAsync("AnswerAck",
+                new { accepted = false, reason = "Unknown reaction." });
+            return;
+        }
+
+        var payload = JsonSerializer.SerializeToElement(
+            new JokeReactSubmit(jokeId, parsed));
+        var result = await session.SubmitMoveAsync(userId, payload, Context.ConnectionAborted);
+
+        await Clients.Caller.SendAsync("AnswerAck",
+            new { accepted = result.Accepted, reason = result.Reason });
+
+        await FlushSessionEventsAsync(session, Context.ConnectionAborted);
+    }
+
+    // ───────────────────────────────────────────────────────────────
     //  SendChat — players + spectators
     // ───────────────────────────────────────────────────────────────
 
@@ -224,9 +256,9 @@ public class GameHub : Hub
 
     private async Task FlushSessionEventsAsync(IGameSession session, CancellationToken ct)
     {
-        if (session is not QuizSession quiz) return;
-        var events = quiz.DrainEvents();
-        foreach (var ev in events)
-            await _ticker.BroadcastAsync(quiz.Slug, ev, ct);
+        // DrainEvents is part of the IGameSession contract — every
+        // concrete session (Quiz, Jokes, future Chess…) exposes it.
+        foreach (var ev in session.DrainEvents())
+            await _ticker.BroadcastAsync(session.Slug, ev, ct);
     }
 }

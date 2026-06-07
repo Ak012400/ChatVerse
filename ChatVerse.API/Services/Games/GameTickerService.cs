@@ -92,13 +92,11 @@ public sealed class GameTickerService : BackgroundService
                 // Even if Tick returned false, the session may have
                 // pending events from a previous call (e.g. ParticipantJoined
                 // queued by JoinAsync, but the hub returned before the
-                // broadcast could be flushed). Always check the queue.
-                if (session is QuizSession quiz)
-                {
-                    var events = quiz.DrainEvents();
-                    foreach (var ev in events)
-                        await BroadcastAsync(quiz.Slug, ev, ct);
-                }
+                // broadcast could be flushed). Always drain — DrainEvents
+                // is part of the IGameSession contract so no type-check
+                // is needed (works for Quiz, Jokes, and any future games).
+                foreach (var ev in session.DrainEvents())
+                    await BroadcastAsync(session.Slug, ev, ct);
             }
             catch (Exception ex)
             {
@@ -151,6 +149,30 @@ public sealed class GameTickerService : BackgroundService
                 await _hub.Clients.Group(group).SendAsync(
                     "ParticipantLeft", new { userId = pl.UserId }, ct);
                 break;
+
+            // ─── Jokes-mode events ─────────────────────────────────────
+            // Methods names mirror useGameHub.ts subscriptions: client
+            // listens for "JokePushed", "ReactionsUpdated", "JokeRevealed",
+            // and "JokesFinished".
+            case JokePushedEvent jp:
+                await _hub.Clients.Group(group).SendAsync(
+                    "JokePushed", jp.Joke, ct);
+                break;
+            case ReactionsUpdatedEvent ru:
+                await _hub.Clients.Group(group).SendAsync(
+                    "ReactionsUpdated", ru.Update, ct);
+                break;
+            case JokeRevealedEvent jr:
+                await _hub.Clients.Group(group).SendAsync(
+                    "JokeRevealed", jr.Reveal, ct);
+                break;
+            case JokesFinishedEvent jf:
+                await _hub.Clients.Group(group).SendAsync(
+                    "JokesFinished",
+                    new { finalStats = jf.FinalStats, reason = jf.Reason },
+                    ct);
+                break;
+
             default:
                 _logger.LogWarning("Unhandled GameEvent type {Type}", ev.GetType().Name);
                 break;

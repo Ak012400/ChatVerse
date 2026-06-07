@@ -54,6 +54,10 @@ public static class RedisKeys
     // so different settings don't poison each other.
     public static string QuizQuestionCache(string categorySlug, string difficultySlug)
         => $"quiz:cache:{categorySlug}:{difficultySlug}";
+
+    // icanhazdadjoke cache. Single global pool — no per-difficulty
+    // segmentation since dad jokes don't have difficulty levels.
+    public const string JokesCache = "jokes:cache:global";
 }
 
 public static class RedisTTL
