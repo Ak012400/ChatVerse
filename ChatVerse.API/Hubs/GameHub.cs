@@ -394,6 +394,41 @@ public class GameHub : Hub
             new { inviteId, targetUserId });
     }
 
+    /// <summary>
+    /// Creator explicitly closes the room. Broadcasts a "RoomClosed"
+    /// event so all members of the SignalR group can navigate back to
+    /// chat. Then drops the session from the registry so it disappears
+    /// from the Active Games panel.
+    /// </summary>
+    public async Task EndRoom(string slug)
+    {
+        if (IsGuest()) return;
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is null) return;
+        if (session.HostUserId != userId)
+        {
+            await Clients.Caller.SendAsync("Error",
+                new { message = "Only the host can end the room." });
+            return;
+        }
+
+        // Tell everyone in the room to bounce.
+        await Clients.Group(RoomGroup(slug)).SendAsync(
+            "RoomClosed",
+            new { slug, reason = "Host closed the room." },
+            Context.ConnectionAborted);
+
+        // Fire-and-forget drop — we don't want the caller to wait on
+        // the Redis cleanup. The broadcast above has already informed
+        // every client.
+        _ = Task.Run(async () =>
+        {
+            try { await _registry.DropAsync(slug); }
+            catch (Exception ex) { _logger.LogWarning(ex, "DropAsync failed for {Slug}", slug); }
+        });
+    }
+
     public async Task AcceptInvite(string inviteId)
     {
         if (IsGuest()) return;
@@ -448,19 +483,52 @@ public class GameHub : Hub
 
     // ───────────────────────────────────────────────────────────────
     //  LeaveRoom — explicit leave (vs disconnect)
+    //
+    //  Distinguishes between:
+    //   • Non-host leaves   — only the caller is removed from the
+    //                          participant list. Room stays alive for
+    //                          everyone else.
+    //   • HOST leaves       — broadcasts RoomClosed to all members
+    //                          and drops the session from the registry.
+    //                          Everyone gets navigated back to chat.
+    //
+    //  Done here (not in OnDisconnectedAsync) because a disconnect is
+    //  often transient (refresh, network blip); LeaveRoom is the user's
+    //  deliberate intent to abandon the room.
     // ───────────────────────────────────────────────────────────────
 
     public async Task LeaveRoom(string slug)
     {
+        if (string.IsNullOrWhiteSpace(slug)) return;
         var userId = JwtService.GetUserId(Context.User!).ToString();
         var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
         if (session is null) return;
+
+        var hostLeaving = session.HostUserId == userId;
 
         await session.LeaveAsync(userId, Context.ConnectionAborted);
         await Groups.RemoveFromGroupAsync(Context.ConnectionId, RoomGroup(slug));
         await _redis.DeleteKeyAsync($"conn:game:{Context.ConnectionId}");
 
         await FlushSessionEventsAsync(session, Context.ConnectionAborted);
+
+        // Host leaving = room closes for everyone. Broadcast + drop the
+        // registry entry so Active Games panel + ListActive stop showing
+        // it. The drop is fire-and-forget so the caller's RPC returns
+        // immediately; the broadcast has already informed every client.
+        if (hostLeaving)
+        {
+            await Clients.Group(RoomGroup(slug)).SendAsync(
+                "RoomClosed",
+                new { slug, reason = "Host left the room." },
+                Context.ConnectionAborted);
+
+            _ = Task.Run(async () =>
+            {
+                try { await _registry.DropAsync(slug); }
+                catch (Exception ex) { _logger.LogWarning(ex, "DropAsync after host-leave failed for {Slug}", slug); }
+            });
+        }
     }
 
     // ───────────────────────────────────────────────────────────────
