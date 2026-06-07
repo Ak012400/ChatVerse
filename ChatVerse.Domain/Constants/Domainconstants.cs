@@ -65,6 +65,10 @@ public static class RedisKeys
     // results in exactly one room being created.
     public static string GameRandomPointer(string chatSlug, string gameType)
         => $"game:random:{chatSlug}:{gameType.ToLowerInvariant()}";
+
+    // Tech Talk news feed cache. Single global key — same feed for
+    // every client of the Tech Talk room.
+    public const string TechNewsCache = "tech-news:cache:global";
 }
 
 public static class RedisTTL
@@ -82,6 +86,10 @@ public static class RedisTTL
     // Question cache — refresh every hour. OpenTriviaDB has 4000+ Q's,
     // so even with caching we get plenty of variety.
     public static readonly TimeSpan QuizCache = TimeSpan.FromHours(1);
+
+    // Tech news cache — 10 min is the sweet spot between "fresh enough
+    // to feel live" and "doesn't hammer upstream APIs for the same data".
+    public static readonly TimeSpan TechNews = TimeSpan.FromMinutes(10);
 }
 
 public static class JwtClaims
