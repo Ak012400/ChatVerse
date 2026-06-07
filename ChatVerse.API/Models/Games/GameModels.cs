@@ -341,3 +341,80 @@ public record AmbientQuestion(
     string Category,
     DateTime EmittedAtUtc);
 
+// ============================================================
+//  ROLLING QUIZ — the always-on, scored quiz that runs in
+//  #general. Unlike AmbientQuestion (passive, no scoring) and
+//  unlike QuizSession (started/stopped game flow), this is a
+//  background ticker with a per-day leaderboard scoped to the
+//  #general room itself.
+//
+//  Scoring:
+//   1st correct  → 100 points
+//   2nd correct  → 70
+//   3rd correct  → 50
+//   others       → 30
+//   wrong/late   → 0
+//
+//  Session = UTC day. Leaderboard resets at midnight UTC so
+//  there's a fresh start every day — no permanent dominance
+//  by users who happened to be early.
+// ============================================================
+
+/// <summary>
+/// What the client sees when a new rolling-quiz question goes live.
+/// CorrectIndex is deliberately omitted — only revealed at deadline
+/// so users can't peek by inspecting the network payload.
+/// </summary>
+public record RollingQuizQuestion(
+    string Id,
+    string Category,
+    string Difficulty,
+    string Question,
+    IReadOnlyList<string> Options,
+    DateTime DeadlineUtc,
+    string SessionId);
+
+public record RollingQuizAnswerSubmit(string QuestionId, int ChoiceIndex);
+
+/// <summary>
+/// What the server pushes when a player submits a correct answer
+/// before the deadline. The rank is the 1-based position of THIS
+/// answer in the correct-answers ordering (1 = first to answer).
+/// Clients use it to render the "🥇 / 🥈 / 🥉" badges live.
+/// </summary>
+public record RollingQuizScored(
+    string UserId,
+    string Username,
+    int Rank,
+    int PointsAwarded,
+    int RunningTotal);
+
+/// <summary>
+/// Final reveal at deadline. Includes the correct answer so the
+/// UI can colour options in retrospect. Counts let us show "5 got
+/// it right out of 12 who answered".
+/// </summary>
+public record RollingQuizRevealed(
+    string QuestionId,
+    int CorrectIndex,
+    string CorrectAnswer,
+    int CorrectAnswerCount,
+    int TotalSubmissionCount);
+
+public record RollingQuizLeaderEntry(
+    string UserId,
+    string Username,
+    int Score,
+    int CorrectAnswers,
+    int TotalAttempts);
+
+/// <summary>
+/// Sent on join + after every scoring update so late-joiners see
+/// the up-to-date board. Top 10 only — anyone outside top-10 can
+/// see their own row separately via the "you" pin.
+/// </summary>
+public record RollingQuizLeaderboard(
+    string SessionId,
+    IReadOnlyList<RollingQuizLeaderEntry> Top,
+    RollingQuizLeaderEntry? YouRow);
+
