@@ -297,6 +297,9 @@ public sealed class GameSessionRegistry
             GameType.Jokes => new JokesSession(
                 slug, meta, _redis, _jokes,
                 _loggerFactory.CreateLogger<JokesSession>()),
+            GameType.Chess => new ChessSession(
+                slug, meta, _redis,
+                _loggerFactory.CreateLogger<ChessSession>()),
             // Quiz, Trivia, and anything else default to QuizSession.
             // (Trivia is a frontend preset that reuses Quiz mechanics.)
             _ => new QuizSession(
