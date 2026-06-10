@@ -198,6 +198,42 @@ public sealed class GameTickerService : BackgroundService
                     "JoinRequestResolved", jrr.Resolution, ct);
                 break;
 
+            // ─── Director-mode + reconnect-grace events ────────────
+            // Mirror these names in useGameHub.ts subscriptions.
+            case ChessSeatChangedEvent csc:
+                await _hub.Clients.Group(group).SendAsync(
+                    "ChessSeatChanged", csc.Snapshot, ct);
+                break;
+            case PlayerDisconnectedEvent pd:
+                await _hub.Clients.Group(group).SendAsync(
+                    "ChessPlayerDisconnected",
+                    new {
+                        userId = pd.UserId,
+                        username = pd.Username,
+                        seatColor = pd.SeatColor.ToString(),
+                        graceSeconds = pd.GraceSeconds,
+                        atUtc = DateTime.UtcNow,
+                    },
+                    ct);
+                break;
+            case PlayerReturnedEvent pr:
+                await _hub.Clients.Group(group).SendAsync(
+                    "ChessPlayerReturned",
+                    new { userId = pr.UserId, username = pr.Username },
+                    ct);
+                break;
+            case SeatTimedOutEvent sto:
+                await _hub.Clients.Group(group).SendAsync(
+                    "ChessSeatTimedOut",
+                    new {
+                        userId = sto.UserId,
+                        username = sto.Username,
+                        seatColor = sto.SeatColor.ToString(),
+                        snapshot = sto.Snapshot,
+                    },
+                    ct);
+                break;
+
             default:
                 _logger.LogWarning("Unhandled GameEvent type {Type}", ev.GetType().Name);
                 break;
