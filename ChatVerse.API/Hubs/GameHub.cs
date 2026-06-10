@@ -301,6 +301,75 @@ public class GameHub : Hub
         await FlushSessionEventsAsync(session, Context.ConnectionAborted);
     }
 
+    // ───────────────────────────────────────────────────────────────
+    //  Director-mode seat controls — host explicitly assigns who
+    //  plays which colour. Replaces the old auto-seat behaviour
+    //  where the first player to join became White.
+    //
+    //  Color is sent as a string ("White" / "Black") to keep the
+    //  TypeScript client simple — we parse to the enum here.
+    // ───────────────────────────────────────────────────────────────
+    public async Task AssignChessSeat(string slug, string targetUserId, string color)
+    {
+        if (IsGuest()) return;
+        if (!Enum.TryParse<ChessColor>(color, ignoreCase: true, out var parsedColor))
+        {
+            await Clients.Caller.SendAsync("Error",
+                new { message = "Invalid colour — expected 'White' or 'Black'." });
+            return;
+        }
+
+        var hostUserId = JwtService.GetUserId(Context.User!).ToString();
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is not ChessSession chess) return;
+
+        var result = await chess.AssignSeatAsync(
+            hostUserId, targetUserId, parsedColor, Context.ConnectionAborted);
+        await Clients.Caller.SendAsync("SeatAssignAck",
+            new { accepted = result.Accepted, reason = result.Reason });
+        await FlushSessionEventsAsync(session, Context.ConnectionAborted);
+    }
+
+    public async Task UnassignChessSeat(string slug, string color)
+    {
+        if (IsGuest()) return;
+        if (!Enum.TryParse<ChessColor>(color, ignoreCase: true, out var parsedColor))
+        {
+            await Clients.Caller.SendAsync("Error",
+                new { message = "Invalid colour." });
+            return;
+        }
+
+        var hostUserId = JwtService.GetUserId(Context.User!).ToString();
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is not ChessSession chess) return;
+
+        var result = await chess.UnassignSeatAsync(
+            hostUserId, parsedColor, Context.ConnectionAborted);
+        await Clients.Caller.SendAsync("SeatAssignAck",
+            new { accepted = result.Accepted, reason = result.Reason });
+        await FlushSessionEventsAsync(session, Context.ConnectionAborted);
+    }
+
+    /// <summary>
+    /// Host's "Don't wait, reassign now" button — skips the remaining
+    /// grace timer for a disconnected seated player and frees the
+    /// seat immediately. Mid-game timeout still resets the board.
+    /// </summary>
+    public async Task OverrideGraceWait(string slug, string targetUserId)
+    {
+        if (IsGuest()) return;
+        var hostUserId = JwtService.GetUserId(Context.User!).ToString();
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is not ChessSession chess) return;
+
+        var result = await chess.OverrideGraceWaitAsync(
+            hostUserId, targetUserId, Context.ConnectionAborted);
+        await Clients.Caller.SendAsync("GraceOverrideAck",
+            new { accepted = result.Accepted, reason = result.Reason });
+        await FlushSessionEventsAsync(session, Context.ConnectionAborted);
+    }
+
     // Pull "is_guest" from the JWT. Existing JwtClaims constant
     // already defines this — see Domainconstants.cs.
     private bool IsGuest()

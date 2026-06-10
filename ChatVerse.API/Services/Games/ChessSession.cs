@@ -97,8 +97,67 @@ public sealed class ChessSession : IGameSession
                 await PersistStateUnsafeAsync();
             }
             _initialised = true;
+
+            // Resume grace timers for any seated Players who went
+            // offline before the last persist. Either we re-run the
+            // remaining wait, or — if it already elapsed — we fire
+            // the timeout immediately on a background task so the
+            // seat doesn't stay frozen after a server restart.
+            ResumeGraceTimersUnsafe();
         }
         finally { _lock.Release(); }
+    }
+
+    /// <summary>
+    /// Restart fire-and-forget grace tasks for offline seated players
+    /// found in the persisted state. Caller must hold _lock.
+    /// </summary>
+    private void ResumeGraceTimersUnsafe()
+    {
+        foreach (var p in _state.Participants)
+        {
+            if (p.IsOnline || !p.LeftAtUtc.HasValue) continue;
+            var isSeated = p.UserId == _state.WhitePlayerId || p.UserId == _state.BlackPlayerId;
+            if (!isSeated) continue;
+
+            var remaining = TimeSpan.FromSeconds(GraceSeconds) - (DateTime.UtcNow - p.LeftAtUtc.Value);
+            var uid = p.UserId;
+
+            if (remaining <= TimeSpan.Zero)
+            {
+                // Grace already elapsed — schedule timeout on a fresh
+                // task so it runs after we've released the init lock.
+                _ = Task.Run(async () =>
+                {
+                    try { await OnGraceExpiredAsync(uid, CancellationToken.None); }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex,
+                            "Resumed-stale grace timeout failed for {U} in {S}", uid, Slug);
+                    }
+                });
+            }
+            else
+            {
+                p.GraceCts = new CancellationTokenSource();
+                var token = p.GraceCts.Token;
+                var delay = remaining;
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await Task.Delay(delay, token);
+                        await OnGraceExpiredAsync(uid, CancellationToken.None);
+                    }
+                    catch (OperationCanceledException) { /* player returned */ }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex,
+                            "Resumed grace task crashed for {U} in {S}", uid, Slug);
+                    }
+                });
+            }
+        }
     }
 
     private ChessPersistedState FreshState() => new()
@@ -130,11 +189,25 @@ public sealed class ChessSession : IGameSession
         try
         {
             // Returning user — refresh online flag, give them their seat.
+            // If they were in a grace window (seated Player who walked
+            // away), cancel the timeout task so the seat stays theirs.
             var existing = _state.Participants.FirstOrDefault(p => p.UserId == userId);
             if (existing is not null)
             {
+                var wasInGrace = existing.GraceCts is not null && !existing.IsOnline;
                 existing.IsOnline = true;
+                existing.LeftAtUtc = null;
+                if (existing.GraceCts is not null)
+                {
+                    try { existing.GraceCts.Cancel(); existing.GraceCts.Dispose(); }
+                    catch { /* already disposed — fine */ }
+                    existing.GraceCts = null;
+                }
                 await PersistStateUnsafeAsync();
+                if (wasInGrace)
+                {
+                    _pendingEvents.Enqueue(new PlayerReturnedEvent(existing.UserId, existing.Username));
+                }
                 return new JoinResult(true, existing.Role);
             }
 
@@ -174,9 +247,14 @@ public sealed class ChessSession : IGameSession
     }
 
     /// <summary>
-    /// Inserts a user into the participant list, assigning Player or
-    /// Spectator as space allows. Also seats them as White / Black if
-    /// those slots are open. Caller must hold _lock.
+    /// Director-mode admission: everyone — including the host — enters
+    /// as a Spectator. Seats are assigned EXPLICITLY by the host via
+    /// AssignSeatAsync. No auto-seating, no silent upgrades.
+    ///
+    /// Why: previously the first Player auto-took White, the second
+    /// Black. That created the "guest somehow ended up on Black" UX
+    /// bug — silent assignment beat any explicit intent the host had.
+    /// Now: empty room = both seats null. Host decides who plays.
     /// </summary>
     private async Task<JoinResult> AdmitUnsafeAsync(
         string userId, string username, GameRole requestedRole)
@@ -184,13 +262,10 @@ public sealed class ChessSession : IGameSession
         if (_state.Status == GameStatus.Ended)
             return new JoinResult(false, requestedRole, "Game has ended.");
 
-        var assignedRole = requestedRole;
-        // Cap at 2 Players for chess. Anyone after = Spectator.
-        if (assignedRole == GameRole.Player && PlayerCount >= 2)
-            assignedRole = GameRole.Spectator;
-        // Block new Player joins mid-game.
-        if (assignedRole == GameRole.Player && _state.Status == GameStatus.Playing)
-            assignedRole = GameRole.Spectator;
+        // Everyone joins as Spectator. Host elevates them to Player by
+        // assigning a seat. Even the room creator starts as Spectator —
+        // they self-assign if they want to play.
+        var assignedRole = GameRole.Spectator;
 
         var participant = new ParticipantState
         {
@@ -202,22 +277,6 @@ public sealed class ChessSession : IGameSession
             JoinedAtUtc = DateTime.UtcNow,
         };
         _state.Participants.Add(participant);
-
-        // Assign White / Black seats. First Player taking it = White
-        // (so host who creates + auto-joins becomes White).
-        if (assignedRole == GameRole.Player)
-        {
-            if (_state.WhitePlayerId is null)
-            {
-                _state.WhitePlayerId = userId;
-                _state.WhitePlayerName = username;
-            }
-            else if (_state.BlackPlayerId is null && _state.WhitePlayerId != userId)
-            {
-                _state.BlackPlayerId = userId;
-                _state.BlackPlayerName = username;
-            }
-        }
 
         await PersistStateUnsafeAsync();
 
@@ -263,13 +322,15 @@ public sealed class ChessSession : IGameSession
     }
 
     /// <summary>
-    /// Spectator asks for a Player seat. Decision tree:
+    /// Spectator asks the host for a Player seat. ALWAYS queues — the
+    /// host decides both whether to admit AND which colour to give.
+    /// No silent auto-seating even if a seat is empty.
+    ///
+    /// Decision tree:
     ///   1. Already a Player → no-op success.
-    ///   2. Not in room → reject (must join the room first).
-    ///   3. Empty seat exists → admit immediately (upgrades role).
-    ///   4. Both seats taken → enqueue as JoinRequest for host
-    ///      approval. Host decides whether to swap the existing
-    ///      player out or keep them.
+    ///   2. Not in room → reject (must be a spectator first).
+    ///   3. Otherwise → enqueue as JoinRequest. Host picks colour
+    ///      when approving via AssignSeatAsync.
     /// </summary>
     public async Task<ActionResult> RequestPlayerSeatAsync(
         string userId, string username, CancellationToken ct)
@@ -284,28 +345,10 @@ public sealed class ChessSession : IGameSession
             if (p.Role == GameRole.Player)
                 return new ActionResult(true, "You're already a player.");
 
-            // Empty seat path — upgrade silently.
-            if (_state.Status == GameStatus.Lobby &&
-                (_state.WhitePlayerId is null || _state.BlackPlayerId is null))
-            {
-                p.Role = GameRole.Player;
-                if (_state.WhitePlayerId is null)
-                {
-                    _state.WhitePlayerId = userId;
-                    _state.WhitePlayerName = username;
-                }
-                else
-                {
-                    _state.BlackPlayerId = userId;
-                    _state.BlackPlayerName = username;
-                }
-                await PersistStateUnsafeAsync();
-                _pendingEvents.Enqueue(new ParticipantJoinedEvent(
-                    new GameParticipant(userId, username, GameRole.Player, p.IsHost, true)));
-                return new ActionResult(true, "Seat taken.");
-            }
-
-            // Full / mid-game path — enqueue for host approval.
+            // Always queue — host gets the colour choice. Even with an
+            // empty seat, we wait for explicit assignment. (Previous
+            // silent-admit path caused the "guest sneaks into Black"
+            // behaviour that director-mode is fixing.)
             if (_state.PendingRequests.Any(r => r.UserId == userId && r.Status == JoinRequestStatus.Pending))
                 return new ActionResult(true, "Request already pending.");
 
@@ -322,6 +365,111 @@ public sealed class ChessSession : IGameSession
             _pendingEvents.Enqueue(new JoinRequestedEvent(
                 new JoinRequest(req.Id, req.UserId, req.Username, req.RequestedAtUtc, req.Status)));
             return new ActionResult(true, "Request sent to host.");
+        }
+        finally { _lock.Release(); }
+    }
+
+    /// <summary>
+    /// Director-mode seat assignment. Host picks who plays which colour.
+    /// Target can be:
+    ///   • the host themselves (self-assign — "I want to play White")
+    ///   • an existing Spectator in the room
+    ///   • a Spectator whose RequestPlayerSeatAsync request is pending
+    ///     (we auto-resolve the request so the host's notification list
+    ///     stays clean)
+    ///
+    /// Behaviour:
+    ///   • Lobby only — once status == Playing, seats are locked.
+    ///     Reassigning mid-game would discard board state silently;
+    ///     instead the host should let the game finish or end it first.
+    ///   • Target seat must be empty. To replace someone, host calls
+    ///     UnassignSeatAsync first then this.
+    /// </summary>
+    public async Task<ActionResult> AssignSeatAsync(
+        string hostUserId, string targetUserId, ChessColor color, CancellationToken ct)
+    {
+        await EnsureInitialisedAsync(ct);
+        await _lock.WaitAsync(ct);
+        try
+        {
+            if (hostUserId != _meta.HostUserId)
+                return new ActionResult(false, "Only the host can assign seats.");
+            if (_state.Status != GameStatus.Lobby)
+                return new ActionResult(false, "Seats are locked once the game starts.");
+
+            var target = _state.Participants.FirstOrDefault(p => p.UserId == targetUserId);
+            if (target is null)
+                return new ActionResult(false, "Target user is not in the room.");
+
+            var (currentId, currentName) = color == ChessColor.White
+                ? (_state.WhitePlayerId, _state.WhitePlayerName)
+                : (_state.BlackPlayerId, _state.BlackPlayerName);
+            if (currentId is not null)
+                return new ActionResult(false, $"{color} seat is occupied. Empty it first.");
+
+            // Apply.
+            if (color == ChessColor.White)
+            {
+                _state.WhitePlayerId = target.UserId;
+                _state.WhitePlayerName = target.Username;
+            }
+            else
+            {
+                _state.BlackPlayerId = target.UserId;
+                _state.BlackPlayerName = target.Username;
+            }
+            target.Role = GameRole.Player;
+
+            // If they had a pending RequestPlayerSeat, auto-resolve it
+            // so the host's pending-list cleans up.
+            var pending = _state.PendingRequests
+                .FirstOrDefault(r => r.UserId == target.UserId && r.Status == JoinRequestStatus.Pending);
+            if (pending is not null)
+            {
+                pending.Status = JoinRequestStatus.Approved;
+                _state.PendingRequests.Remove(pending);
+                _state.ApprovedUserIds.Add(target.UserId);
+                _pendingEvents.Enqueue(new JoinRequestResolvedEvent(
+                    new JoinRequestResolved(pending.Id, target.UserId, JoinRequestStatus.Approved)));
+            }
+
+            await PersistStateUnsafeAsync();
+            // Broadcast the updated seat layout via the standard chess
+            // snapshot event so clients re-render labels + orientation.
+            _pendingEvents.Enqueue(new ChessSeatChangedEvent(BuildSnapshotUnsafe()));
+            return new ActionResult(true, $"{target.Username} seated as {color}.");
+        }
+        finally { _lock.Release(); }
+    }
+
+    /// <summary>
+    /// Frees a seat (host-only, lobby-only). The unseated player goes
+    /// back to Spectator role and can re-request or be reassigned.
+    /// </summary>
+    public async Task<ActionResult> UnassignSeatAsync(
+        string hostUserId, ChessColor color, CancellationToken ct)
+    {
+        await EnsureInitialisedAsync(ct);
+        await _lock.WaitAsync(ct);
+        try
+        {
+            if (hostUserId != _meta.HostUserId)
+                return new ActionResult(false, "Only the host can unseat players.");
+            if (_state.Status != GameStatus.Lobby)
+                return new ActionResult(false, "Seats are locked once the game starts.");
+
+            var seatedId = color == ChessColor.White ? _state.WhitePlayerId : _state.BlackPlayerId;
+            if (seatedId is null)
+                return new ActionResult(false, $"{color} seat is already empty.");
+
+            var seated = _state.Participants.FirstOrDefault(p => p.UserId == seatedId);
+            if (color == ChessColor.White) { _state.WhitePlayerId = null; _state.WhitePlayerName = null; }
+            else                           { _state.BlackPlayerId = null; _state.BlackPlayerName = null; }
+            if (seated is not null) seated.Role = GameRole.Spectator;
+
+            await PersistStateUnsafeAsync();
+            _pendingEvents.Enqueue(new ChessSeatChangedEvent(BuildSnapshotUnsafe()));
+            return new ActionResult(true, $"{color} seat cleared.");
         }
         finally { _lock.Release(); }
     }
@@ -351,7 +499,21 @@ public sealed class ChessSession : IGameSession
     }
 
     // ───────────────────────────────────────────────────────────────
-    //  LEAVE
+    //  LEAVE — grace-aware
+    //
+    //  Behaviour:
+    //   • Seated Player (White / Black) leaves → DO NOT remove from
+    //     participants, DO NOT free seat. Mark IsOnline = false, stamp
+    //     LeftAtUtc, start a fire-and-forget 60s grace timer. Host and
+    //     opponent see a countdown banner with optional "skip-wait".
+    //   • If the player returns inside 60s, JoinAsync cancels the timer
+    //     and reseats them — board state preserved.
+    //   • If 60s elapses, OnGraceExpiredAsync runs: removes them, frees
+    //     the seat, and if it was mid-game resets the board to start +
+    //     status back to Lobby (per user's "chess will restart" intent).
+    //   • Spectators are removed immediately — they don't hold state.
+    //   • Host walking away from lobby still kills the room (creator
+    //     intent is unambiguous).
     // ───────────────────────────────────────────────────────────────
     public async Task LeaveAsync(string userId, CancellationToken ct)
     {
@@ -362,38 +524,61 @@ public sealed class ChessSession : IGameSession
             var p = _state.Participants.FirstOrDefault(x => x.UserId == userId);
             if (p is null) return;
 
-            _state.Participants.Remove(p);
+            var isSeatedPlayer = p.Role == GameRole.Player &&
+                (userId == _state.WhitePlayerId || userId == _state.BlackPlayerId);
             var hostLeft = p.IsHost;
 
-            // Vacate seat if a Player walks away — counts as a resign
-            // mid-game (the other side wins by default), or just frees
-            // the seat if still in lobby.
-            if (p.Role == GameRole.Player && _state.Status == GameStatus.Playing)
+            if (isSeatedPlayer && _state.Status != GameStatus.Ended)
             {
-                if (userId == _state.WhitePlayerId)
-                    _state.Result = ChessResult.BlackWins;
-                else if (userId == _state.BlackPlayerId)
-                    _state.Result = ChessResult.WhiteWins;
-                _state.Status = GameStatus.Ended;
-                _pendingEvents.Enqueue(new GameEndedEvent(
-                    new List<ScoreEntry>(), $"{p.Username} disconnected — game forfeited."));
-            }
-            else if (p.Role == GameRole.Player)
-            {
-                // Lobby disconnect — just free the seat.
-                if (userId == _state.WhitePlayerId) { _state.WhitePlayerId = null; _state.WhitePlayerName = null; }
-                if (userId == _state.BlackPlayerId) { _state.BlackPlayerId = null; _state.BlackPlayerName = null; }
+                // Grace path — keep seat, start countdown.
+                p.IsOnline = false;
+                p.LeftAtUtc = DateTime.UtcNow;
+                // Cancel any prior grace token (shouldn't happen, but
+                // defensive) before creating a new one.
+                try { p.GraceCts?.Cancel(); p.GraceCts?.Dispose(); } catch { }
+                p.GraceCts = new CancellationTokenSource();
+                var graceToken = p.GraceCts.Token;
+                var leftUserId = userId;
+                var seatColor = userId == _state.WhitePlayerId ? ChessColor.White : ChessColor.Black;
+
+                await PersistStateUnsafeAsync();
+                _pendingEvents.Enqueue(new PlayerDisconnectedEvent(
+                    leftUserId, p.Username, seatColor, GraceSeconds));
+
+                // Fire-and-forget grace timer. Per user's async/cancellable
+                // rule: caller doesn't await, exception swallowed, and the
+                // CTS lets either side cancel cleanly.
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(GraceSeconds), graceToken);
+                        // Grace elapsed without a return.
+                        await OnGraceExpiredAsync(leftUserId, CancellationToken.None);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // Player returned — JoinAsync cancelled us. Nothing
+                        // to do; the resume path already broadcast the
+                        // "back" event.
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex,
+                            "Grace task for {UserId} in {Slug} crashed.", leftUserId, Slug);
+                    }
+                });
+
+                return; // do NOT remove participant, do NOT free seat
             }
 
-            // HOST-LEAVES POLICY (the consistency the user asked for):
-            //  • Lobby → kill room immediately. A creator who walked out
-            //    before the game began isn't coming back; the slug is
-            //    dead weight in the active-rooms index. Spectators get
-            //    a clean "host disconnected" message and bounce back.
-            //  • Playing → already ended above as a forfeit; downgrade
-            //    the persistence TTL so the result page stays visible
-            //    for a few minutes but doesn't clutter discovery.
-            //  • Ended → nothing to do (will be GC'd by TTL anyway).
+            // Spectator OR ended-game seated player → remove immediately.
+            _state.Participants.Remove(p);
+
+            // HOST-LEAVES POLICY: lobby → kill room (creator-only destroy
+            // rule still holds — if they walked, room is dead). This stays
+            // outside the grace window because the host explicitly created
+            // the room; we don't speculate about their return.
             if (hostLeft && _state.Status == GameStatus.Lobby)
             {
                 _state.Status = GameStatus.Ended;
@@ -408,6 +593,93 @@ public sealed class ChessSession : IGameSession
         }
         finally { _lock.Release(); }
     }
+
+    /// <summary>
+    /// Called by the grace task after the timeout window elapses without
+    /// a reconnect. Frees the seat, removes the participant, resets the
+    /// board to the start position if a game was in progress (mid-game
+    /// timeout → back to Lobby, NOT a forfeit, per user's intent of
+    /// "chess will restart and host can assign the seat to any different
+    /// person").
+    /// </summary>
+    private async Task OnGraceExpiredAsync(string userId, CancellationToken ct)
+    {
+        await _lock.WaitAsync(ct);
+        try
+        {
+            var p = _state.Participants.FirstOrDefault(x => x.UserId == userId);
+            if (p is null) return;             // already cleaned up
+            if (p.IsOnline) return;            // returned right at the edge — leave them be
+
+            var seatColor = userId == _state.WhitePlayerId ? ChessColor.White
+                          : userId == _state.BlackPlayerId ? ChessColor.Black
+                          : (ChessColor?)null;
+
+            // Free the seat.
+            if (userId == _state.WhitePlayerId) { _state.WhitePlayerId = null; _state.WhitePlayerName = null; }
+            if (userId == _state.BlackPlayerId) { _state.BlackPlayerId = null; _state.BlackPlayerName = null; }
+
+            // Reset board + back to lobby if mid-game. The remaining
+            // player isn't punished with a forfeit; instead the host
+            // gets to assign a fresh opponent and a new game starts.
+            if (_state.Status == GameStatus.Playing)
+            {
+                _state.Status = GameStatus.Lobby;
+                _state.Fen = StartingFen;
+                _state.Turn = ChessColor.White;
+                _state.Result = ChessResult.InProgress;
+                _state.MoveHistory.Clear();
+            }
+
+            _state.Participants.Remove(p);
+            try { p.GraceCts?.Dispose(); } catch { }
+            p.GraceCts = null;
+
+            await PersistStateUnsafeAsync();
+            if (seatColor.HasValue)
+            {
+                _pendingEvents.Enqueue(new SeatTimedOutEvent(
+                    userId, p.Username, seatColor.Value, BuildSnapshotUnsafe()));
+            }
+            _pendingEvents.Enqueue(new ParticipantLeftEvent(userId));
+        }
+        finally { _lock.Release(); }
+    }
+
+    /// <summary>
+    /// Host-only override: skip the remaining grace wait, free the seat
+    /// now. Useful when it's obvious the disconnected player isn't
+    /// coming back and the room has eager spectators waiting.
+    /// </summary>
+    public async Task<ActionResult> OverrideGraceWaitAsync(
+        string hostUserId, string targetUserId, CancellationToken ct)
+    {
+        await EnsureInitialisedAsync(ct);
+
+        // Validate + capture under the lock; cancel + process timeout
+        // OUTSIDE the lock so OnGraceExpiredAsync can take it cleanly
+        // and exceptions don't double-release the semaphore.
+        CancellationTokenSource? cts;
+        await _lock.WaitAsync(ct);
+        try
+        {
+            if (hostUserId != _meta.HostUserId)
+                return new ActionResult(false, "Only the host can skip the wait.");
+            var p = _state.Participants.FirstOrDefault(x => x.UserId == targetUserId);
+            if (p is null) return new ActionResult(false, "Player not in room.");
+            if (p.IsOnline) return new ActionResult(false, "Player is online — nothing to override.");
+            if (p.GraceCts is null) return new ActionResult(false, "No active grace timer.");
+            cts = p.GraceCts;
+        }
+        finally { _lock.Release(); }
+
+        try { cts.Cancel(); } catch { /* already disposed — fine */ }
+        await OnGraceExpiredAsync(targetUserId, ct);
+        return new ActionResult(true);
+    }
+
+    /// <summary>Default grace window before a seat auto-frees.</summary>
+    public const int GraceSeconds = 60;
 
     // ───────────────────────────────────────────────────────────────
     //  START — needs 2 seated players
@@ -713,6 +985,21 @@ public sealed class ChessSession : IGameSession
         public bool IsHost { get; set; }
         public bool IsOnline { get; set; }
         public DateTime JoinedAtUtc { get; set; }
+
+        /// <summary>
+        /// When the player went offline. Persisted so a server restart
+        /// during a grace window can still compute remaining time and
+        /// either time out or reseat on return.
+        /// </summary>
+        public DateTime? LeftAtUtc { get; set; }
+
+        /// <summary>
+        /// Active grace timer for an offline seated Player. NOT persisted
+        /// (in-memory only). Cancelled by JoinAsync if the player returns
+        /// in time, or fires naturally to free the seat.
+        /// </summary>
+        [JsonIgnore]
+        public CancellationTokenSource? GraceCts { get; set; }
     }
 
     public sealed class JoinRequestRecord
@@ -736,3 +1023,22 @@ public sealed record ChessMovePushedEvent(ChessMovePushed Move) : GameEvent;
 public sealed record JoinRequestedEvent(JoinRequest Request) : GameEvent;
 
 public sealed record JoinRequestResolvedEvent(JoinRequestResolved Resolution) : GameEvent;
+
+/// <summary>Seat assignment / unassignment by host — clients should
+/// re-render labels + board orientation from the snapshot.</summary>
+public sealed record ChessSeatChangedEvent(ChessStateSnapshot Snapshot) : GameEvent;
+
+/// <summary>A seated Player went offline. Clients show countdown +
+/// host's "skip wait" button.</summary>
+public sealed record PlayerDisconnectedEvent(
+    string UserId, string Username, ChessColor SeatColor, int GraceSeconds) : GameEvent;
+
+/// <summary>A previously-disconnected Player returned inside the grace
+/// window. Clients dismiss the countdown banner.</summary>
+public sealed record PlayerReturnedEvent(string UserId, string Username) : GameEvent;
+
+/// <summary>Grace window expired without a return. Seat is freed; if
+/// the timeout interrupted a live game, snapshot reflects board reset
+/// to start + status back to Lobby.</summary>
+public sealed record SeatTimedOutEvent(
+    string UserId, string Username, ChessColor SeatColor, ChessStateSnapshot Snapshot) : GameEvent;
