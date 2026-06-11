@@ -34,6 +34,16 @@ public sealed class GameTickerService : BackgroundService
     private readonly ILogger<GameTickerService> _logger;
     private static readonly TimeSpan TickInterval = TimeSpan.FromSeconds(1);
 
+    /// <summary>
+    /// Rooms with no state-changing activity (join/leave/move/chat/seat
+    /// op/deadline advancement) for this long are auto-closed: RoomClosed
+    /// broadcast + registry drop. Applies to ALL game rooms including
+    /// random ones (they're recreated on demand by GetOrCreateRandomAsync).
+    /// Requested by Arun 2026-06-11 — supersedes the earlier
+    /// "only the creator destroys" rule.
+    /// </summary>
+    private static readonly TimeSpan IdleTimeout = TimeSpan.FromMinutes(5);
+
     public GameTickerService(
         GameSessionRegistry registry,
         IHubContext<GameHub> hub,
@@ -98,12 +108,31 @@ public sealed class GameTickerService : BackgroundService
                 foreach (var ev in session.DrainEvents())
                     await BroadcastAsync(session.Slug, ev, ct);
 
-                // NB: no auto-drop on Ended status. The user explicitly
-                // requested that ended rooms persist until the creator
-                // ends them — so post-game review (board replay,
-                // scoreboard, chat) stays available indefinitely. Redis
-                // TTL still GC's abandoned rooms after RedisTTL.GameRoom
-                // (1hr) as a backstop.
+                // ─── Idle auto-close ──────────────────────────────
+                // No activity for IdleTimeout → close the room exactly
+                // like the host's EndRoom: RoomClosed broadcast first
+                // (clients navigate out), then drop from the registry.
+                // LastActivityUtc is in-memory and initialised to "now"
+                // on construction, so freshly created/hydrated rooms
+                // always get a full idle window.
+                if (now - session.LastActivityUtc > IdleTimeout)
+                {
+                    _logger.LogInformation(
+                        "Game room {Slug} idle for {Minutes:F1} min — auto-closing",
+                        session.Slug, (now - session.LastActivityUtc).TotalMinutes);
+
+                    await _hub.Clients.Group(GameHub.RoomGroup(session.Slug)).SendAsync(
+                        "RoomClosed",
+                        new { slug = session.Slug, reason = "Room closed — no activity for 5 minutes." },
+                        ct);
+
+                    await _registry.DropAsync(session.Slug);
+                    continue;
+                }
+
+                // NB: rooms otherwise persist until the creator ends
+                // them (post-game review stays available), with the
+                // idle sweep above + Redis TTL (1hr) as backstops.
             }
             catch (Exception ex)
             {
