@@ -167,7 +167,23 @@ public sealed class QuizSession : IGameSession
             // (we keep them in the room rather than rejecting) unless
             // they explicitly asked for Spectator anyway.
             var assignedRole = requestedRole;
-            if (requestedRole == GameRole.Player &&
+
+            // ─── Director mode (Quiz v2) ───────────────────────────
+            // In user-created rooms only the HOST auto-seats as Player.
+            // Everyone else enters as Spectator; the host promotes them
+            // via SetRoleAsync — mirrors the chess seat-assignment UX.
+            // Random always-on rooms keep walk-in Player joins (they
+            // have no actively-managing host).
+            string? directorNote = null;
+            if (!_meta.IsRandom &&
+                userId != _meta.HostUserId &&
+                requestedRole == GameRole.Player)
+            {
+                assignedRole = GameRole.Spectator;
+                directorNote = "Host seats the players — you're in the audience for now.";
+            }
+
+            if (assignedRole == GameRole.Player &&
                 PlayerCount >= _meta.Settings.MaxPlayers)
             {
                 assignedRole = GameRole.Spectator;
@@ -210,9 +226,10 @@ public sealed class QuizSession : IGameSession
             _pendingEvents.Enqueue(new ParticipantJoinedEvent(
                 new GameParticipant(userId, username, assignedRole, participant.IsHost, true)));
 
-            var reasonNote = assignedRole != requestedRole
-                ? "Players full; joined as spectator."
-                : null;
+            var reasonNote = directorNote
+                ?? (assignedRole != requestedRole
+                    ? "Players full; joined as spectator."
+                    : null);
             return new JoinResult(true, assignedRole, reasonNote);
         }
         finally { _lock.Release(); }
@@ -472,6 +489,60 @@ public sealed class QuizSession : IGameSession
         _state.CurrentDeadlineUtc = null;
         await PersistStateUnsafeAsync();
         _pendingEvents.Enqueue(new GameEndedEvent(BuildScoreboardUnsafe(), reason));
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    //  SetRole (Quiz v2 director mode) — host seats/unseats anyone.
+    //  Works in Lobby AND mid-game (a freshly-seated player starts at
+    //  0 and can answer from the next question; FirstCorrect scoring
+    //  is per-question so late entry stays fair). Demotion keeps the
+    //  player's score history on the board.
+    // ───────────────────────────────────────────────────────────────
+    public async Task<ActionResult> SetRoleAsync(
+        string hostUserId, string targetUserId, GameRole role, CancellationToken ct)
+    {
+        await EnsureInitialisedAsync(ct);
+        await _lock.WaitAsync(ct);
+        try
+        {
+            if (hostUserId != _meta.HostUserId)
+                return new ActionResult(false, "Only the host can seat players.");
+
+            var target = _state.Participants.FirstOrDefault(p => p.UserId == targetUserId);
+            if (target is null)
+                return new ActionResult(false, "User is not in this room.");
+            if (target.Role == role)
+                return new ActionResult(true);
+            if (role == GameRole.Player && PlayerCount >= _meta.Settings.MaxPlayers)
+                return new ActionResult(false, "All player seats are full.");
+
+            target.Role = role;
+
+            if (role == GameRole.Player && !_state.Scores.ContainsKey(targetUserId))
+            {
+                _state.Scores[targetUserId] = new ScoreState
+                {
+                    UserId = targetUserId,
+                    Username = target.Username,
+                    Score = 0,
+                    Correct = 0,
+                    Answered = 0,
+                    TotalResponseMs = 0,
+                };
+            }
+
+            await PersistStateUnsafeAsync();
+
+            // ParticipantJoined doubles as a role-update event — the
+            // client store replaces by userId, so the new role lands
+            // everywhere (lists + the target's own viewerRole sync).
+            _pendingEvents.Enqueue(new ParticipantJoinedEvent(
+                new GameParticipant(target.UserId, target.Username,
+                    target.Role, target.IsHost, target.IsOnline)));
+            _pendingEvents.Enqueue(new ScoreUpdatedEvent(BuildScoreboardUnsafe()));
+            return new ActionResult(true);
+        }
+        finally { _lock.Release(); }
     }
 
     // ───────────────────────────────────────────────────────────────

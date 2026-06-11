@@ -499,6 +499,44 @@ public class GameHub : Hub
     }
 
     // ───────────────────────────────────────────────────────────────
+    //  SetQuizRole (Quiz v2 director mode) — host seats a spectator as
+    //  Player or moves a Player back to the audience. Role arrives as
+    //  a string ("Player"/"Spectator") and is parsed defensively.
+    // ───────────────────────────────────────────────────────────────
+    public async Task SetQuizRole(string slug, string targetUserId, string role)
+    {
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is null)
+        {
+            await Clients.Caller.SendAsync("Error",
+                new { message = "Room not found." });
+            return;
+        }
+        if (session is not QuizSession quiz)
+        {
+            await Clients.Caller.SendAsync("Error",
+                new { message = "Seating is only available for quiz rooms." });
+            return;
+        }
+        if (!Enum.TryParse<GameRole>(role, ignoreCase: true, out var parsedRole))
+        {
+            await Clients.Caller.SendAsync("Error",
+                new { message = "Invalid role." });
+            return;
+        }
+
+        var result = await quiz.SetRoleAsync(
+            userId, targetUserId, parsedRole, Context.ConnectionAborted);
+        if (!result.Accepted)
+        {
+            await Clients.Caller.SendAsync("Error", new { message = result.Reason });
+            return;
+        }
+        await FlushSessionEventsAsync(session, Context.ConnectionAborted);
+    }
+
+    // ───────────────────────────────────────────────────────────────
     //  RematchQuiz (Quiz v2) — host-only, resets an Ended quiz back to
     //  Lobby with the same settings + participants, cleared scores.
     // ───────────────────────────────────────────────────────────────
