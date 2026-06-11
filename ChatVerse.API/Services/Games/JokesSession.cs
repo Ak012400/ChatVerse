@@ -59,6 +59,10 @@ public sealed class JokesSession : IGameSession
     public int PlayerCount => _state?.Participants.Count(p => p.Role == GameRole.Player) ?? 0;
     public int SpectatorCount => _state?.Participants.Count(p => p.Role == GameRole.Spectator) ?? 0;
 
+    /// <summary>In-memory activity stamp — see IGameSession docs. Updated
+    /// on every state persist + chat append; drives ticker idle close.</summary>
+    public DateTime LastActivityUtc { get; private set; } = DateTime.UtcNow;
+
     // ───────────────────────────────────────────────────────────────
     //  Hydration
     // ───────────────────────────────────────────────────────────────
@@ -357,6 +361,9 @@ public sealed class JokesSession : IGameSession
         await _lock.WaitAsync(ct);
         try
         {
+            // Chat doesn't persist through PersistStateUnsafeAsync (ring
+            // buffer key), so stamp activity here explicitly.
+            LastActivityUtc = DateTime.UtcNow;
             var clean = (text ?? "").Trim();
             if (clean.Length > 280) clean = clean[..280];
             var msg = new GameChatMessage(
@@ -433,6 +440,9 @@ public sealed class JokesSession : IGameSession
 
     private async Task PersistStateUnsafeAsync()
     {
+        // Every state mutation funnels through here — single choke
+        // point for the idle-close activity stamp.
+        LastActivityUtc = DateTime.UtcNow;
         var json = JsonSerializer.Serialize(_state, JsonOpts);
         await _redis.SetStringAsync(
             RedisKeys.GameRoomState(Slug), json, RedisTTL.GameRoom);

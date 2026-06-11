@@ -39,6 +39,15 @@ public interface IGameSession : IAsyncDisposable
     int SpectatorCount { get; }
 
     /// <summary>
+    /// UTC timestamp of the last state-changing activity (join, leave,
+    /// move, chat, seat op, deadline advancement). In-memory only — a
+    /// server restart resets it to "now", giving hydrated rooms a fresh
+    /// idle window rather than instantly closing them. GameTickerService
+    /// auto-closes rooms idle past its IdleTimeout (5 min).
+    /// </summary>
+    DateTime LastActivityUtc { get; }
+
+    /// <summary>
     /// Hydrate from Redis if state exists, else set up a fresh session.
     /// Idempotent — safe to call multiple times.
     /// </summary>
