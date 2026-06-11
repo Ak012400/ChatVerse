@@ -338,7 +338,27 @@ public sealed class QuizSession : IGameSession
             var responseMs = Math.Max(0, (int)elapsed.TotalMilliseconds);
 
             var correct = submit.ChoiceIndex == currentQ.CorrectIndex;
-            var score = correct ? ComputeScore(responseMs) : 0;
+
+            // ─── Scoring (Quiz v2) ─────────────────────────────────
+            // FirstCorrect: buzzer rules — ONLY the first correct
+            //   answer for this question scores, flat +1. perQ already
+            //   holds everyone who answered before us, so "someone was
+            //   correct already" is a single scan.
+            // Speed (v1): every correct answer gets 100 + speed bonus.
+            var score = 0;
+            if (correct)
+            {
+                score = _meta.Settings.ScoringMode == ScoringMode.FirstCorrect
+                    ? (perQ.Values.Any(a => a.IsCorrect) ? 0 : 1)
+                    : ComputeScore(responseMs);
+            }
+
+            // Hot-streak: 3+ consecutive correct answers earn +1 bonus
+            // per question (applies in both modes — it rewards the run,
+            // not the speed).
+            var sc = _state.Scores[userId];
+            var newStreak = correct ? sc.Streak + 1 : 0;
+            if (correct && newStreak >= 3) score += 1;
 
             perQ[userId] = new AnswerState
             {
@@ -349,11 +369,20 @@ public sealed class QuizSession : IGameSession
             };
 
             // Update aggregate score.
-            var sc = _state.Scores[userId];
+            sc.Streak = newStreak;
             sc.Answered++;
             if (correct) sc.Correct++;
             sc.Score += score;
             sc.TotalResponseMs += responseMs;
+
+            // Live answer indicator — who has locked in (count only,
+            // no choice leak). Broadcast to the whole room so players
+            // + spectators see "3/6 answered" chips in real time.
+            _pendingEvents.Enqueue(new PlayerAnsweredEvent(
+                userId,
+                player.Username,
+                perQ.Count,
+                _state.Participants.Count(p => p.Role == GameRole.Player)));
 
             await PersistStateUnsafeAsync();
 
@@ -443,6 +472,46 @@ public sealed class QuizSession : IGameSession
         _state.CurrentDeadlineUtc = null;
         await PersistStateUnsafeAsync();
         _pendingEvents.Enqueue(new GameEndedEvent(BuildScoreboardUnsafe(), reason));
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    //  Rematch (Quiz v2) — host-only, Ended → Lobby with fresh slate.
+    //  Participants stay seated; scores/answers/questions reset.
+    //  Fresh questions are fetched by the next StartAsync as usual.
+    // ───────────────────────────────────────────────────────────────
+    public async Task<ActionResult> RematchAsync(string requestingUserId, CancellationToken ct)
+    {
+        await EnsureInitialisedAsync(ct);
+        await _lock.WaitAsync(ct);
+        try
+        {
+            if (requestingUserId != _meta.HostUserId)
+                return new ActionResult(false, "Only the host can start a rematch.");
+            if (_state.Status != GameStatus.Ended)
+                return new ActionResult(false, "Rematch is only available after the game ends.");
+
+            _state.Status = GameStatus.Lobby;
+            _state.Questions = new();
+            _state.CurrentIndex = -1;
+            _state.CurrentDeadlineUtc = null;
+            _state.StartedAtUtc = null;
+            _state.Answers = new();
+            foreach (var s in _state.Scores.Values)
+            {
+                s.Score = 0;
+                s.Correct = 0;
+                s.Answered = 0;
+                s.TotalResponseMs = 0;
+                s.Streak = 0;
+            }
+
+            await PersistStateUnsafeAsync();
+            // Clients react to QuizReset by re-invoking JoinRoom, which
+            // is idempotent and hands each of them a fresh RoomSnapshot.
+            _pendingEvents.Enqueue(new QuizResetEvent());
+            return new ActionResult(true);
+        }
+        finally { _lock.Release(); }
     }
 
     // ───────────────────────────────────────────────────────────────
@@ -566,7 +635,8 @@ public sealed class QuizSession : IGameSession
                 Score: s.Score,
                 CorrectAnswers: s.Correct,
                 AnsweredCount: s.Answered,
-                AverageResponseMs: s.Answered == 0 ? 0 : s.TotalResponseMs / (double)s.Answered))
+                AverageResponseMs: s.Answered == 0 ? 0 : s.TotalResponseMs / (double)s.Answered,
+                Streak: s.Streak))
             .ToList();
     }
 
@@ -680,6 +750,9 @@ public sealed class QuizSession : IGameSession
         public int Correct { get; set; }
         public int Answered { get; set; }
         public long TotalResponseMs { get; set; }
+        /// <summary>Quiz v2: consecutive correct answers. 3+ earns a
+        /// +1 hot-streak bonus per question and the 🔥 badge.</summary>
+        public int Streak { get; set; }
     }
 }
 
@@ -736,6 +809,9 @@ public sealed class QuizSettings
     public int QuestionCount { get; set; } = 10;
     public int SecondsPerQuestion { get; set; } = 15;
     public int MaxPlayers { get; set; } = 8;
+    /// <summary>Quiz v2: how points are awarded. Old persisted rooms
+    /// lack this field and deserialise to Speed — behaviour unchanged.</summary>
+    public ScoringMode ScoringMode { get; set; } = ScoringMode.Speed;
 }
 
 // ============================================================
@@ -764,3 +840,15 @@ public sealed record GameEndedEvent(
 public sealed record ParticipantJoinedEvent(GameParticipant Participant) : GameEvent;
 
 public sealed record ParticipantLeftEvent(string UserId) : GameEvent;
+
+/// <summary>Quiz v2: someone locked in an answer — count only, the
+/// choice itself stays secret until the reveal.</summary>
+public sealed record PlayerAnsweredEvent(
+    string UserId,
+    string Username,
+    int AnsweredCount,
+    int TotalPlayers) : GameEvent;
+
+/// <summary>Quiz v2: host triggered a rematch — room is back in Lobby
+/// with cleared scores. Clients re-attach for a fresh snapshot.</summary>
+public sealed record QuizResetEvent() : GameEvent;

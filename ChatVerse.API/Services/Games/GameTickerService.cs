@@ -186,6 +186,23 @@ public sealed class GameTickerService : BackgroundService
                     "ParticipantLeft", new { userId = pl.UserId }, ct);
                 break;
 
+            // ─── Quiz v2 events ────────────────────────────────────
+            case PlayerAnsweredEvent pa:
+                await _hub.Clients.Group(group).SendAsync(
+                    "PlayerAnswered",
+                    new {
+                        userId = pa.UserId,
+                        username = pa.Username,
+                        answeredCount = pa.AnsweredCount,
+                        totalPlayers = pa.TotalPlayers,
+                    },
+                    ct);
+                break;
+            case QuizResetEvent:
+                await _hub.Clients.Group(group).SendAsync(
+                    "QuizReset", new { }, ct);
+                break;
+
             // ─── Jokes-mode events ─────────────────────────────────────
             // Methods names mirror useGameHub.ts subscriptions: client
             // listens for "JokePushed", "ReactionsUpdated", "JokeRevealed",
