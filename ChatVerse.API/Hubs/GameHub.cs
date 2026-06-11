@@ -499,6 +499,100 @@ public class GameHub : Hub
     }
 
     // ───────────────────────────────────────────────────────────────
+    //  LUDO (Sprint B) — server-authoritative; clients only render.
+    //  All methods flush session events so the full board snapshot
+    //  ("LudoState") reaches the room after every mutation.
+    // ───────────────────────────────────────────────────────────────
+
+    /// <summary>Late joiner / reconnect catch-up — full board to caller.</summary>
+    public async Task GetLudoState(string slug)
+    {
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is not LudoSession ludo) return;
+        var snap = await ludo.GetLudoStateAsync(Context.ConnectionAborted);
+        await Clients.Caller.SendAsync("LudoState", snap, Context.ConnectionAborted);
+    }
+
+    public async Task LudoRoll(string slug)
+    {
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is not LudoSession) return;
+
+        var payload = JsonSerializer.SerializeToElement(new { action = "roll" });
+        var result = await session.SubmitMoveAsync(userId, payload, Context.ConnectionAborted);
+        if (!result.Accepted)
+            await Clients.Caller.SendAsync("Error", new { message = result.Reason });
+        await FlushSessionEventsAsync(session, Context.ConnectionAborted);
+    }
+
+    public async Task LudoMove(string slug, int tokenIndex)
+    {
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is not LudoSession) return;
+
+        var payload = JsonSerializer.SerializeToElement(new { action = "move", token = tokenIndex });
+        var result = await session.SubmitMoveAsync(userId, payload, Context.ConnectionAborted);
+        if (!result.Accepted)
+            await Clients.Caller.SendAsync("Error", new { message = result.Reason });
+        await FlushSessionEventsAsync(session, Context.ConnectionAborted);
+    }
+
+    public async Task AssignLudoSeat(string slug, string targetUserId, string color)
+    {
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is not LudoSession ludo) return;
+        if (!Enum.TryParse<LudoColor>(color, ignoreCase: true, out var parsed))
+        {
+            await Clients.Caller.SendAsync("Error", new { message = "Invalid colour." });
+            return;
+        }
+
+        var result = await ludo.AssignSeatAsync(
+            userId, targetUserId, parsed, Context.ConnectionAborted);
+        if (!result.Accepted)
+            await Clients.Caller.SendAsync("Error", new { message = result.Reason });
+        await FlushSessionEventsAsync(session, Context.ConnectionAborted);
+    }
+
+    public async Task UnassignLudoSeat(string slug, string color)
+    {
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is not LudoSession ludo) return;
+        if (!Enum.TryParse<LudoColor>(color, ignoreCase: true, out var parsed))
+        {
+            await Clients.Caller.SendAsync("Error", new { message = "Invalid colour." });
+            return;
+        }
+
+        var result = await ludo.UnassignSeatAsync(userId, parsed, Context.ConnectionAborted);
+        if (!result.Accepted)
+            await Clients.Caller.SendAsync("Error", new { message = result.Reason });
+        await FlushSessionEventsAsync(session, Context.ConnectionAborted);
+    }
+
+    public async Task RequestLudoSeat(string slug)
+    {
+        if (IsGuest())
+        {
+            await Clients.Caller.SendAsync("LudoSeatAck",
+                new { accepted = false, reason = "Sign up to play — guests can watch and chat." });
+            return;
+        }
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is not LudoSession ludo) return;
+
+        var result = await ludo.RequestSeatAsync(userId, Context.ConnectionAborted);
+        await Clients.Caller.SendAsync("LudoSeatAck",
+            new { accepted = result.Accepted, reason = result.Reason });
+        await FlushSessionEventsAsync(session, Context.ConnectionAborted);
+    }
+
+    // ───────────────────────────────────────────────────────────────
     //  RequestQuizSeat (Quiz v2 director mode) — spectator raises a
     //  hand for a player seat. Host approves via SetQuizRole.
     // ───────────────────────────────────────────────────────────────
