@@ -464,6 +464,16 @@ public enum ChessColor
     Black,
 }
 
+/// <summary>The four Ludo seats, in turn order.</summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum LudoColor
+{
+    Red,
+    Green,
+    Yellow,
+    Blue,
+}
+
 [JsonConverter(typeof(JsonStringEnumConverter))]
 public enum ChessResult
 {

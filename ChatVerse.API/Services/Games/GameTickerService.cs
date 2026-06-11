@@ -213,6 +213,26 @@ public sealed class GameTickerService : BackgroundService
                     "QuizSeatResolved", new { userId = qsv.UserId }, ct);
                 break;
 
+            // ─── Ludo events ───────────────────────────────────────
+            case LudoStateEvent ls:
+                await _hub.Clients.Group(group).SendAsync(
+                    "LudoState", ls.Snapshot, ct);
+                break;
+            case LudoDiceRolledEvent ld:
+                await _hub.Clients.Group(group).SendAsync(
+                    "LudoDiceRolled",
+                    new {
+                        color = ld.Color.ToString(),
+                        value = ld.Value,
+                        forfeited = ld.Forfeited,
+                    },
+                    ct);
+                break;
+            case LudoTurnSkippedEvent lt:
+                await _hub.Clients.Group(group).SendAsync(
+                    "LudoTurnSkipped", new { color = lt.Color.ToString() }, ct);
+                break;
+
             // ─── Jokes-mode events ─────────────────────────────────────
             // Methods names mirror useGameHub.ts subscriptions: client
             // listens for "JokePushed", "ReactionsUpdated", "JokeRevealed",
