@@ -202,6 +202,16 @@ public sealed class GameTickerService : BackgroundService
                 await _hub.Clients.Group(group).SendAsync(
                     "QuizReset", new { }, ct);
                 break;
+            case QuizSeatRequestedEvent qsr:
+                await _hub.Clients.Group(group).SendAsync(
+                    "QuizSeatRequested",
+                    new { userId = qsr.UserId, username = qsr.Username },
+                    ct);
+                break;
+            case QuizSeatResolvedEvent qsv:
+                await _hub.Clients.Group(group).SendAsync(
+                    "QuizSeatResolved", new { userId = qsv.UserId }, ct);
+                break;
 
             // ─── Jokes-mode events ─────────────────────────────────────
             // Methods names mirror useGameHub.ts subscriptions: client

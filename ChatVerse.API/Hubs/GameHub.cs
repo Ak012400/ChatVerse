@@ -499,6 +499,34 @@ public class GameHub : Hub
     }
 
     // ───────────────────────────────────────────────────────────────
+    //  RequestQuizSeat (Quiz v2 director mode) — spectator raises a
+    //  hand for a player seat. Host approves via SetQuizRole.
+    // ───────────────────────────────────────────────────────────────
+    public async Task RequestQuizSeat(string slug)
+    {
+        if (IsGuest())
+        {
+            await Clients.Caller.SendAsync("QuizSeatAck",
+                new { accepted = false, reason = "Sign up to play — guests can watch and chat." });
+            return;
+        }
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is null) return;
+        if (session is not QuizSession quiz)
+        {
+            await Clients.Caller.SendAsync("QuizSeatAck",
+                new { accepted = false, reason = "Seat requests are only for quiz rooms." });
+            return;
+        }
+
+        var result = await quiz.RequestSeatAsync(userId, Context.ConnectionAborted);
+        await Clients.Caller.SendAsync("QuizSeatAck",
+            new { accepted = result.Accepted, reason = result.Reason });
+        await FlushSessionEventsAsync(session, Context.ConnectionAborted);
+    }
+
+    // ───────────────────────────────────────────────────────────────
     //  SetQuizRole (Quiz v2 director mode) — host seats a spectator as
     //  Player or moves a Player back to the audience. Role arrives as
     //  a string ("Player"/"Spectator") and is parsed defensively.
