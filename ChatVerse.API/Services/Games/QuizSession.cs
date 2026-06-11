@@ -245,6 +245,9 @@ public sealed class QuizSession : IGameSession
             if (p is null) return;
 
             _state.Participants.Remove(p);
+            // Leaving withdraws any raised hand too.
+            if (_state.SeatRequests.Remove(userId))
+                _pendingEvents.Enqueue(new QuizSeatResolvedEvent(userId));
             await PersistStateUnsafeAsync();
             await TrackRoomMembershipAsync(userId, p.Role, joining: false);
 
@@ -492,6 +495,34 @@ public sealed class QuizSession : IGameSession
     }
 
     // ───────────────────────────────────────────────────────────────
+    //  RequestSeat (Quiz v2 director mode) — a spectator raises a hand.
+    //  The host sees a 🙋 badge and seats them via SetRoleAsync.
+    //  Idempotent; persisted so a server restart keeps raised hands.
+    // ───────────────────────────────────────────────────────────────
+    public async Task<ActionResult> RequestSeatAsync(
+        string userId, CancellationToken ct)
+    {
+        await EnsureInitialisedAsync(ct);
+        await _lock.WaitAsync(ct);
+        try
+        {
+            var p = _state.Participants.FirstOrDefault(x => x.UserId == userId);
+            if (p is null)
+                return new ActionResult(false, "Join the room first.");
+            if (p.Role == GameRole.Player)
+                return new ActionResult(false, "You're already seated.");
+            if (_state.SeatRequests.Contains(userId))
+                return new ActionResult(true, "Request already sent — host has been notified.");
+
+            _state.SeatRequests.Add(userId);
+            await PersistStateUnsafeAsync();
+            _pendingEvents.Enqueue(new QuizSeatRequestedEvent(userId, p.Username));
+            return new ActionResult(true, "Request sent — waiting for the host.");
+        }
+        finally { _lock.Release(); }
+    }
+
+    // ───────────────────────────────────────────────────────────────
     //  SetRole (Quiz v2 director mode) — host seats/unseats anyone.
     //  Works in Lobby AND mid-game (a freshly-seated player starts at
     //  0 and can answer from the next question; FirstCorrect scoring
@@ -530,6 +561,10 @@ public sealed class QuizSession : IGameSession
                     TotalResponseMs = 0,
                 };
             }
+
+            // Seating (or demoting) resolves any raised hand.
+            if (_state.SeatRequests.Remove(targetUserId))
+                _pendingEvents.Enqueue(new QuizSeatResolvedEvent(targetUserId));
 
             await PersistStateUnsafeAsync();
 
@@ -609,7 +644,8 @@ public sealed class QuizSession : IGameSession
                 Scoreboard: BuildScoreboardUnsafe(),
                 Participants: _state.Participants.Select(p => new GameParticipant(
                     p.UserId, p.Username, p.Role, p.IsHost, p.IsOnline)).ToList(),
-                RecentChat: _state.ChatTail.ToList());
+                RecentChat: _state.ChatTail.ToList(),
+                SeatRequests: _state.SeatRequests.ToList());
         }
         finally { _lock.Release(); }
     }
@@ -793,6 +829,10 @@ public sealed class QuizSession : IGameSession
         public List<ParticipantState> Participants { get; set; } = new();
         public List<GameChatMessage> ChatTail { get; set; } = new();
         public DateTime? StartedAtUtc { get; set; }
+        /// <summary>Quiz v2 director mode: spectators who raised a hand
+        /// for a player seat (userIds). Old persisted rooms deserialise
+        /// to an empty list.</summary>
+        public List<string> SeatRequests { get; set; } = new();
     }
 
     public sealed class ParticipantState
@@ -923,3 +963,11 @@ public sealed record PlayerAnsweredEvent(
 /// <summary>Quiz v2: host triggered a rematch — room is back in Lobby
 /// with cleared scores. Clients re-attach for a fresh snapshot.</summary>
 public sealed record QuizResetEvent() : GameEvent;
+
+/// <summary>Quiz v2 director mode: a spectator raised a hand for a
+/// player seat. Host UI shows the 🙋 badge.</summary>
+public sealed record QuizSeatRequestedEvent(string UserId, string Username) : GameEvent;
+
+/// <summary>Quiz v2 director mode: a raised hand was resolved (seated,
+/// demoted, or the requester left). Clients clear the badge.</summary>
+public sealed record QuizSeatResolvedEvent(string UserId) : GameEvent;

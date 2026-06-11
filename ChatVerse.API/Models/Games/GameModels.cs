@@ -255,7 +255,11 @@ public record GameRoomSnapshot(
     QuizQuestionPublic? CurrentQuestion,
     IReadOnlyList<ScoreEntry> Scoreboard,
     IReadOnlyList<GameParticipant> Participants,
-    IReadOnlyList<GameChatMessage> RecentChat);
+    IReadOnlyList<GameChatMessage> RecentChat,
+    // Quiz v2 director mode: userIds of spectators who raised a hand
+    // for a seat. Default keeps Jokes/Chess snapshot builders compiling
+    // unchanged; null on the wire for non-quiz rooms.
+    IReadOnlyList<string>? SeatRequests = null);
 
 public record GameParticipant(
     string UserId,
