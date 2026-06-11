@@ -169,6 +169,7 @@ public sealed class GameRoomController : ControllerBase
             QuestionCount = req.QuestionCount,
             SecondsPerQuestion = req.SecondsPerQuestion,
             MaxPlayers = req.MaxPlayers,
+            ScoringMode = req.ScoringMode,
         };
 
         var session = await _registry.CreateAsync(

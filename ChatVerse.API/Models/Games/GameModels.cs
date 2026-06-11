@@ -79,6 +79,21 @@ public enum QuizDifficulty
 }
 
 /// <summary>
+/// How quiz points are awarded per question.
+///   Speed        — every correct answer scores 100 + speed bonus (v1 behaviour).
+///   FirstCorrect — ONLY the first correct answer scores, flat +1.
+///                  Cutthroat buzzer-style — Arun's Quiz v2 default.
+/// Additive: old rooms / old clients omit the field and deserialise
+/// to Speed, so nothing existing changes behaviour.
+/// </summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum ScoringMode
+{
+    Speed,
+    FirstCorrect,
+}
+
+/// <summary>
 /// OpenTriviaDB categories we expose. Keep this list curated rather
 /// than dumping all 24 — too many options paralyse first-time users.
 /// </summary>
@@ -119,6 +134,13 @@ public record CreateGameRoomRequest(
     /// pre-Phase-2 callers that don't send this field.
     /// </summary>
     public bool IsPublic { get; init; } = true;
+
+    /// <summary>
+    /// Scoring rules for this room. Defaults to Speed so pre-v2
+    /// clients (and Jokes/Chess creates, which ignore it) are
+    /// unaffected. The launcher sends FirstCorrect for new quizzes.
+    /// </summary>
+    public ScoringMode ScoringMode { get; init; } = ScoringMode.Speed;
 
     /// <summary>
     /// The chat-room slug this game was launched from (e.g.
@@ -216,7 +238,10 @@ public record ScoreEntry(
     int Score,
     int CorrectAnswers,
     int AnsweredCount,
-    double AverageResponseMs);
+    double AverageResponseMs,
+    // Current consecutive-correct run — drives the 🔥 badge. Default
+    // keeps older positional constructions compiling unchanged.
+    int Streak = 0);
 
 /// <summary>
 /// Snapshot a late-joining player or spectator receives on connect.

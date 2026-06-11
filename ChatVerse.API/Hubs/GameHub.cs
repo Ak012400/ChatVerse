@@ -498,6 +498,55 @@ public class GameHub : Hub
         });
     }
 
+    // ───────────────────────────────────────────────────────────────
+    //  RematchQuiz (Quiz v2) — host-only, resets an Ended quiz back to
+    //  Lobby with the same settings + participants, cleared scores.
+    // ───────────────────────────────────────────────────────────────
+    public async Task RematchQuiz(string slug)
+    {
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+        var session = await _registry.GetOrLoadAsync(slug, Context.ConnectionAborted);
+        if (session is null)
+        {
+            await Clients.Caller.SendAsync("Error",
+                new { message = "Room not found." });
+            return;
+        }
+        if (session is not QuizSession quiz)
+        {
+            await Clients.Caller.SendAsync("Error",
+                new { message = "Rematch is only available for quiz rooms." });
+            return;
+        }
+
+        var result = await quiz.RematchAsync(userId, Context.ConnectionAborted);
+        if (!result.Accepted)
+        {
+            await Clients.Caller.SendAsync("Error", new { message = result.Reason });
+            return;
+        }
+        await FlushSessionEventsAsync(session, Context.ConnectionAborted);
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    //  SendCheer (Quiz v2) — spectators (or anyone) hype the players.
+    //  Ephemeral fire-and-forget: no persistence, straight broadcast.
+    //  Emoji is whitelist-gated so arbitrary strings never hit the wire.
+    // ───────────────────────────────────────────────────────────────
+    public async Task SendCheer(string slug, string emoji)
+    {
+        if (string.IsNullOrWhiteSpace(slug)) return;
+        if (emoji is not ("🔥" or "👏" or "😂" or "💀" or "🎉")) return;
+
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+        var username = JwtService.GetUsername(Context.User!);
+
+        await Clients.Group(RoomGroup(slug)).SendAsync(
+            "CheerPushed",
+            new { userId, username, emoji },
+            Context.ConnectionAborted);
+    }
+
     public async Task AcceptInvite(string inviteId)
     {
         if (IsGuest()) return;
