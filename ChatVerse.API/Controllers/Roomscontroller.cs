@@ -158,6 +158,55 @@ public class RoomsController : ControllerBase
     }
 
     // ============================================================
+    //  GET /api/rooms/{slug}/spotify-tracks?limit=20
+    //  Last N Spotify-bearing messages — powers the Music Lounge
+    //  jukebox panel without forcing the client to fetch the full
+    //  message history and filter on its own.
+    // ============================================================
+    [HttpGet("{slug}/spotify-tracks")]
+    public async Task<IActionResult> GetSpotifyTracks(
+        string slug,
+        [FromQuery] int limit = 20)
+    {
+        var room = await _mongo.GetRoomBySlugAsync(slug);
+        if (room == null)
+            return NotFound(ApiResponse.Fail("Room not found"));
+
+        var ageVerified = await _userState.GetAgeVerifiedAsync(JwtService.GetUserId(User));
+        if (room.Category == "18plus" && !ageVerified)
+            return StatusCode(403, ApiResponse.Fail("Age verification required"));
+
+        var messages = await _mongo.GetRoomSpotifyTracksAsync(slug, limit);
+
+        // Newest first — frontend "Now Playing" = index 0.
+        var tracks = messages
+            .Where(m => m.Spotify != null)
+            .Select(m => new
+            {
+                messageId = m.Id,
+                senderId = m.SenderId,
+                senderName = m.SenderName,
+                senderAvatar = m.SenderAvatarUrl,
+                caption = m.Content,
+                spotify = new
+                {
+                    kind = m.Spotify!.Kind,
+                    spotifyId = m.Spotify.SpotifyId,
+                    embedUrl = m.Spotify.EmbedUrl,
+                    webUrl = m.Spotify.WebUrl,
+                },
+                createdAt = m.CreatedAt,
+            });
+
+        return Ok(ApiResponse<object>.Ok(new
+        {
+            roomSlug = slug,
+            count = messages.Count,
+            tracks,
+        }));
+    }
+
+    // ============================================================
     //  POST /api/rooms
     //  Create a private/user-defined room. Trust gate keeps low-score
     //  accounts from spawning throwaway rooms.

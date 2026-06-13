@@ -55,6 +55,31 @@ public partial class MongoService
     }
 
     /// <summary>
+    /// Last N messages in a room that carry a Spotify embed. Powers the
+    /// Music Lounge "Now Playing" panel — newest first, skip moderated /
+    /// deleted rows so blocked tracks never reach the jukebox.
+    ///
+    /// Filtering server-side keeps the panel small even in a busy room
+    /// where 90% of messages have nothing to do with music.
+    /// </summary>
+    public async Task<List<Message>> GetRoomSpotifyTracksAsync(
+        string roomId, int limit = 20)
+    {
+        var filter = Builders<Message>.Filter.And(
+            Builders<Message>.Filter.Eq(m => m.RoomId, roomId),
+            Builders<Message>.Filter.Ne(m => m.IsDeleted, true),
+            Builders<Message>.Filter.Ne(m => m.Moderation.Status, "blocked"),
+            Builders<Message>.Filter.Ne(m => m.Spotify, null)
+        );
+
+        return await Messages
+            .Find(filter)
+            .SortByDescending(m => m.CreatedAt)
+            .Limit(Math.Clamp(limit, 1, 50))
+            .ToListAsync();
+    }
+
+    /// <summary>
     /// Insert new message — moderation status starts as 'pending'.
     /// </summary>
     public async Task<Message> InsertMessageAsync(Message message)
