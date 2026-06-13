@@ -5,11 +5,11 @@ using ChatVerse.Infrastructure.Persistence.MongoDB;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
 using ChatVerse.Infrastructure.Persistence.Redis;
 using ChatVerse.Infrastructure.Services.LiveKit;
+using ChatVerse.Infrastructure.Services.UserState;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using MongoDB.Driver;
-using StackExchange.Redis;
 
 namespace ChatVerse.Infrastructure;
 
@@ -46,12 +46,15 @@ public static class InfrastructureServiceExtensions
             ));
 
         // ── Upstash Redis ─────────────────────────────────────
-        var redisConnStr = config.GetConnectionString("Redis")!;
-
-        services.AddSingleton<IConnectionMultiplexer>(_ =>
-            ConnectionMultiplexer.Connect(redisConnStr));
-
+        //  IConnectionMultiplexer is registered in Program.cs (with proper
+        //  Upstash rediss:// URI parsing). Registering here too would just
+        //  be overwritten — keeping a single source of truth for that.
         services.AddScoped<RedisService>();
+
+        // ── User-state cache (trust score + age verified) ─────
+        //  Read by hubs and controllers instead of JWT claims so bans
+        //  / trust penalties propagate within seconds.
+        services.AddScoped<UserStateService>();
 
         // ── Brevo Email (SMTP path — bypasses Brevo's API IP allow-list) ──
         // MailKit opens a fresh SMTP connection per send so it doesn't

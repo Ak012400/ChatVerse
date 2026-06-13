@@ -191,6 +191,12 @@ public class Message
     public DateTime? DeletedAt { get; set; }
     public DateTime? EditedAt { get; set; }
     public DateTime CreatedAt { get; set; }
+
+    // Rich link preview — populated server-side when the message body
+    // contains a Spotify track/album/playlist/episode URL. Null when no
+    // recognisable link is present. Lets the frontend render an inline
+    // Spotify iframe without doing its own URL parsing.
+    public SpotifyEmbed? Spotify { get; set; }
 }
 
 public class MessageModeration
@@ -199,6 +205,17 @@ public class MessageModeration
     public string? CheckedBy { get; set; }
     public string? FlagReason { get; set; }
     public double? Confidence { get; set; }
+}
+
+public class SpotifyEmbed
+{
+    /// <summary>track | album | playlist | episode | show | artist</summary>
+    public string Kind { get; set; } = default!;
+    public string SpotifyId { get; set; } = default!;
+    /// <summary>Ready-to-iframe URL — https://open.spotify.com/embed/{kind}/{id}</summary>
+    public string EmbedUrl { get; set; } = default!;
+    /// <summary>Canonical web URL — original Spotify link the user pasted.</summary>
+    public string WebUrl { get; set; } = default!;
 }
 
 public class Room
@@ -313,4 +330,6 @@ public class DmMessage
     public bool IsDeleted { get; set; } = false;
     public DateTime CreatedAt { get; set; }
     public DateTime? ReadAt { get; set; }
+    // Same Spotify enrichment as room messages.
+    public SpotifyEmbed? Spotify { get; set; }
 }

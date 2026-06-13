@@ -496,6 +496,25 @@ public class PostgresProcService
         return result == null || result == DBNull.Value ? (short)50 : Convert.ToInt16(result);
     }
 
+    // ── Combined trust + age verified read (UserStateService) ────
+    //  Single round-trip so the cache populates both keys at once
+    //  on a miss.
+    public async Task<(short TrustScore, bool AgeVerified)> GetUserStateAsync(Guid userId)
+    {
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(
+            "SELECT trust_score, age_verified FROM user_auth.users WHERE id = @id", conn);
+        cmd.Parameters.AddWithValue("id", userId);
+        await using var reader = await cmd.ExecuteReaderAsync();
+        if (await reader.ReadAsync())
+        {
+            var score = reader.IsDBNull(0) ? (short)50 : reader.GetInt16(0);
+            var verified = !reader.IsDBNull(1) && reader.GetBoolean(1);
+            return (score, verified);
+        }
+        return ((short)50, false);
+    }
+
     // ============================================================
     //  BILLING PROCS
     // ============================================================

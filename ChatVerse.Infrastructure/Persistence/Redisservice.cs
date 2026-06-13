@@ -402,6 +402,113 @@ public class RedisService
     }
 
     // ============================================================
+    //  USER-STATE CACHE (trust score, age verified)
+    //  Short TTL — lets bans / verifications take effect quickly
+    //  without re-issuing JWT. Hubs and controllers MUST read these
+    //  instead of JWT claims so a penalised user can't keep posting
+    //  just because their token is still warm.
+    // ============================================================
+
+    public async Task<short?> GetTrustScoreCacheAsync(string userId)
+    {
+        var val = await _db.StringGetAsync(RedisKeys.UserTrust(userId));
+        return val.HasValue && short.TryParse(val, out var s) ? s : (short?)null;
+    }
+
+    public async Task SetTrustScoreCacheAsync(string userId, short score)
+        => await _db.StringSetAsync(RedisKeys.UserTrust(userId), score, RedisTTL.UserState);
+
+    public async Task<bool?> GetAgeVerifiedCacheAsync(string userId)
+    {
+        var val = await _db.StringGetAsync(RedisKeys.UserAgeVerified(userId));
+        if (!val.HasValue) return null;
+        return val == "1";
+    }
+
+    public async Task SetAgeVerifiedCacheAsync(string userId, bool verified)
+        => await _db.StringSetAsync(
+            RedisKeys.UserAgeVerified(userId),
+            verified ? "1" : "0",
+            RedisTTL.UserState);
+
+    /// <summary>
+    /// Drop cached trust/age values for a user. Call this immediately
+    /// after any state mutation (trust event, age verification pass,
+    /// manual ban) so the next gate check sees the fresh value.
+    /// </summary>
+    public async Task InvalidateUserStateAsync(string userId)
+    {
+        await _db.KeyDeleteAsync(RedisKeys.UserTrust(userId));
+        await _db.KeyDeleteAsync(RedisKeys.UserAgeVerified(userId));
+    }
+
+    // ============================================================
+    //  CHAT MATCH QUEUE
+    //  Distributed replacement for ChatHub's in-memory ConcurrentQueue.
+    //  Atomic LPUSH/LPOP so two API replicas behind a load balancer can
+    //  pair users with each other.
+    // ============================================================
+
+    public async Task EnqueueForChatMatchAsync(string userId)
+        => await _db.ListRightPushAsync(RedisKeys.ChatMatchQueue, userId);
+
+    public async Task<string?> DequeueForChatMatchAsync()
+    {
+        var val = await _db.ListLeftPopAsync(RedisKeys.ChatMatchQueue);
+        return val.HasValue ? (string?)val : null;
+    }
+
+    public async Task RemoveFromChatMatchQueueAsync(string userId)
+        => await _db.ListRemoveAsync(RedisKeys.ChatMatchQueue, userId);
+
+    public async Task<bool> IsInChatMatchQueueAsync(string userId)
+    {
+        // Queue is small in practice (single-digit waiting users at a time)
+        var all = await _db.ListRangeAsync(RedisKeys.ChatMatchQueue);
+        foreach (var v in all)
+            if (v == userId) return true;
+        return false;
+    }
+
+    // ============================================================
+    //  VIDEO SESSION PARTICIPANT LOOKUP
+    //  MatchingService writes "userA,userB" to video:session:{id}.
+    //  Used by VideoHub.ReportNsfw to verify the reporter is actually
+    //  a participant before any penalty is considered.
+    // ============================================================
+
+    public async Task<(string?, string?)> GetVideoSessionParticipantsAsync(string sessionId)
+    {
+        var val = await _db.StringGetAsync($"video:session:{sessionId}");
+        if (!val.HasValue) return (null, null);
+        var parts = ((string)val!).Split(',');
+        return parts.Length == 2 ? (parts[0], parts[1]) : (null, null);
+    }
+
+    // ============================================================
+    //  NSFW REPORT AGGREGATION
+    //  Distinct-reporter SET per (session, violator) with short TTL.
+    //  Trust penalty only fires when threshold met — stops one-click
+    //  griefing where a single user can dock another 25 trust points.
+    // ============================================================
+
+    /// <summary>
+    /// Adds reporterId to the set, returns the new distinct-reporter count.
+    /// Sets an expiry on first add so abandoned reports clear themselves.
+    /// </summary>
+    public async Task<long> AddNsfwReporterAsync(string sessionId, string violatorId, string reporterId)
+    {
+        var key = RedisKeys.NsfwReports(sessionId, violatorId);
+        var added = await _db.SetAddAsync(key, reporterId);
+        if (added)
+            await _db.KeyExpireAsync(key, RedisTTL.NsfwReportWindow);
+        return await _db.SetLengthAsync(key);
+    }
+
+    public async Task ClearNsfwReportsAsync(string sessionId, string violatorId)
+        => await _db.KeyDeleteAsync(RedisKeys.NsfwReports(sessionId, violatorId));
+
+    // ============================================================
     //  GENERIC HELPERS
     // ============================================================
 

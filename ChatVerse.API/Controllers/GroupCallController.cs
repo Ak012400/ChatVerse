@@ -3,6 +3,7 @@ using ChatVerse.Domain.Constants;
 using ChatVerse.Infrastructure.Persistence.MongoDB;
 using ChatVerse.Infrastructure.Persistence.Redis;
 using ChatVerse.Infrastructure.Services.LiveKit;
+using ChatVerse.Infrastructure.Services.UserState;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
@@ -16,9 +17,10 @@ public class GroupCallController : ControllerBase
     private readonly LiveKitService _liveKit;
     private readonly MongoService _mongo;
     private readonly RedisService _redis;
+    private readonly UserStateService _userState;
     private readonly ILogger<GroupCallController> _logger;
 
-    // Redis key — active group calls track karne ke liye
+    // Redis key for active group call tracking.
     private static string GroupCallKey(string roomName)
         => $"groupcall:active:{roomName}";
 
@@ -26,11 +28,13 @@ public class GroupCallController : ControllerBase
         LiveKitService liveKit,
         MongoService mongo,
         RedisService redis,
+        UserStateService userState,
         ILogger<GroupCallController> logger)
     {
         _liveKit = liveKit;
         _mongo = mongo;
         _redis = redis;
+        _userState = userState;
         _logger = logger;
     }
 
@@ -41,9 +45,13 @@ public class GroupCallController : ControllerBase
     [HttpPost("token")]
     public async Task<IActionResult> GetToken([FromBody] GetGroupCallTokenRequest req)
     {
-        var userId = JwtService.GetUserId(User).ToString();
+        var userGuid = JwtService.GetUserId(User);
+        var userId = userGuid.ToString();
         var username = JwtService.GetUsername(User);
-        var trustScore = JwtService.GetTrustScore(User);
+
+        // Fresh values via 30s Redis cache → Postgres fallback
+        var trustScore = await _userState.GetTrustScoreAsync(userGuid);
+        var ageVerified = await _userState.GetAgeVerifiedAsync(userGuid);
 
         // Trust gate
         if (trustScore < TrustBands.RestrictedMax)
@@ -56,7 +64,7 @@ public class GroupCallController : ControllerBase
             return BadRequest(ApiResponse.Fail("Invalid room name"));
 
         // 18+ room check
-        if (roomName.StartsWith("adult-") && !JwtService.GetAgeVerified(User))
+        if (roomName.StartsWith("adult-") && !ageVerified)
             return StatusCode(403, ApiResponse.Fail(
                 "Age verification required for adult rooms"));
 
@@ -104,9 +112,10 @@ public class GroupCallController : ControllerBase
     [HttpPost("create")]
     public async Task<IActionResult> CreateRoom([FromBody] CreateGroupCallRequest req)
     {
-        var userId = JwtService.GetUserId(User).ToString();
+        var userGuid = JwtService.GetUserId(User);
+        var userId = userGuid.ToString();
         var username = JwtService.GetUsername(User);
-        var trustScore = JwtService.GetTrustScore(User);
+        var trustScore = await _userState.GetTrustScoreAsync(userGuid);
 
         if (trustScore < TrustBands.NormalMax)
             return StatusCode(403, ApiResponse.Fail(

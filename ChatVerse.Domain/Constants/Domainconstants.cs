@@ -91,6 +91,25 @@ public static class RedisKeys
     /// <summary>Hash: userId → "username|correct|attempts" for richer leader rows.</summary>
     public static string RollingQuizStats(string sessionId)
         => $"rolling-quiz:stats:{sessionId}";
+
+    // ── User-state cache (trust score + age verified) ─────────────
+    //  Hubs/controllers read through these so a banned user's gate
+    //  flips within seconds instead of waiting for JWT expiry.
+    public static string UserTrust(string userId) => $"user:trust:{userId}";
+    public static string UserAgeVerified(string userId) => $"user:ageverified:{userId}";
+
+    // ── ChatHub random match queue ────────────────────────────────
+    //  Distributed replacement for the legacy static ConcurrentQueue.
+    //  Separate key from the video matchmaker so the two flows don't
+    //  pull each other's users.
+    public const string ChatMatchQueue = "chat:match:queue";
+
+    // ── NSFW report aggregation per (session, violator) ──────────
+    //  SET of distinct reporter IDs with a short TTL — used to apply
+    //  trust penalties only when ≥2 independent users report the same
+    //  violator (or one reporter with very high model confidence).
+    public static string NsfwReports(string sessionId, string violatorUserId)
+        => $"nsfw:reports:{sessionId}:{violatorUserId}";
 }
 
 public static class RedisTTL
@@ -112,6 +131,29 @@ public static class RedisTTL
     // Tech news cache — 10 min is the sweet spot between "fresh enough
     // to feel live" and "doesn't hammer upstream APIs for the same data".
     public static readonly TimeSpan TechNews = TimeSpan.FromMinutes(10);
+
+    // Trust/age cache TTL — short so bans + verifications propagate fast
+    // (the price is one extra Postgres round-trip every 30s per active user).
+    public static readonly TimeSpan UserState = TimeSpan.FromSeconds(30);
+
+    // NSFW report aggregation window
+    public static readonly TimeSpan NsfwReportWindow = TimeSpan.FromSeconds(60);
+}
+
+public static class NsfwModeration
+{
+    // Number of distinct reporters required before trust penalty is applied
+    // (a single very-high-confidence report still triggers the penalty).
+    public const int ReportThreshold = 2;
+    public const double HighConfidenceAutoTrip = 0.95;
+}
+
+public static class EphemeralImage
+{
+    // Minimum trust score required to send vanish-mode images.
+    // Keeps brand-new / penalised accounts out of the path entirely.
+    public const int MinTrustScore = 41;   // Normal band or above
+    public const int MaxBase64Bytes = 4 * 1024 * 1024;
 }
 
 public static class JwtClaims

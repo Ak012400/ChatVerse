@@ -5,6 +5,7 @@ using ChatVerse.Domain.Enums;
 using ChatVerse.Infrastructure.Persistence.MongoDB;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
 using ChatVerse.Infrastructure.Persistence.Redis;
+using ChatVerse.Infrastructure.Services.UserState;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
 
@@ -32,6 +33,7 @@ public class VideoHub : Hub
     private readonly RedisService _redis;
     private readonly MongoService _mongo;
     private readonly PostgresProcService _postgres;
+    private readonly UserStateService _userState;
     private readonly ILogger<VideoHub> _logger;
 
     // Redis key — connectionId → sessionId mapping
@@ -43,11 +45,13 @@ public class VideoHub : Hub
         RedisService redis,
         MongoService mongo,
         PostgresProcService postgres,
+        UserStateService userState,
         ILogger<VideoHub> logger)
     {
         _redis = redis;
         _mongo = mongo;
         _postgres = postgres;
+        _userState = userState;
         _logger = logger;
     }
 
@@ -118,8 +122,12 @@ public class VideoHub : Hub
     // ============================================================
     public async Task JoinQueue()
     {
-        var userId = JwtService.GetUserId(Context.User!).ToString();
-        var trustScore = JwtService.GetTrustScore(Context.User!);
+        var userGuid = JwtService.GetUserId(Context.User!);
+        var userId = userGuid.ToString();
+
+        // Fresh trust read — bans/penalties take effect within the
+        // cache TTL, not at JWT expiry.
+        var trustScore = await _userState.GetTrustScoreAsync(userGuid);
 
         // Trust gate — minimum Normal band required
         if (trustScore < TrustBands.RestrictedMax)
@@ -246,6 +254,8 @@ public class VideoHub : Hub
                     "Video session completed",
                     null
                 );
+                // Invalidate cached trust so the +1 propagates immediately.
+                await _userState.InvalidateAsync(Guid.Parse(userId));
             }
             catch (Exception ex)
             {
@@ -281,7 +291,36 @@ public class VideoHub : Hub
     {
         var reporterId = JwtService.GetUserId(Context.User!).ToString();
 
-        // Append NSFW flag to MongoDB session
+        // ── Sanity guards ────────────────────────────────────────
+        // 1) Self-report is always meaningless.
+        if (reporterId == violatorUserId)
+        {
+            await Clients.Caller.SendAsync("SignalError", new
+            {
+                code = "SELF_REPORT_BLOCKED",
+                message = "You cannot report yourself"
+            });
+            return;
+        }
+
+        // 2) Verify the reporter is actually a session participant. Without
+        //    this, any user can fire a trust penalty at any other user just
+        //    by guessing a sessionId — one of the easier abuse vectors.
+        var (u1, u2) = await _redis.GetVideoSessionParticipantsAsync(sessionId);
+        if (u1 == null || u2 == null
+            || (reporterId != u1 && reporterId != u2)
+            || (violatorUserId != u1 && violatorUserId != u2))
+        {
+            await Clients.Caller.SendAsync("SignalError", new
+            {
+                code = "REPORT_INVALID",
+                message = "You are not a participant in this session"
+            });
+            return;
+        }
+
+        // Always record the flag — it's evidence even before any
+        // threshold trips, so we have an audit trail for review.
         var flag = new NsfwFlag
         {
             DetectedAt = DateTime.UtcNow,
@@ -291,10 +330,37 @@ public class VideoHub : Hub
         };
         await _mongo.AppendNsfwFlagAsync(sessionId, flag);
 
-        // End session with violation outcome
+        // Aggregate distinct reporters within the time window. Penalty only
+        // fires when ≥ ReportThreshold OR a single very-high-confidence
+        // report. Stops the one-click griefing where a user can dock another
+        // 25 trust points unilaterally.
+        var reporterCount = await _redis.AddNsfwReporterAsync(
+            sessionId, violatorUserId, reporterId);
+
+        var highConfidenceSingleReport = confidence >= NsfwModeration.HighConfidenceAutoTrip;
+        var thresholdReached =
+            reporterCount >= NsfwModeration.ReportThreshold || highConfidenceSingleReport;
+
+        if (!thresholdReached)
+        {
+            await Clients.Caller.SendAsync("ReportAcknowledged", new
+            {
+                sessionId,
+                violatorUserId,
+                reporterCount,
+                threshold = NsfwModeration.ReportThreshold,
+                message = "Report recorded. Waiting on threshold before action is taken."
+            });
+
+            _logger.LogInformation(
+                "NSFW report below threshold ({Count}/{Threshold}) — session {SessionId}, violator {ViolatorId}",
+                reporterCount, NsfwModeration.ReportThreshold, sessionId, violatorUserId);
+            return;
+        }
+
+        // ── Threshold met: apply consequences ───────────────────
         await _mongo.EndVideoSessionAsync(sessionId, "nsfw_violation", "banned");
 
-        // Apply trust penalty to violator
         _ = Task.Run(async () =>
         {
             try
@@ -303,9 +369,11 @@ public class VideoHub : Hub
                     Guid.Parse(violatorUserId),
                     TrustEventType.VideoNsfw,
                     TrustDeltas.VideoNsfw,
-                    $"NSFW content detected in video: {label} ({confidence:P0})",
+                    $"NSFW content detected in video: {label} ({confidence:P0}) — reporters: {reporterCount}",
                     null
                 );
+                // Invalidate cached trust so the next gate check sees the penalty.
+                await _userState.InvalidateAsync(Guid.Parse(violatorUserId));
             }
             catch (Exception ex)
             {
@@ -313,7 +381,7 @@ public class VideoHub : Hub
             }
         });
 
-        // Disconnect both users
+        // Disconnect violator
         var violatorConnId = await _redis.GetStringAsync(UserConnKey(violatorUserId));
         if (violatorConnId != null)
         {
@@ -324,17 +392,20 @@ public class VideoHub : Hub
             });
         }
 
+        // Notify the reporter
         await Clients.Caller.SendAsync("PartnerDisconnected", new
         {
             reason = "nsfw_violation",
             message = "Partner removed: community guidelines violation"
         });
 
-        // Cleanup
+        // Cleanup session + report aggregation
         await _redis.DeleteKeyAsync($"video:session:{sessionId}");
+        await _redis.ClearNsfwReportsAsync(sessionId, violatorUserId);
 
-        _logger.LogWarning("NSFW violation in session {SessionId} — Violator: {ViolatorId}",
-            sessionId, violatorUserId);
+        _logger.LogWarning(
+            "NSFW threshold met in session {SessionId} — violator {ViolatorId}, reporters {Count}",
+            sessionId, violatorUserId, reporterCount);
     }
 
     // ============================================================
