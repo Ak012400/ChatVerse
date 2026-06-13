@@ -216,6 +216,14 @@ public class SpotifyEmbed
     public string EmbedUrl { get; set; } = default!;
     /// <summary>Canonical web URL — original Spotify link the user pasted.</summary>
     public string WebUrl { get; set; } = default!;
+
+    // ── oEmbed-enriched metadata ─────────────────────────────────
+    //  Populated by SpotifyOEmbedService during ChatHub.SendMessage.
+    //  Null when the enricher couldn't reach Spotify or the URL is
+    //  malformed — frontend falls back to the generic "Spotify {kind}"
+    //  label in that case.
+    public string? Title { get; set; }
+    public string? ThumbnailUrl { get; set; }
 }
 
 public class Room
