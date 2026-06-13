@@ -1,6 +1,7 @@
 ﻿using ChatVerse.Infrastructure.ExternalServices.Cloudinary;
 using ChatVerse.Infrastructure.ExternalServices.Email;
 using ChatVerse.Infrastructure.ExternalServices.OpenAI;
+using ChatVerse.Infrastructure.ExternalServices.Spotify;
 using ChatVerse.Infrastructure.Persistence.MongoDB;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
 using ChatVerse.Infrastructure.Persistence.Redis;
@@ -82,6 +83,15 @@ public static class InfrastructureServiceExtensions
         // SDK manages its own HttpClient internally — register as plain
         // singleton (config + secret are immutable for the process).
         services.AddSingleton<CloudinaryService>();
+
+        // ── Spotify oEmbed (Music Lounge metadata) ────────────────────
+        // Typed HttpClient so its timeout doesn't bleed into other
+        // outbound calls. Scoped service consumes RedisService which is
+        // also scoped — lifetimes line up.
+        services.AddHttpClient<SpotifyOEmbedService>(c =>
+        {
+            c.Timeout = TimeSpan.FromSeconds(5);
+        });
 
         return services;
     }

@@ -120,6 +120,45 @@ public partial class MongoService
     }
 
     /// <summary>
+    /// Toggle a user's reaction on a message. Returns the resulting
+    /// reactions map so the hub can broadcast the authoritative state
+    /// instead of guessing it client-side.
+    ///
+    /// Idempotent: clicking the same emoji twice from the same user
+    /// removes the reaction (Slack/Discord behaviour). New emojis are
+    /// added as empty bucket → user-id append.
+    /// </summary>
+    public async Task<Dictionary<string, List<string>>> ToggleReactionAsync(
+        string messageId, string emoji, string userId)
+    {
+        var filter = Builders<Message>.Filter.Eq(m => m.Id, messageId);
+        var msg = await Messages.Find(filter).FirstOrDefaultAsync();
+        if (msg == null) return new Dictionary<string, List<string>>();
+
+        var reactions = msg.Reactions ?? new Dictionary<string, List<string>>();
+        if (!reactions.TryGetValue(emoji, out var users))
+        {
+            users = new List<string>();
+            reactions[emoji] = users;
+        }
+
+        if (users.Contains(userId))
+        {
+            users.Remove(userId);
+            // Prune empty buckets so the panel doesn't render dead emojis.
+            if (users.Count == 0) reactions.Remove(emoji);
+        }
+        else
+        {
+            users.Add(userId);
+        }
+
+        var update = Builders<Message>.Update.Set(m => m.Reactions, reactions);
+        await Messages.UpdateOneAsync(filter, update);
+        return reactions;
+    }
+
+    /// <summary>
     /// Flagged/blocked messages for admin dashboard.
     /// Maps to pipe_get_flagged_messages pipeline.
     /// </summary>

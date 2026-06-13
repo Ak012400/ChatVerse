@@ -4,6 +4,7 @@ using ChatVerse.API.Services;
 using ChatVerse.Domain.Constants;
 using ChatVerse.Domain.Entities;
 using ChatVerse.Infrastructure.ExternalServices.OpenAI;
+using ChatVerse.Infrastructure.ExternalServices.Spotify;
 using ChatVerse.Infrastructure.Persistence.MongoDB;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
 using ChatVerse.Infrastructure.Persistence.Redis;
@@ -24,6 +25,7 @@ public class ChatHub : Hub
     private readonly PostgresProcService _postgres;
     private readonly ModerationOrchestrator _moderation;
     private readonly UserStateService _userState;
+    private readonly SpotifyOEmbedService _spotifyOEmbed;
     private readonly ILogger<ChatHub> _logger;
     private readonly IServiceScopeFactory _scopeFactory;
 
@@ -33,6 +35,7 @@ public class ChatHub : Hub
         PostgresProcService postgres,
         ModerationOrchestrator moderation,
         UserStateService userState,
+        SpotifyOEmbedService spotifyOEmbed,
         ILogger<ChatHub> logger,
         IServiceScopeFactory scopeFactory)
     {
@@ -41,6 +44,7 @@ public class ChatHub : Hub
         _postgres = postgres;
         _moderation = moderation;
         _userState = userState;
+        _spotifyOEmbed = spotifyOEmbed;
         _logger = logger;
         _scopeFactory = scopeFactory;
     }
@@ -275,6 +279,15 @@ public class ChatHub : Hub
         // to-iframe embed URL to the persisted message. The frontend just
         // renders `message.spotify.embedUrl` in an iframe when present.
         var spotifyEmbed = SpotifyLinkExtractor.Extract(content);
+        // Best-effort oEmbed enrichment so the panel shows a real title
+        // + cover instead of generic "Spotify track". Cache hits in
+        // SpotifyOEmbedService make this nearly free on repeat shares.
+        if (spotifyEmbed != null)
+        {
+            var (title, thumb) = await _spotifyOEmbed.FetchAsync(spotifyEmbed.WebUrl);
+            spotifyEmbed.Title = title;
+            spotifyEmbed.ThumbnailUrl = thumb;
+        }
 
         var message = new Message
         {
@@ -360,7 +373,32 @@ public class ChatHub : Hub
     public async Task ReactToMessage(string roomSlug, string messageId, string emoji)
     {
         var userId = JwtService.GetUserId(Context.User!).ToString();
-        await Clients.Group(roomSlug).SendAsync("MessageReaction", new { messageId, emoji, userId });
+
+        // Persist the toggle so reactions survive a reload and the Music
+        // Lounge panel can show counts that match the chat bubble. Toggle
+        // semantics match Slack/Discord — second click from the same user
+        // removes their reaction.
+        Dictionary<string, List<string>> updated;
+        try
+        {
+            updated = await _mongo.ToggleReactionAsync(messageId, emoji, userId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Persist reaction failed — broadcasting transient state");
+            updated = new Dictionary<string, List<string>> { [emoji] = new() { userId } };
+        }
+
+        // Broadcast the authoritative server state so every client renders
+        // the same counts. Older clients that only listen for the legacy
+        // single-user payload still get the messageId+emoji+userId fields.
+        await Clients.Group(roomSlug).SendAsync("MessageReaction", new
+        {
+            messageId,
+            emoji,
+            userId,
+            reactions = updated,
+        });
     }
 
     // ============================================================
@@ -402,6 +440,12 @@ public class ChatHub : Hub
         // Mirror room messages: detect Spotify links server-side so DM
         // payloads and history both carry a ready-to-iframe embed URL.
         var dmSpotify = SpotifyLinkExtractor.Extract(content);
+        if (dmSpotify != null)
+        {
+            var (title, thumb) = await _spotifyOEmbed.FetchAsync(dmSpotify.WebUrl);
+            dmSpotify.Title = title;
+            dmSpotify.ThumbnailUrl = thumb;
+        }
 
         var dm = new DmMessage
         {
@@ -432,6 +476,8 @@ public class ChatHub : Hub
                 spotifyId = saved.Spotify.SpotifyId,
                 embedUrl  = saved.Spotify.EmbedUrl,
                 webUrl    = saved.Spotify.WebUrl,
+                title     = saved.Spotify.Title,
+                thumbnailUrl = saved.Spotify.ThumbnailUrl,
             },
             createdAt     = saved.CreatedAt,
         };
@@ -920,6 +966,8 @@ public class ChatHub : Hub
             spotifyId = m.Spotify.SpotifyId,
             embedUrl = m.Spotify.EmbedUrl,
             webUrl = m.Spotify.WebUrl,
+            title = m.Spotify.Title,
+            thumbnailUrl = m.Spotify.ThumbnailUrl,
         },
         editedAt = m.EditedAt,
         createdAt = m.CreatedAt

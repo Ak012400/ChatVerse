@@ -143,6 +143,8 @@ public class RoomsController : ControllerBase
                 spotifyId = m.Spotify.SpotifyId,
                 embedUrl = m.Spotify.EmbedUrl,
                 webUrl = m.Spotify.WebUrl,
+                title = m.Spotify.Title,
+                thumbnailUrl = m.Spotify.ThumbnailUrl,
             },
             editedAt = m.EditedAt,
             createdAt = m.CreatedAt
@@ -194,7 +196,10 @@ public class RoomsController : ControllerBase
                     spotifyId = m.Spotify.SpotifyId,
                     embedUrl = m.Spotify.EmbedUrl,
                     webUrl = m.Spotify.WebUrl,
+                    title = m.Spotify.Title,
+                    thumbnailUrl = m.Spotify.ThumbnailUrl,
                 },
+                reactions = m.Reactions,
                 createdAt = m.CreatedAt,
             });
 
