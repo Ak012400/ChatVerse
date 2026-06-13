@@ -3,6 +3,7 @@ using ChatVerse.Domain.Constants;
 using ChatVerse.Domain.Entities;
 using ChatVerse.Infrastructure.Persistence.MongoDB;
 using ChatVerse.Infrastructure.Persistence.Redis;
+using ChatVerse.Infrastructure.Services.UserState;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using System.Text.RegularExpressions;
@@ -16,15 +17,18 @@ public class RoomsController : ControllerBase
 {
     private readonly MongoService _mongo;
     private readonly RedisService _redis;
+    private readonly UserStateService _userState;
     private readonly ILogger<RoomsController> _logger;
 
     public RoomsController(
         MongoService mongo,
         RedisService redis,
+        UserStateService userState,
         ILogger<RoomsController> logger)
     {
         _mongo = mongo;
         _redis = redis;
+        _userState = userState;
         _logger = logger;
     }
 
@@ -36,7 +40,7 @@ public class RoomsController : ControllerBase
     [HttpGet]
     public async Task<IActionResult> GetRooms()
     {
-        var ageVerified = JwtService.GetAgeVerified(User);
+        var ageVerified = await _userState.GetAgeVerifiedAsync(JwtService.GetUserId(User));
         var rooms = await _mongo.GetActiveRoomsAsync();
 
         // Filter: hide private rooms entirely; hide 18+ rooms unless verified.
@@ -71,7 +75,7 @@ public class RoomsController : ControllerBase
     [HttpGet("{slug}")]
     public async Task<IActionResult> GetRoom(string slug)
     {
-        var ageVerified = JwtService.GetAgeVerified(User);
+        var ageVerified = await _userState.GetAgeVerifiedAsync(JwtService.GetUserId(User));
         var room = await _mongo.GetRoomBySlugAsync(slug);
 
         if (room == null)
@@ -105,7 +109,7 @@ public class RoomsController : ControllerBase
         [FromQuery] int skip = 0,
         [FromQuery] int limit = 50)
     {
-        var ageVerified = JwtService.GetAgeVerified(User);
+        var ageVerified = await _userState.GetAgeVerifiedAsync(JwtService.GetUserId(User));
         var room = await _mongo.GetRoomBySlugAsync(slug);
 
         if (room == null)
@@ -131,6 +135,15 @@ public class RoomsController : ControllerBase
             replyTo = m.ReplyTo,
             reactions = m.Reactions,
             modStatus = m.Moderation.Status,
+            // Include Spotify embed in REST history so embeds survive a
+            // cold reload, not just live SignalR broadcasts.
+            spotify = m.Spotify == null ? null : new
+            {
+                kind = m.Spotify.Kind,
+                spotifyId = m.Spotify.SpotifyId,
+                embedUrl = m.Spotify.EmbedUrl,
+                webUrl = m.Spotify.WebUrl,
+            },
             editedAt = m.EditedAt,
             createdAt = m.CreatedAt
         });
@@ -155,7 +168,9 @@ public class RoomsController : ControllerBase
         if (JwtService.GetIsGuest(User))
             return StatusCode(403, ApiResponse.Fail("Sign up to create rooms"));
 
-        var trustScore = JwtService.GetTrustScore(User);
+        // Fresh trust read so a recently-penalised user can't keep
+        // creating throwaway rooms with a stale JWT.
+        var trustScore = await _userState.GetTrustScoreAsync(JwtService.GetUserId(User));
         if (trustScore < TrustBands.RestrictedMax)
             return StatusCode(403, ApiResponse.Fail(
                 "Trust score too low to create rooms. Minimum required: 41"));

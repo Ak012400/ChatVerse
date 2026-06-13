@@ -2,6 +2,7 @@
 using Microsoft.EntityFrameworkCore;
 using ChatVerse.Infrastructure.ExternalServices.Cloudinary;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
+using ChatVerse.Infrastructure.Services.UserState;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using System.Text.Json;
@@ -15,15 +16,18 @@ public class AgeController : ControllerBase
 {
     private readonly PostgresProcService _postgres;
     private readonly CloudinaryService _cloudinary;
+    private readonly UserStateService _userState;
     private readonly ILogger<AgeController> _logger;
 
     public AgeController(
         PostgresProcService postgres,
         CloudinaryService cloudinary,
+        UserStateService userState,
         ILogger<AgeController> logger)
     {
         _postgres = postgres;
         _cloudinary = cloudinary;
+        _userState = userState;
         _logger = logger;
     }
 
@@ -124,6 +128,11 @@ public class AgeController : ControllerBase
 
         if (error == "MAX_ATTEMPTS_REACHED")
             return StatusCode(429, ApiResponse.Fail("Maximum AI quiz attempts reached (3). Please use document verification instead."));
+
+        // If this attempt cleared the age-verification gate, drop the
+        // cached value so the next hub check picks up the new state
+        // immediately instead of waiting for the TTL.
+        if (passed) await _userState.InvalidateAsync(userId);
 
         return Ok(ApiResponse<object>.Ok(new
         {

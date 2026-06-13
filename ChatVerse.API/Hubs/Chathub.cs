@@ -7,10 +7,10 @@ using ChatVerse.Infrastructure.ExternalServices.OpenAI;
 using ChatVerse.Infrastructure.Persistence.MongoDB;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
 using ChatVerse.Infrastructure.Persistence.Redis;
+using ChatVerse.Infrastructure.Services.UserState;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.DependencyInjection;
-using System.Collections.Concurrent;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -23,15 +23,16 @@ public class ChatHub : Hub
     private readonly RedisService _redis;
     private readonly PostgresProcService _postgres;
     private readonly ModerationOrchestrator _moderation;
+    private readonly UserStateService _userState;
     private readonly ILogger<ChatHub> _logger;
     private readonly IServiceScopeFactory _scopeFactory;
-    private static readonly ConcurrentQueue<string> _waitingUsers = new ConcurrentQueue<string>();
 
     public ChatHub(
         MongoService mongo,
         RedisService redis,
         PostgresProcService postgres,
         ModerationOrchestrator moderation,
+        UserStateService userState,
         ILogger<ChatHub> logger,
         IServiceScopeFactory scopeFactory)
     {
@@ -39,6 +40,7 @@ public class ChatHub : Hub
         _redis = redis;
         _postgres = postgres;
         _moderation = moderation;
+        _userState = userState;
         _logger = logger;
         _scopeFactory = scopeFactory;
     }
@@ -64,15 +66,9 @@ public class ChatHub : Hub
         var userId = JwtService.GetUserId(Context.User!).ToString();
         var username = JwtService.GetUsername(Context.User!);
 
-        // Rebuild waiting queue without this user.
-        // Order matters: snapshot the survivors FIRST, then clear the
-        // shared queue, then enqueue the survivors. The earlier version
-        // cleared after enqueueing, which wiped the entire queue on every
-        // disconnect.
-        var survivors = _waitingUsers.Where(u => u != userId).ToList();
-        _waitingUsers.Clear();
-        foreach (var user in survivors) _waitingUsers.Enqueue(user);
-
+        // Distributed cleanup — works across multiple API instances.
+        // Replaces the static ConcurrentQueue that broke under horizontal scale.
+        await _redis.RemoveFromChatMatchQueueAsync(userId);
         await _redis.SetUserOfflineAsync(userId);
 
         var roomSlug = await _redis.GetStringAsync($"conn:room:{Context.ConnectionId}");
@@ -98,10 +94,14 @@ public class ChatHub : Hub
     // ============================================================
     public async Task JoinRoom(string roomSlug)
     {
-        var userId = JwtService.GetUserId(Context.User!).ToString();
+        var userGuid = JwtService.GetUserId(Context.User!);
+        var userId = userGuid.ToString();
         var username = JwtService.GetUsername(Context.User!);
-        var trustScore = JwtService.GetTrustScore(Context.User!);
-        var ageVerified = JwtService.GetAgeVerified(Context.User!);
+
+        // Fresh trust + age — picks up bans / verifications within cache
+        // TTL (~30s) instead of waiting for the 24h JWT to expire.
+        var trustScore = await _userState.GetTrustScoreAsync(userGuid);
+        var ageVerified = await _userState.GetAgeVerifiedAsync(userGuid);
 
         var room = await _mongo.GetRoomBySlugAsync(roomSlug);
         if (room == null)
@@ -180,14 +180,41 @@ public class ChatHub : Hub
     // ============================================================
     public async Task SendMessage(string roomSlug, string content, string type = "text", string? mediaUrl = null, string? replyToId = null)
     {
-        var userId = JwtService.GetUserId(Context.User!).ToString();
+        var userGuid = JwtService.GetUserId(Context.User!);
+        var userId = userGuid.ToString();
         var username = JwtService.GetUsername(Context.User!);
-        var trustScore = JwtService.GetTrustScore(Context.User!);
+
+        // Fresh trust score — penalised users can't keep posting just
+        // because their JWT is still warm.
+        var trustScore = await _userState.GetTrustScoreAsync(userGuid);
 
         // ── 1. EPHEMERAL IMAGE (VANISH MODE) LOGIC ──
         if (type == "ephemeral_image")
         {
+            // Trust gate — keeps brand-new / penalised accounts out of the
+            // vanish path entirely. One of the easier abuse vectors to seal.
+            if (trustScore < EphemeralImage.MinTrustScore)
+            {
+                await Clients.Caller.SendAsync("Error",
+                    "Your trust score is too low to send ephemeral images.");
+                return;
+            }
+
+            // Defence-in-depth payload guard. SignalR already caps the
+            // transport message, but base64 data URLs blow up fast and
+            // this is the cleanest place to reject oversized uploads.
+            if (!string.IsNullOrEmpty(mediaUrl) && mediaUrl.Length > EphemeralImage.MaxBase64Bytes)
+            {
+                await Clients.Caller.SendAsync("Error", "Image too large.");
+                return;
+            }
+
             var tempMsgId = Guid.NewGuid().ToString("N")[..12];
+
+            // Server NEVER trusts a client-supplied moderation status.
+            // Until vision moderation is wired up, we broadcast as
+            // "pending" so clients can blur/queue rather than treating
+            // an attacker-set "clean" flag as the truth.
             await Clients.Group(roomSlug).SendAsync("ReceiveMessage", new
             {
                 id = tempMsgId,
@@ -195,17 +222,45 @@ public class ChatHub : Hub
                 senderId = userId,
                 senderName = username,
                 senderAvatar = (string?)null,
-                content = content ?? "📸 sent a photo",
+                content = content ?? "sent a photo",
                 type = type,
-                mediaUrl = mediaUrl, // Base64 Compressed Image
+                mediaUrl = mediaUrl,
                 replyTo = replyToId,
                 reactions = new Dictionary<string, List<string>>(),
-                modStatus = "clean", // Frontend NSFW JS ne pass kar diya hai tabhi yaha aaya
+                modStatus = "pending",
                 createdAt = DateTime.UtcNow
             });
 
+            // Audit trail — image bytes stay ephemeral but we keep the
+            // who/where/when so abuse reports can be correlated even
+            // after the photo has vanished from the room.
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    using var scope = _scopeFactory.CreateScope();
+                    var mongo = scope.ServiceProvider.GetRequiredService<MongoService>();
+                    await mongo.InsertModerationLogAsync(new ModerationLog
+                    {
+                        // ObjectId required by the moderation_logs schema —
+                        // ephemeral messages don't have one, so we mint one.
+                        MessageId = MongoDB.Bson.ObjectId.GenerateNewId().ToString(),
+                        RoomId = roomSlug,
+                        SenderId = userId,
+                        OriginalContent = $"[ephemeral_image: {content ?? "(no caption)"}]",
+                        Action = "pending",
+                        Source = "audit_ephemeral",
+                        CreatedAt = DateTime.UtcNow
+                    });
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Ephemeral audit log failed");
+                }
+            });
+
             _logger.LogInformation("Ephemeral image sent by {Username} in {Room}", username, roomSlug);
-            return; // 🛑 Yahi se wapas laut jao, DB mein kuch save mat karo!
+            return;
         }
 
         // ── 2. NORMAL TEXT MESSAGE LOGIC ──
@@ -214,6 +269,12 @@ public class ChatHub : Hub
             await Clients.Caller.SendAsync("Error", "Invalid message content");
             return;
         }
+
+        // Server-side Spotify link detection. If the message body contains
+        // a recognisable open.spotify.com / spotify: URL we attach a ready-
+        // to-iframe embed URL to the persisted message. The frontend just
+        // renders `message.spotify.embedUrl` in an iframe when present.
+        var spotifyEmbed = SpotifyLinkExtractor.Extract(content);
 
         var message = new Message
         {
@@ -226,6 +287,7 @@ public class ChatHub : Hub
             MediaUrl = mediaUrl,
             ReplyTo = replyToId,
             Moderation = new MessageModeration { Status = "pending" },
+            Spotify = spotifyEmbed,
             CreatedAt = DateTime.UtcNow
         };
 
@@ -258,12 +320,12 @@ public class ChatHub : Hub
                     roomClients: roomClients
                 );
 
-                // Step 2: Trust score warning — fresh scope
+                // Step 2: Trust score warning — fresh scope, fresh cached score
                 using var scope = _scopeFactory.CreateScope();
-                var scopedPostgres = scope.ServiceProvider
-                    .GetRequiredService<PostgresProcService>();
+                var scopedUserState = scope.ServiceProvider
+                    .GetRequiredService<UserStateService>();
 
-                var newScore = await scopedPostgres.GetTrustScoreAsync(userIdParsed);
+                var newScore = await scopedUserState.GetTrustScoreAsync(userIdParsed);
                 if (newScore <= 60)
                 {
                     var band = newScore <= 20 ? "New" :
@@ -336,6 +398,11 @@ public class ChatHub : Hub
         }
 
         var convId = Infrastructure.Persistence.MongoDB.MongoService.ConversationIdFor(senderId, recipientId);
+
+        // Mirror room messages: detect Spotify links server-side so DM
+        // payloads and history both carry a ready-to-iframe embed URL.
+        var dmSpotify = SpotifyLinkExtractor.Extract(content);
+
         var dm = new DmMessage
         {
             ConversationId = convId,
@@ -344,6 +411,7 @@ public class ChatHub : Hub
             RecipientId    = recipientId,
             Content        = content.Trim(),
             Type           = "text",
+            Spotify        = dmSpotify,
             CreatedAt      = DateTime.UtcNow,
         };
 
@@ -358,6 +426,13 @@ public class ChatHub : Hub
             recipientId   = saved.RecipientId,
             content       = saved.Content,
             type          = saved.Type,
+            spotify       = saved.Spotify == null ? null : new
+            {
+                kind      = saved.Spotify.Kind,
+                spotifyId = saved.Spotify.SpotifyId,
+                embedUrl  = saved.Spotify.EmbedUrl,
+                webUrl    = saved.Spotify.WebUrl,
+            },
             createdAt     = saved.CreatedAt,
         };
 
@@ -429,18 +504,35 @@ public class ChatHub : Hub
         if (string.IsNullOrEmpty(currentUserId)) return;
 
         // अगर यूज़र पहले से Queue में है, तो उसे दोबारा मत डालो
-        if (_waitingUsers.Contains(currentUserId)) return;
+        // Redis-backed match queue — safe across multiple API replicas.
+        // Replaces the legacy static ConcurrentQueue which silently
+        // failed to pair users that landed on different instances behind
+        // a load balancer.
+        if (await _redis.IsInChatMatchQueueAsync(currentUserId))
+        {
+            await Clients.Caller.SendAsync("WaitingForMatch");
+            return;
+        }
 
-        if (_waitingUsers.TryDequeue(out var partnerUserId))
+        var partnerUserId = await _redis.DequeueForChatMatchAsync();
+        if (partnerUserId != null && partnerUserId != currentUserId)
         {
             var randomRoomId = Guid.NewGuid().ToString();
+
+            // Register session participants so VideoHub partner lookups
+            // resolve identically for chat-hub matches and the dedicated
+            // video-hub flow.
+            await _redis.SetStringAsync(
+                $"video:session:{randomRoomId}",
+                $"{currentUserId},{partnerUserId}",
+                TimeSpan.FromHours(4));
 
             await Clients.User(currentUserId).SendAsync("MatchFound", randomRoomId, partnerUserId, true);
             await Clients.User(partnerUserId).SendAsync("MatchFound", randomRoomId, currentUserId, false);
         }
         else
         {
-            _waitingUsers.Enqueue(currentUserId);
+            await _redis.EnqueueForChatMatchAsync(currentUserId);
             await Clients.Caller.SendAsync("WaitingForMatch");
         }
     }
@@ -449,10 +541,8 @@ public class ChatHub : Hub
     {
         var currentUserId = Context.UserIdentifier;
         // ConcurrentQueue से रिमूव करने के लिए एक नई List बनाओ (सिर्फ cancellation के वक्त)
-        var newQueue = new ConcurrentQueue<string>(_waitingUsers.Where(u => u != currentUserId));
-        _waitingUsers.Clear();
-        foreach (var user in newQueue) _waitingUsers.Enqueue(user);
-
+        if (!string.IsNullOrEmpty(currentUserId))
+            await _redis.RemoveFromChatMatchQueueAsync(currentUserId);
         await Clients.Caller.SendAsync("MatchCancelled");
     }
     // ── 📞 WEBRTC SIGNALING METHODS ──
@@ -809,6 +899,8 @@ public class ChatHub : Hub
     }
 
     // ── Map message to client DTO ─────────────────────────────
+    //  Includes the optional Spotify embed so room history loads
+    //  with embeds intact (not just live broadcasts).
     private static object MapMessage(Message m) => new
     {
         id = m.Id,
@@ -822,6 +914,13 @@ public class ChatHub : Hub
         replyTo = m.ReplyTo,
         reactions = m.Reactions,
         modStatus = m.Moderation.Status,
+        spotify = m.Spotify == null ? null : new
+        {
+            kind = m.Spotify.Kind,
+            spotifyId = m.Spotify.SpotifyId,
+            embedUrl = m.Spotify.EmbedUrl,
+            webUrl = m.Spotify.WebUrl,
+        },
         editedAt = m.EditedAt,
         createdAt = m.CreatedAt
     };

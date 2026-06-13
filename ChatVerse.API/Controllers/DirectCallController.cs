@@ -2,6 +2,7 @@ using ChatVerse.API.Extensions;
 using ChatVerse.Domain.Constants;
 using ChatVerse.Infrastructure.Persistence.Redis;
 using ChatVerse.Infrastructure.Services.LiveKit;
+using ChatVerse.Infrastructure.Services.UserState;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
@@ -20,6 +21,7 @@ public class DirectCallController : ControllerBase
 {
     private readonly LiveKitService _liveKit;
     private readonly RedisService _redis;
+    private readonly UserStateService _userState;
     private readonly ILogger<DirectCallController> _logger;
 
     // LiveKit deletes a room after it has been empty for this many seconds.
@@ -36,10 +38,12 @@ public class DirectCallController : ControllerBase
     public DirectCallController(
         LiveKitService liveKit,
         RedisService redis,
+        UserStateService userState,
         ILogger<DirectCallController> logger)
     {
         _liveKit = liveKit;
         _redis = redis;
+        _userState = userState;
         _logger = logger;
     }
 
@@ -53,9 +57,11 @@ public class DirectCallController : ControllerBase
     [HttpPost("token")]
     public async Task<IActionResult> GetToken([FromBody] DirectCallTokenRequest req)
     {
-        var userId = JwtService.GetUserId(User).ToString();
+        var userGuid = JwtService.GetUserId(User);
+        var userId = userGuid.ToString();
         var username = JwtService.GetUsername(User);
-        var trustScore = JwtService.GetTrustScore(User);
+        // Fresh trust read so a recent ban applies before token mint.
+        var trustScore = await _userState.GetTrustScoreAsync(userGuid);
 
         if (trustScore < TrustBands.RestrictedMax)
             return StatusCode(403, ApiResponse.Fail(

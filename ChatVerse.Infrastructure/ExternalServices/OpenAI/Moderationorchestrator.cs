@@ -2,6 +2,7 @@
 using ChatVerse.Domain.Enums;
 using ChatVerse.Infrastructure.Persistence.MongoDB;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
+using ChatVerse.Infrastructure.Services.UserState;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -81,6 +82,13 @@ public class ModerationOrchestrator
                     reason: $"Message {result.Action}: {result.FlagReason}",
                     refSource: "mongo_messages"
                 );
+
+                // Invalidate user-state cache so the next gate check
+                // (room join / video queue / group call) sees the fresh
+                // trust score instead of the stale cached value.
+                var userState = scope.ServiceProvider.GetService<UserStateService>();
+                if (userState != null)
+                    await userState.InvalidateAsync(Guid.Parse(senderId));
             }
 
             // Notify room

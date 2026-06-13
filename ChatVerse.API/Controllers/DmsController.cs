@@ -137,6 +137,15 @@ public class DmsController : ControllerBase
             content     = m.Content,
             type        = m.Type,
             mediaUrl    = m.MediaUrl,
+            // Carry Spotify embed through history loads so cold opens
+            // render the same iframe as live broadcasts.
+            spotify     = m.Spotify == null ? null : new
+            {
+                kind      = m.Spotify.Kind,
+                spotifyId = m.Spotify.SpotifyId,
+                embedUrl  = m.Spotify.EmbedUrl,
+                webUrl    = m.Spotify.WebUrl,
+            },
             isRead      = m.IsRead,
             createdAt   = m.CreatedAt.ToString("o"),
         });

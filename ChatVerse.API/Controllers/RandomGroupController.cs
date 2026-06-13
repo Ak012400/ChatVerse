@@ -5,6 +5,7 @@ using ChatVerse.Infrastructure.Persistence.MongoDB;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
 using ChatVerse.Infrastructure.Persistence.Redis;
 using ChatVerse.Infrastructure.Services.LiveKit;
+using ChatVerse.Infrastructure.Services.UserState;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
@@ -27,6 +28,7 @@ public class RandomGroupController : ControllerBase
     private readonly LiveKitService _liveKit;
     private readonly RedisService _redis;
     private readonly PostgresProcService _postgres;
+    private readonly UserStateService _userState;
     private readonly ILogger<RandomGroupController> _logger;
 
     // Tunables — keep small so each peer can self-moderate effectively.
@@ -38,11 +40,13 @@ public class RandomGroupController : ControllerBase
         LiveKitService liveKit,
         RedisService redis,
         PostgresProcService postgres,
+        UserStateService userState,
         ILogger<RandomGroupController> logger)
     {
         _liveKit = liveKit;
         _redis = redis;
         _postgres = postgres;
+        _userState = userState;
         _logger = logger;
     }
 
@@ -53,9 +57,13 @@ public class RandomGroupController : ControllerBase
     [HttpPost("join")]
     public async Task<IActionResult> Join()
     {
-        var userId = JwtService.GetUserId(User).ToString();
+        var userGuid = JwtService.GetUserId(User);
+        var userId = userGuid.ToString();
         var username = JwtService.GetUsername(User);
-        var trustScore = JwtService.GetTrustScore(User);
+
+        // Fresh trust read — penalised accounts can't keep joining random
+        // lobbies by virtue of an old JWT.
+        var trustScore = await _userState.GetTrustScoreAsync(userGuid);
 
         // Trust gate — same threshold as random 1-on-1
         if (trustScore < TrustBands.RestrictedMax)
