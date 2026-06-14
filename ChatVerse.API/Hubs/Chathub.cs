@@ -706,26 +706,46 @@ public class ChatHub : Hub
     // ============================================================
 
     private static string TheaterGroupFor(string roomName) => $"theater:{roomName}";
-    private static string TheaterUrlCacheKey(string roomName) => $"theater:url:{roomName}";
+    private static string TheaterStateCacheKey(string roomName) => $"theater:state:{roomName}";
+
+    // Mode names the client + server agree on.
+    //   "cobrowse"    → URL-sync iframe path (YouTube / direct video etc.)
+    //   "screenshare" → LiveKit screen-share path (Netflix-style sites)
+    private const string TheaterModeCobrowse = "cobrowse";
+    private const string TheaterModeScreenShare = "screenshare";
 
     public async Task JoinTheaterRoom(string roomName)
     {
         if (string.IsNullOrWhiteSpace(roomName)) return;
         await Groups.AddToGroupAsync(Context.ConnectionId, TheaterGroupFor(roomName));
 
-        // Replay the current URL (if any) so the joiner doesn't sit on
-        // a blank iframe waiting for the host to pick a new one.
-        var lastUrl = await _redis.GetStringAsync(TheaterUrlCacheKey(roomName));
-        if (!string.IsNullOrWhiteSpace(lastUrl))
+        // Replay the current state (if any) so a joiner sees whatever
+        // mode + URL the host already picked, instead of dropping into
+        // a blank room.
+        var json = await _redis.GetStringAsync(TheaterStateCacheKey(roomName));
+        if (!string.IsNullOrWhiteSpace(json))
         {
-            await Clients.Caller.SendAsync("TheaterUrlChanged", new
+            try
             {
-                url = lastUrl,
-                at = DateTime.UtcNow,
-                hostId = (string?)null,
-                hostName = (string?)null,
-                replay = true,
-            });
+                var state = JsonSerializer.Deserialize<TheaterStateDto>(json);
+                if (state != null)
+                {
+                    await Clients.Caller.SendAsync("TheaterStateChanged", new
+                    {
+                        mode = state.Mode,
+                        url = state.Url,
+                        hostId = (string?)null,
+                        hostName = state.HostName,
+                        at = DateTime.UtcNow,
+                        replay = true,
+                    });
+                }
+            }
+            catch
+            {
+                // Bad cache entry — drop it so next write can repopulate.
+                await _redis.DeleteKeyAsync(TheaterStateCacheKey(roomName));
+            }
         }
     }
 
@@ -736,35 +756,62 @@ public class ChatHub : Hub
     }
 
     /// <summary>
-    /// Host (or anyone in the room — first-come-first-serve, just like
-    /// LiveKit screen-share before) updates the shared iframe URL.
-    /// We cache it briefly in Redis so late joiners pick it up too.
+    /// Single broadcast for both mode and URL — keeps the wire model
+    /// simple and means viewers can never observe an inconsistent state
+    /// (mode says iframe but url is null, etc.). For screen-share mode
+    /// the url is ignored (LiveKit carries the video itself).
     /// </summary>
-    public async Task BroadcastTheaterUrl(string roomName, string url)
+    public async Task BroadcastTheaterState(string roomName, string mode, string? url)
     {
-        if (string.IsNullOrWhiteSpace(roomName) || string.IsNullOrWhiteSpace(url)) return;
-        // Defensive bounds — anything past 2KB is not a real URL.
-        if (url.Length > 2048) return;
-        // Must be http(s) — javascript:, data:, file: are off-limits.
-        if (!url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
-            !url.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return;
+        if (string.IsNullOrWhiteSpace(roomName)) return;
+
+        var normalisedMode = (mode ?? "").Trim().ToLowerInvariant();
+        if (normalisedMode != TheaterModeCobrowse && normalisedMode != TheaterModeScreenShare) return;
+
+        // URL only matters in co-browse mode; trim it down in screen-share.
+        string? normalisedUrl = null;
+        if (normalisedMode == TheaterModeCobrowse && !string.IsNullOrWhiteSpace(url))
+        {
+            if (url.Length > 2048) return;
+            if (!url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+                !url.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return;
+            normalisedUrl = url;
+        }
 
         var hostId = JwtService.GetUserId(Context.User!).ToString();
         var hostName = JwtService.GetUsername(Context.User!);
 
-        // Persist for late joiners — 15 minutes is enough for the
-        // duration of an average movie session before the host renews.
-        await _redis.SetStringAsync(TheaterUrlCacheKey(roomName), url, TimeSpan.FromMinutes(15));
+        // Persist for late joiners — 15 minutes covers a typical movie
+        // before the host updates it.
+        var stateJson = JsonSerializer.Serialize(new TheaterStateDto
+        {
+            Mode = normalisedMode,
+            Url = normalisedUrl,
+            HostName = hostName,
+        });
+        await _redis.SetStringAsync(TheaterStateCacheKey(roomName), stateJson, TimeSpan.FromMinutes(15));
 
         await Clients.Group(TheaterGroupFor(roomName))
-            .SendAsync("TheaterUrlChanged", new
+            .SendAsync("TheaterStateChanged", new
             {
-                url,
+                mode = normalisedMode,
+                url = normalisedUrl,
                 hostId,
                 hostName,
                 at = DateTime.UtcNow,
                 replay = false,
             });
+    }
+
+    /// <summary>
+    /// Compact DTO for the Redis-cached theater state. Kept private to
+    /// the hub — no consumer outside this file deserialises this shape.
+    /// </summary>
+    private sealed class TheaterStateDto
+    {
+        [JsonPropertyName("mode")] public string Mode { get; set; } = TheaterModeCobrowse;
+        [JsonPropertyName("url")]  public string? Url { get; set; }
+        [JsonPropertyName("hostName")] public string? HostName { get; set; }
     }
 
     // ============================================================
