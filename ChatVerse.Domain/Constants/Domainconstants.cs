@@ -173,6 +173,18 @@ public static class MongoCollections
     public const string ModerationLogs = "moderation_logs";
     public const string VideoSessions = "video_sessions";
     public const string DmMessages = "dm_messages";
+    /// <summary>Directed user-block relationships. (blocker, blocked) pair.</summary>
+    public const string UserBlocks = "user_blocks";
+}
+
+public static class Theater
+{
+    /// <summary>Max concurrent participants in a Theater (Watch Party) room.</summary>
+    public const int MaxParticipants = 10;
+    /// <summary>Empty room TTL in seconds — LiveKit closes after this idle window.</summary>
+    public const int EmptyTimeoutSeconds = 300;
+    /// <summary>Slug prefix so client-side routing can detect theater rooms.</summary>
+    public const string SlugPrefix = "th-";
 }
 
 public static class AgeVerification

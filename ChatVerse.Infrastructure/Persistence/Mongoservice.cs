@@ -20,6 +20,7 @@ public partial class MongoService
     private IMongoCollection<ModerationLog> ModerationLogs => _db.GetCollection<ModerationLog>(MongoCollections.ModerationLogs);
     private IMongoCollection<VideoSession> VideoSessions => _db.GetCollection<VideoSession>(MongoCollections.VideoSessions);
     private IMongoCollection<DmMessage> DmMessages => _db.GetCollection<DmMessage>(MongoCollections.DmMessages);
+    private IMongoCollection<UserBlock> UserBlocks => _db.GetCollection<UserBlock>(MongoCollections.UserBlocks);
 
     public MongoService(IMongoClient client, string databaseName)
     {
@@ -550,6 +551,71 @@ public partial class MongoService
             .Set(m => m.ReadAt, DateTime.UtcNow);
         var res = await DmMessages.UpdateManyAsync(filter, update);
         return res.ModifiedCount;
+    }
+
+    // ============================================================
+    //  USER BLOCKS — Instagram-style directed silencing.
+    //
+    //  Read pattern is dominated by "is X blocked by Y?" which a
+    //  compound (blockedId, blockerId) index makes O(log n). We also
+    //  surface "how many people blocked me?" as a count, deliberately
+    //  WITHOUT names — same privacy posture mainstream platforms use.
+    // ============================================================
+
+    /// <summary>Add a block; idempotent (no-op if already exists).</summary>
+    public async Task<UserBlock> BlockUserAsync(string blockerId, string blockedId, string? reason)
+    {
+        if (blockerId == blockedId)
+            throw new ArgumentException("Cannot block yourself");
+
+        var existing = await UserBlocks
+            .Find(b => b.BlockerId == blockerId && b.BlockedId == blockedId)
+            .FirstOrDefaultAsync();
+        if (existing != null) return existing;
+
+        var doc = new UserBlock
+        {
+            BlockerId = blockerId,
+            BlockedId = blockedId,
+            Reason = reason,
+            CreatedAt = DateTime.UtcNow,
+        };
+        await UserBlocks.InsertOneAsync(doc);
+        return doc;
+    }
+
+    public async Task<bool> UnblockUserAsync(string blockerId, string blockedId)
+    {
+        var res = await UserBlocks.DeleteOneAsync(b =>
+            b.BlockerId == blockerId && b.BlockedId == blockedId);
+        return res.DeletedCount > 0;
+    }
+
+    /// <summary>True if blockerId has blocked blockedId.</summary>
+    public async Task<bool> IsBlockedAsync(string blockerId, string blockedId)
+    {
+        return await UserBlocks
+            .Find(b => b.BlockerId == blockerId && b.BlockedId == blockedId)
+            .AnyAsync();
+    }
+
+    /// <summary>List of users the caller has blocked. Newest first.</summary>
+    public async Task<List<UserBlock>> GetBlocksByMeAsync(string myUserId, int limit = 100)
+    {
+        return await UserBlocks
+            .Find(b => b.BlockerId == myUserId)
+            .SortByDescending(b => b.CreatedAt)
+            .Limit(limit)
+            .ToListAsync();
+    }
+
+    /// <summary>
+    /// Count-only — surfaced in the blocked user's settings as
+    /// "You appear in N blocklists". Names are never returned.
+    /// </summary>
+    public async Task<long> GetBlockedMeCountAsync(string myUserId)
+    {
+        return await UserBlocks.CountDocumentsAsync(b => b.BlockedId == myUserId);
     }
 }
 
