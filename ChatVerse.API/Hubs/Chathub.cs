@@ -618,6 +618,75 @@ public class ChatHub : Hub
     }
 
     // ============================================================
+    //  LIVE VOICE CAPTIONS + TRANSLATION
+    //
+    //  Architecture (Phase A — captions only, no TTS):
+    //   1. Each participant's browser runs Web Speech API locally to
+    //      transcribe their OWN microphone — zero audio uploads.
+    //   2. As soon as a phrase is recognised (interim or final), the
+    //      speaker invokes BroadcastCaption(roomName, text, sourceLang, isFinal).
+    //   3. We fan out "IncomingCaption" to everyone else in a SignalR
+    //      group whose name mirrors the LiveKit room (the voice rooms
+    //      live in LiveKit, but SignalR carries the side-channel text).
+    //   4. Each receiver's frontend POSTs to /api/translate if the
+    //      source language differs from their preferred language —
+    //      with Redis caching, repeated phrases ("haan", "okay")
+    //      translate exactly once across the whole platform.
+    //
+    //  Why a SignalR group instead of Clients.User(id) per listener?
+    //   • A 4-person group call means 3 fanouts per phrase. Group
+    //     send is a single server-side broadcast — much cheaper.
+    //   • Participants come and go; group membership auto-cleans
+    //     on disconnect, no manual bookkeeping.
+    //
+    //  The group naming is `caption:{liveKitRoomName}` so even if a
+    //  user has multiple tabs in different rooms, captions stay
+    //  scoped to the room they belong to.
+    // ============================================================
+
+    private static string CaptionGroupFor(string roomName) => $"caption:{roomName}";
+
+    public async Task JoinCaptionRoom(string roomName)
+    {
+        if (string.IsNullOrWhiteSpace(roomName)) return;
+        await Groups.AddToGroupAsync(Context.ConnectionId, CaptionGroupFor(roomName));
+    }
+
+    public async Task LeaveCaptionRoom(string roomName)
+    {
+        if (string.IsNullOrWhiteSpace(roomName)) return;
+        await Groups.RemoveFromGroupAsync(Context.ConnectionId, CaptionGroupFor(roomName));
+    }
+
+    /// <summary>
+    /// Fire-and-forget broadcast of a transcribed phrase to every other
+    /// participant in the same caption group. Sent as both interim and
+    /// final passes so receivers can render a "typing-in-progress" line
+    /// before the final replaces it.
+    /// </summary>
+    public async Task BroadcastCaption(string roomName, string text, string sourceLang, bool isFinal)
+    {
+        if (string.IsNullOrWhiteSpace(roomName) || string.IsNullOrWhiteSpace(text)) return;
+        // Defensive cap — Web Speech occasionally returns a runaway
+        // string when audio dropouts confuse the recogniser.
+        if (text.Length > 1000) text = text[..1000];
+
+        var speakerId = JwtService.GetUserId(Context.User!).ToString();
+        var speakerName = JwtService.GetUsername(Context.User!);
+
+        await Clients.GroupExcept(CaptionGroupFor(roomName), Context.ConnectionId)
+            .SendAsync("IncomingCaption", new
+            {
+                speakerId,
+                speakerName,
+                text,
+                sourceLang = string.IsNullOrWhiteSpace(sourceLang) ? "en" : sourceLang.ToLowerInvariant(),
+                isFinal,
+                at = DateTime.UtcNow,
+            });
+    }
+
+    // ============================================================
     //  DIRECT INVITE CALLING
     //  - Caller invokes InviteToCall(targetUserId, message)
     //  - Target receives "IncomingCall" event with a per-invite id

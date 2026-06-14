@@ -1,8 +1,11 @@
 using ChatVerse.API.Extensions;
 using ChatVerse.API.Models;
 using ChatVerse.Infrastructure.ExternalServices.AI;
+using ChatVerse.Infrastructure.Persistence.Redis;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace ChatVerse.API.Controllers;
 
@@ -25,6 +28,7 @@ namespace ChatVerse.API.Controllers;
 public class TranslateController : ControllerBase
 {
     private readonly AiChatProvider _ai;
+    private readonly RedisService _redis;
     private readonly ILogger<TranslateController> _logger;
 
     // Whitelist of language codes we know our prompt handles well.
@@ -35,9 +39,18 @@ public class TranslateController : ControllerBase
         "ur", "ar", "es", "fr", "de", "ja", "zh", "ko", "ru", "pt", "it",
     };
 
-    public TranslateController(AiChatProvider ai, ILogger<TranslateController> logger)
+    // 24h cache TTL — translation of "hello" into Hindi today is the
+    // same tomorrow. Voice captions repeat phrases constantly ("haan",
+    // "okay", "thank you") so this saves a huge chunk of Groq calls.
+    private static readonly TimeSpan CacheTtl = TimeSpan.FromHours(24);
+
+    public TranslateController(
+        AiChatProvider ai,
+        RedisService redis,
+        ILogger<TranslateController> logger)
     {
         _ai = ai;
+        _redis = redis;
         _logger = logger;
     }
 
@@ -51,6 +64,25 @@ public class TranslateController : ControllerBase
         if (string.IsNullOrWhiteSpace(req.TargetLang) || !SupportedTargets.Contains(req.TargetLang))
             return BadRequest(ApiResponse.Fail("Unsupported target language"));
 
+        var trimmed = req.Text.Trim();
+        var targetLower = req.TargetLang.ToLowerInvariant();
+
+        // ── Redis cache check ─────────────────────────────────────
+        //  Key is a SHA-1 of `{trimmed}|{targetLower}` so very long
+        //  inputs don't blow up Redis key sizes. Collisions at SHA-1
+        //  are astronomically rare for this use case.
+        var cacheKey = $"tx:cache:{targetLower}:{Sha1(trimmed)}";
+        var cached = await _redis.GetStringAsync(cacheKey);
+        if (!string.IsNullOrEmpty(cached))
+        {
+            return Ok(ApiResponse<object>.Ok(new
+            {
+                translated = cached,
+                targetLang = req.TargetLang,
+                cached = true,
+            }));
+        }
+
         // Keep the prompt small and direct — translation models do better
         // with concrete instruction than verbose framing. Asking for ONLY
         // the translation suppresses the model's tendency to add prefaces.
@@ -62,7 +94,7 @@ public class TranslateController : ControllerBase
         var msgs = new List<AiChatProvider.ChatMessage>
         {
             new("system", system),
-            new("user", req.Text.Trim()),
+            new("user", trimmed),
         };
 
         var translated = await _ai.CompleteAsync(
@@ -72,11 +104,22 @@ public class TranslateController : ControllerBase
         if (string.IsNullOrWhiteSpace(translated))
             return StatusCode(503, ApiResponse.Fail("Translation provider unavailable"));
 
+        var clean = translated.Trim();
+        // Fire-and-forget cache write — keeps the response fast.
+        _ = _redis.SetStringAsync(cacheKey, clean, CacheTtl);
+
         return Ok(ApiResponse<object>.Ok(new
         {
-            translated = translated.Trim(),
+            translated = clean,
             targetLang = req.TargetLang,
+            cached = false,
         }));
+    }
+
+    private static string Sha1(string input)
+    {
+        var bytes = SHA1.HashData(Encoding.UTF8.GetBytes(input));
+        return Convert.ToHexString(bytes).ToLowerInvariant();
     }
 
     private static string LanguageName(string code) => code.ToLowerInvariant() switch
