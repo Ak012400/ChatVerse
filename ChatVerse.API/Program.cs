@@ -234,6 +234,11 @@ try
     builder.Services.AddHttpClient<ChatVerse.API.Services.Games.JokesProvider>();
     // Tech Talk news feed — pulls HN + dev.to, caches in Redis.
     builder.Services.AddHttpClient<ChatVerse.API.Services.Games.TechNewsProvider>();
+    // Trending-headline source for AmbientQuestionProvider. Hits HN +
+    // Reddit (no key required), caches the merged pool in Redis 15 min.
+    // Lets the #general chat see LIVE topics instead of the same 30
+    // evergreen prompts on rotation.
+    builder.Services.AddHttpClient<ChatVerse.API.Services.Games.TrendingQuestionProvider>();
     // Ambient-question feed: wraps QuizQuestionProvider for MCQs and a
     // curated bank for discussion prompts. Scoped because the wrapped
     // provider already lives at a defined lifetime.

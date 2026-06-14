@@ -33,16 +33,28 @@ public sealed class AmbientQuestionService : BackgroundService
 
     // Slugs we drop ambient questions into. Match the live chat
     // room slugs — see the Rooms sidebar.
+    //
+    // We deliberately include the BROAD-AUDIENCE rooms (general /
+    // random / tech-talk) so the trending-headline prompts get the
+    // engagement they're designed for. RollingQuizService still
+    // operates on #general at its own cadence — the two don't fight
+    // because they share the same client banner UI which collapses
+    // multiple ambient items into one strip.
     private static readonly string[] GameableSlugs =
     {
+        "general",
         "gaming-lounge",
         "mini-game",
+        "tech-talk",
+        "random",
+        "music-room",
     };
 
     // Cadence: gentle. Faster than this and the chat starts to
     // feel like the questions are spamming over real conversation;
-    // slower and the engagement boost fades.
-    private static readonly TimeSpan EmitInterval = TimeSpan.FromMinutes(7);
+    // slower and the engagement boost fades. With the larger room
+    // set above we stretch a little further to reduce per-room load.
+    private static readonly TimeSpan EmitInterval = TimeSpan.FromMinutes(9);
     // Initial delay so a Render cold-start doesn't fire one before
     // the chat has rendered for any user.
     private static readonly TimeSpan StartupDelay = TimeSpan.FromMinutes(2);
