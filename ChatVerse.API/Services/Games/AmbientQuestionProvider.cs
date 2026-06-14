@@ -25,30 +25,50 @@ namespace ChatVerse.API.Services.Games;
 public sealed class AmbientQuestionProvider
 {
     private readonly QuizQuestionProvider _quiz;
+    private readonly TrendingQuestionProvider _trending;
     private readonly ILogger<AmbientQuestionProvider> _logger;
 
-    public AmbientQuestionProvider(QuizQuestionProvider quiz, ILogger<AmbientQuestionProvider> logger)
+    public AmbientQuestionProvider(
+        QuizQuestionProvider quiz,
+        TrendingQuestionProvider trending,
+        ILogger<AmbientQuestionProvider> logger)
     {
         _quiz = quiz;
+        _trending = trending;
         _logger = logger;
     }
 
     /// <summary>
-    /// Returns the next ambient question. The flavour split is
-    /// roughly 60/40 toward MCQ — visual variety beats pure prose,
-    /// but discussion prompts are higher-engagement when they land
-    /// so we don't bury them under quizzes.
+    /// Returns the next ambient question. Three-way mix:
+    ///   45% MCQ            (visual variety + light competition)
+    ///   35% Live trending  (headlines from HackerNews / Reddit India /
+    ///                       worldnews / cricket / movies — wraps each
+    ///                       into a discussion prompt)
+    ///   20% Curated bank   (evergreen "would you rather" style — always
+    ///                       available even when upstream feeds are down)
     /// </summary>
     public async Task<AmbientQuestion?> NextAsync(CancellationToken ct)
     {
         var roll = RandomNumberGenerator.GetInt32(100);
-        if (roll < 60)
+        if (roll < 45)
         {
             var mcq = await TryFetchMcqAsync(ct);
             if (mcq is not null) return mcq;
         }
-        // Either we rolled discussion OR MCQ fetch failed. Either
-        // way, lean on the hardcoded bank — it's always available.
+        if (roll < 80) // 45..79 → trending bucket
+        {
+            try
+            {
+                var trending = await _trending.NextAsync(ct);
+                if (trending is not null) return trending;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Trending source failed, falling back to bank");
+            }
+        }
+        // Either we rolled the bank OR earlier sources failed. The
+        // curated bank is always available — no upstream dependency.
         return PickDiscussion();
     }
 

@@ -40,7 +40,50 @@ public enum GameType
     Trivia,
     Chess,
     Ludo,
+    /// <summary>
+    /// Quiplash-style writing game. Bot drops a "Roast X" topic, every
+    /// player submits a one-liner, all submissions reveal anonymously,
+    /// players vote, winner per round. See RoastSession for details.
+    /// </summary>
+    Roast,
 }
+
+/// <summary>Lifecycle phases inside a Roast round.</summary>
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum RoastPhase
+{
+    Lobby,
+    /// <summary>Submission window — every player types their roast (60s).</summary>
+    Submitting,
+    /// <summary>Voting window — anonymous reveals + vote tally (30s).</summary>
+    Voting,
+    /// <summary>Reveal — show authors + winner before next round (10s).</summary>
+    Revealing,
+    /// <summary>Final scoreboard.</summary>
+    Ended,
+}
+
+public sealed record RoastSubmission(
+    string AuthorUserId,
+    string AuthorUsername,
+    string Text,
+    DateTime SubmittedAtUtc);
+
+public sealed record RoastVote(
+    string VoterUserId,
+    string ForAuthorUserId,
+    DateTime AtUtc);
+
+public sealed record RoastRoundState(
+    int RoundNumber,
+    string Topic,
+    string TopicSource,
+    RoastPhase Phase,
+    DateTime PhaseEndsAtUtc,
+    List<RoastSubmission> Submissions,
+    List<RoastVote> Votes,
+    string? WinnerUserId,
+    int? WinnerVoteCount);
 
 /// <summary>
 /// Players actively participate (submit answers, make moves). Spectators
@@ -295,10 +338,12 @@ public record SendChatRequest(string Text);
 [JsonConverter(typeof(JsonStringEnumConverter))]
 public enum JokeReactionType
 {
-    Laugh,      // 😂
-    Meh,        // 😐
-    Skull,      // 💀  ("dead"-funny / cringe — context-dependent)
-    EyeRoll,    // 🙄
+    Laugh,      // 😂  classic "that's funny"
+    Meh,        // 😐  it was OK
+    Skull,      // 💀  dead from laughter
+    EyeRoll,    // 🙄  hard pass
+    Fire,       // 🔥  roast was savage / amazing punchline
+    Clap,       // 👏  respectable delivery — slow clap
 }
 
 /// <summary>
