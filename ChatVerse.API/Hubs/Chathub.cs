@@ -89,6 +89,24 @@ public class ChatHub : Hub
             });
         }
 
+        // Theater cleanup — same shape as chat-room cleanup. Without
+        // this an abandoned tab leaves a presence entry forever and
+        // the room never auto-closes.
+        var theaterRoom = await _redis.GetStringAsync(TheaterConnRoomKey(Context.ConnectionId));
+        if (theaterRoom != null)
+        {
+            await _redis.LeaveRoomPresenceAsync(TheaterPresenceSlug(theaterRoom), userId);
+            await _redis.DeleteKeyAsync(TheaterConnRoomKey(Context.ConnectionId));
+            await Clients.Group(TheaterGroupFor(theaterRoom)).SendAsync("TheaterParticipantsChanged", new
+            {
+                leftUserId = userId,
+                leftUsername = username,
+                at = DateTime.UtcNow,
+            });
+            var remaining = await _redis.GetRoomOnlineCountAsync(TheaterPresenceSlug(theaterRoom));
+            if (remaining <= 0) await CleanupTheaterRoomAsync(theaterRoom);
+        }
+
         _logger.LogInformation("User {Username} disconnected", username);
         await base.OnDisconnectedAsync(exception);
     }
@@ -707,6 +725,11 @@ public class ChatHub : Hub
 
     private static string TheaterGroupFor(string roomName) => $"theater:{roomName}";
     private static string TheaterStateCacheKey(string roomName) => $"theater:state:{roomName}";
+    private static string TheaterCreatorCacheKey(string roomName) => $"theater:creator:{roomName}";
+    private static string TheaterConnRoomKey(string connId) => $"theater:conn:{connId}";
+    // Presence reuses the chat presence set machinery; we just namespace
+    // the slug so theater participants never collide with chat-room ones.
+    private static string TheaterPresenceSlug(string roomName) => $"theater:{roomName}";
 
     // Mode names the client + server agree on.
     //   "cobrowse"    → URL-sync iframe path (YouTube / direct video etc.)
@@ -714,10 +737,45 @@ public class ChatHub : Hub
     private const string TheaterModeCobrowse = "cobrowse";
     private const string TheaterModeScreenShare = "screenshare";
 
+    // Hard cap — a theater room can't outlive 8 hours. Even if users
+    // forget to close it, server expires the state automatically. The
+    // TTL is renewed on every state broadcast so an active room won't
+    // expire mid-session — only abandoned ones do.
+    private static readonly TimeSpan TheaterMaxLifetime = TimeSpan.FromHours(8);
+
     public async Task JoinTheaterRoom(string roomName)
     {
         if (string.IsNullOrWhiteSpace(roomName)) return;
+
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+        var username = JwtService.GetUsername(Context.User!);
+
         await Groups.AddToGroupAsync(Context.ConnectionId, TheaterGroupFor(roomName));
+
+        // ── Presence + creator tracking
+        //   The first joiner becomes the room creator (per-room TTL of
+        //   8 hours — same as the state cap). Subsequent joiners just
+        //   add themselves to the presence set.
+        var existingCreator = await _redis.GetStringAsync(TheaterCreatorCacheKey(roomName));
+        if (string.IsNullOrEmpty(existingCreator))
+        {
+            await _redis.SetStringAsync(TheaterCreatorCacheKey(roomName), $"{userId}|{username}", TheaterMaxLifetime);
+        }
+
+        // Per-connection cleanup hint so OnDisconnectedAsync can decrement
+        // presence even without a graceful LeaveTheaterRoom.
+        await _redis.SetStringAsync(TheaterConnRoomKey(Context.ConnectionId), roomName, TheaterMaxLifetime);
+        await _redis.JoinRoomPresenceAsync(TheaterPresenceSlug(roomName), userId);
+
+        // Notify the rest of the room about the new participant — used
+        // by the manage drawer to update its list in real time.
+        var creator = await GetTheaterCreatorAsync(roomName);
+        await Clients.OthersInGroup(TheaterGroupFor(roomName)).SendAsync("TheaterParticipantsChanged", new
+        {
+            joinedUserId = userId,
+            joinedUsername = username,
+            at = DateTime.UtcNow,
+        });
 
         // Replay the current state (if any) so a joiner sees whatever
         // mode + URL the host already picked, instead of dropping into
@@ -736,6 +794,8 @@ public class ChatHub : Hub
                         url = state.Url,
                         hostId = (string?)null,
                         hostName = state.HostName,
+                        creatorId = creator.userId,
+                        creatorName = creator.username,
                         at = DateTime.UtcNow,
                         replay = true,
                     });
@@ -743,16 +803,151 @@ public class ChatHub : Hub
             }
             catch
             {
-                // Bad cache entry — drop it so next write can repopulate.
                 await _redis.DeleteKeyAsync(TheaterStateCacheKey(roomName));
             }
+        }
+        else
+        {
+            // Even with no media yet, send the creator info so the
+            // joiner's UI knows who can run the manage controls.
+            await Clients.Caller.SendAsync("TheaterStateChanged", new
+            {
+                mode = TheaterModeCobrowse,
+                url = (string?)null,
+                hostId = (string?)null,
+                hostName = (string?)null,
+                creatorId = creator.userId,
+                creatorName = creator.username,
+                at = DateTime.UtcNow,
+                replay = true,
+            });
         }
     }
 
     public async Task LeaveTheaterRoom(string roomName)
     {
         if (string.IsNullOrWhiteSpace(roomName)) return;
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+        var username = JwtService.GetUsername(Context.User!);
+
         await Groups.RemoveFromGroupAsync(Context.ConnectionId, TheaterGroupFor(roomName));
+        await _redis.DeleteKeyAsync(TheaterConnRoomKey(Context.ConnectionId));
+        await _redis.LeaveRoomPresenceAsync(TheaterPresenceSlug(roomName), userId);
+
+        await Clients.Group(TheaterGroupFor(roomName)).SendAsync("TheaterParticipantsChanged", new
+        {
+            leftUserId = userId,
+            leftUsername = username,
+            at = DateTime.UtcNow,
+        });
+
+        // Auto-cleanup when nobody is left — frees the cache slot.
+        var remaining = await _redis.GetRoomOnlineCountAsync(TheaterPresenceSlug(roomName));
+        if (remaining <= 0)
+        {
+            await CleanupTheaterRoomAsync(roomName);
+        }
+    }
+
+    /// <summary>
+    /// Creator-only "End room". Broadcasts TheaterEnded → every viewer's
+    /// client navigates them out → state cache cleared.
+    /// </summary>
+    public async Task EndTheaterRoom(string roomName, string? reason = null)
+    {
+        if (string.IsNullOrWhiteSpace(roomName)) return;
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+
+        var creator = await GetTheaterCreatorAsync(roomName);
+        if (string.IsNullOrEmpty(creator.userId) || creator.userId != userId)
+        {
+            await Clients.Caller.SendAsync("TheaterError", new { code = "not_creator", message = "Only the room creator can end the room." });
+            return;
+        }
+
+        await Clients.Group(TheaterGroupFor(roomName)).SendAsync("TheaterEnded", new
+        {
+            reason = string.IsNullOrWhiteSpace(reason) ? "creator_ended" : reason,
+            byUsername = JwtService.GetUsername(Context.User!),
+            at = DateTime.UtcNow,
+        });
+
+        await CleanupTheaterRoomAsync(roomName);
+    }
+
+    /// <summary>
+    /// Creator-only kick. Sends KickedFromTheater to the target so their
+    /// client navigates out, and yanks them from the SignalR group so
+    /// they stop receiving state/control events.
+    /// </summary>
+    public async Task KickFromTheater(string roomName, string targetUserId)
+    {
+        if (string.IsNullOrWhiteSpace(roomName) || string.IsNullOrWhiteSpace(targetUserId)) return;
+        var callerId = JwtService.GetUserId(Context.User!).ToString();
+
+        var creator = await GetTheaterCreatorAsync(roomName);
+        if (string.IsNullOrEmpty(creator.userId) || creator.userId != callerId)
+        {
+            await Clients.Caller.SendAsync("TheaterError", new { code = "not_creator", message = "Only the room creator can remove participants." });
+            return;
+        }
+        if (targetUserId == callerId)
+        {
+            await Clients.Caller.SendAsync("TheaterError", new { code = "self_kick", message = "Use End room to leave as creator." });
+            return;
+        }
+
+        // Push the kick — User-group fanout covers them on any active
+        // connection (multiple tabs, etc.).
+        await Clients.User(targetUserId).SendAsync("KickedFromTheater", new
+        {
+            roomName,
+            byUsername = JwtService.GetUsername(Context.User!),
+            at = DateTime.UtcNow,
+        });
+
+        // And tell the room their participant disappeared.
+        await Clients.Group(TheaterGroupFor(roomName)).SendAsync("TheaterParticipantsChanged", new
+        {
+            leftUserId = targetUserId,
+            kicked = true,
+            at = DateTime.UtcNow,
+        });
+        await _redis.LeaveRoomPresenceAsync(TheaterPresenceSlug(roomName), targetUserId);
+    }
+
+    /// <summary>
+    /// Returns the room's authoritative participant list. Used by the
+    /// manage drawer when the creator opens it.
+    /// </summary>
+    public async Task GetTheaterParticipants(string roomName)
+    {
+        if (string.IsNullOrWhiteSpace(roomName)) return;
+        var participantIds = await _redis.GetRoomPresenceMembersAsync(TheaterPresenceSlug(roomName));
+        var creator = await GetTheaterCreatorAsync(roomName);
+        await Clients.Caller.SendAsync("TheaterParticipants", new
+        {
+            roomName,
+            creatorId = creator.userId,
+            creatorName = creator.username,
+            userIds = participantIds,
+            at = DateTime.UtcNow,
+        });
+    }
+
+    private async Task<(string userId, string username)> GetTheaterCreatorAsync(string roomName)
+    {
+        var raw = await _redis.GetStringAsync(TheaterCreatorCacheKey(roomName));
+        if (string.IsNullOrWhiteSpace(raw)) return ("", "");
+        var parts = raw.Split('|', 2);
+        return parts.Length == 2 ? (parts[0], parts[1]) : ("", "");
+    }
+
+    private async Task CleanupTheaterRoomAsync(string roomName)
+    {
+        await _redis.DeleteKeyAsync(TheaterStateCacheKey(roomName));
+        await _redis.DeleteKeyAsync(TheaterCreatorCacheKey(roomName));
+        await _redis.DeleteKeyAsync(TheaterPresenceSlug(roomName));
     }
 
     /// <summary>

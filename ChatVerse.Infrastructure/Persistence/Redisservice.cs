@@ -124,6 +124,17 @@ public class RedisService
     }
 
     /// <summary>
+    /// Returns the full member list of a room's presence set. Used by
+    /// management features (theater kick / participants drawer) that
+    /// need to enumerate users rather than just count them.
+    /// </summary>
+    public async Task<string[]> GetRoomPresenceMembersAsync(string roomSlug)
+    {
+        var members = await _db.SetMembersAsync(PresenceRoomSet(roomSlug));
+        return members.Select(m => m.ToString()).ToArray();
+    }
+
+    /// <summary>
     /// Returns the current online count for every requested room slug
     /// in one round-trip. Used by the rooms list to populate badges.
     /// </summary>
