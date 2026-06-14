@@ -320,6 +320,32 @@ public class NsfwFlag
 //  DM (direct message) entity. Lives in dm_messages collection.
 //  ConversationId is deterministic — see DmService.ConvIdFor.
 // ============================================================
+/// <summary>
+/// Directed block — blocker chose to silence blocked. Standard
+/// Instagram-style semantics: the blocked party gets no explicit
+/// notification, calls/DMs from them silently fail to reach the
+/// blocker. Stored in Mongo because the relationship is many-to-many
+/// and the read pattern is "is X blocked by Y?" which is a trivial
+/// indexed lookup.
+/// </summary>
+public class UserBlock
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    /// <summary>User who initiated the block.</summary>
+    public string BlockerId { get; set; } = default!;
+
+    /// <summary>User being silenced.</summary>
+    public string BlockedId { get; set; } = default!;
+
+    /// <summary>Optional reason — surfaced only to the blocker.</summary>
+    public string? Reason { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+}
+
 public class DmMessage
 {
     [BsonId]

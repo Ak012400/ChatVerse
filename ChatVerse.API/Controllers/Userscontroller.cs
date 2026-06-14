@@ -1,5 +1,6 @@
 using ChatVerse.API.Extensions;
 using ChatVerse.Infrastructure.ExternalServices.Cloudinary;
+using ChatVerse.Infrastructure.Persistence.MongoDB;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -25,6 +26,7 @@ public class UsersController : ControllerBase
     private readonly ChatVerseDbContext _db;
     private readonly PostgresProcService _postgres;
     private readonly CloudinaryService _cloudinary;
+    private readonly MongoService _mongo;
     private readonly ILogger<UsersController> _logger;
 
     private const int DefaultLimit = 10;
@@ -34,11 +36,13 @@ public class UsersController : ControllerBase
         ChatVerseDbContext db,
         PostgresProcService postgres,
         CloudinaryService cloudinary,
+        MongoService mongo,
         ILogger<UsersController> logger)
     {
         _db = db;
         _postgres = postgres;
         _cloudinary = cloudinary;
+        _mongo = mongo;
         _logger = logger;
     }
 
@@ -197,6 +201,101 @@ public class UsersController : ControllerBase
             avatarUrl = upload.SecureUrl,
         }, "Avatar updated"));
     }
+
+    // ============================================================
+    //  BLOCK SYSTEM — Standard (Instagram-style)
+    //
+    //  Blocks are directed (A blocks B ≠ B blocks A). The blocked
+    //  user receives NO explicit notification — their attempts to
+    //  call/DM the blocker silently fail server-side, mirroring
+    //  mainstream platform behaviour. The blocker sees their full
+    //  list in Settings; the blocked party only sees an aggregated
+    //  "you appear in N blocklists" count, never names.
+    // ============================================================
+
+    /// <summary>POST /api/users/{userId}/block — block another user.</summary>
+    [HttpPost("{userId}/block")]
+    public async Task<IActionResult> BlockUser(string userId, [FromBody] BlockUserRequest? req)
+    {
+        var meId = JwtService.GetUserId(User).ToString();
+        if (meId == userId)
+            return BadRequest(ApiResponse.Fail("Cannot block yourself"));
+        if (!Guid.TryParse(userId, out _))
+            return BadRequest(ApiResponse.Fail("Invalid user id"));
+
+        await _mongo.BlockUserAsync(meId, userId, req?.Reason);
+        _logger.LogInformation("User {Me} blocked {Other}", meId, userId);
+        return Ok(ApiResponse.Ok("Blocked"));
+    }
+
+    /// <summary>DELETE /api/users/{userId}/block — undo a block.</summary>
+    [HttpDelete("{userId}/block")]
+    public async Task<IActionResult> UnblockUser(string userId)
+    {
+        var meId = JwtService.GetUserId(User).ToString();
+        var removed = await _mongo.UnblockUserAsync(meId, userId);
+        if (!removed) return NotFound(ApiResponse.Fail("Not blocked"));
+        _logger.LogInformation("User {Me} unblocked {Other}", meId, userId);
+        return Ok(ApiResponse.Ok("Unblocked"));
+    }
+
+    /// <summary>
+    /// GET /api/users/me/blocks — the caller's outgoing block list.
+    /// Returns blocked user IDs + usernames + reason + when.
+    /// </summary>
+    [HttpGet("me/blocks")]
+    public async Task<IActionResult> GetMyBlocks()
+    {
+        var meId = JwtService.GetUserId(User).ToString();
+        var blocks = await _mongo.GetBlocksByMeAsync(meId);
+        if (blocks.Count == 0) return Ok(ApiResponse<object>.Ok(Array.Empty<object>()));
+
+        // Hydrate usernames + avatars in one Postgres round-trip.
+        var ids = blocks.Select(b => Guid.Parse(b.BlockedId)).ToArray();
+        var conn = await GetConnectionAsync();
+        await using var cmd = new NpgsqlCommand(
+            "SELECT id, username, avatar_url FROM user_auth.users WHERE id = ANY(@ids)", conn);
+        cmd.Parameters.AddWithValue("ids", ids);
+        var profiles = new Dictionary<string, (string Username, string? AvatarUrl)>();
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            var id = reader.GetGuid(0).ToString();
+            profiles[id] = (reader.GetString(1), reader.IsDBNull(2) ? null : reader.GetString(2));
+        }
+
+        var result = blocks.Select(b => new
+        {
+            userId = b.BlockedId,
+            username = profiles.TryGetValue(b.BlockedId, out var p) ? p.Username : "(deleted)",
+            avatarUrl = profiles.TryGetValue(b.BlockedId, out var p2) ? p2.AvatarUrl : null,
+            reason = b.Reason,
+            blockedAt = b.CreatedAt,
+        });
+        return Ok(ApiResponse<object>.Ok(result));
+    }
+
+    /// <summary>
+    /// GET /api/users/me/blocked-by-count — aggregated count of how many
+    /// users have blocked the caller. NEVER returns names, by design.
+    /// </summary>
+    [HttpGet("me/blocked-by-count")]
+    public async Task<IActionResult> GetBlockedByCount()
+    {
+        var meId = JwtService.GetUserId(User).ToString();
+        var count = await _mongo.GetBlockedMeCountAsync(meId);
+        return Ok(ApiResponse<object>.Ok(new { count }));
+    }
+
+    // ── Postgres helper (lives in this controller — same pattern as
+    //    other controllers that need raw SQL alongside the proc service). ──
+    private async Task<NpgsqlConnection> GetConnectionAsync()
+    {
+        var conn = (NpgsqlConnection)_db.Database.GetDbConnection();
+        if (conn.State != ConnectionState.Open) await conn.OpenAsync();
+        return conn;
+    }
 }
 
 public record UpdateMeRequest(string? Username);
+public record BlockUserRequest(string? Reason);

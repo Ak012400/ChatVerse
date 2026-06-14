@@ -641,6 +641,35 @@ public class ChatHub : Hub
             return;
         }
 
+        // Block check: if the target has blocked the caller, we don't
+        // ring them — only fire a silent "CallAttempt" notification so
+        // the target knows someone they blocked tried to reach them.
+        // The caller is told "CallInviteSent" anyway (mirroring Instagram-
+        // style opaque-block UX — they shouldn't be able to confirm
+        // they were blocked).
+        var isBlocked = await _mongo.IsBlockedAsync(targetUserId, callerId);
+        if (isBlocked)
+        {
+            await Clients.User(targetUserId).SendAsync("BlockedCallAttempt", new
+            {
+                callerId,
+                callerName,
+                attemptedAt = DateTime.UtcNow,
+                message,
+            });
+            // Lie to the caller — same "sent" envelope, but no inviteId
+            // that the server would honor on Accept. Their UI shows a
+            // ringing state until 60s expires.
+            var fakeInviteId = Guid.NewGuid().ToString("N")[..12];
+            await Clients.Caller.SendAsync("CallInviteSent", new
+            {
+                inviteId = fakeInviteId,
+                targetUserId,
+                roomName = $"dc-{fakeInviteId}",
+            });
+            return;
+        }
+
         // Per-invite handle so accept/decline reference the same call.
         var inviteId = Guid.NewGuid().ToString("N")[..12];
         var roomName = $"dc-{inviteId}";
