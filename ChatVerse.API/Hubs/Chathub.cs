@@ -687,6 +687,176 @@ public class ChatHub : Hub
     }
 
     // ============================================================
+    //  THEATER URL SYNC
+    //
+    //  Replaces the old screen-share theater. The host picks a URL
+    //  (YouTube, Vimeo, Twitch, direct video, or any iframe-friendly
+    //  source) and we broadcast it to everyone else in the same
+    //  theater room. Each viewer loads the URL in their OWN iframe —
+    //  no pixel streaming, no server-side browser, just URL fanout.
+    //
+    //  Late-joiner support: we also stash the latest URL in Redis
+    //  keyed by `theater:url:{roomName}` (15 min TTL) so anyone who
+    //  joins after the host already picked a video gets it on join.
+    //
+    //  Trust model: the theater room is private and invite-only. Per
+    //  product spec, no moderation runs here — the host who picked
+    //  the URL is responsible for whatever appears in the iframe.
+    //  We DO keep the disclaimer banner on the client so users know.
+    // ============================================================
+
+    private static string TheaterGroupFor(string roomName) => $"theater:{roomName}";
+    private static string TheaterStateCacheKey(string roomName) => $"theater:state:{roomName}";
+
+    // Mode names the client + server agree on.
+    //   "cobrowse"    → URL-sync iframe path (YouTube / direct video etc.)
+    //   "screenshare" → LiveKit screen-share path (Netflix-style sites)
+    private const string TheaterModeCobrowse = "cobrowse";
+    private const string TheaterModeScreenShare = "screenshare";
+
+    public async Task JoinTheaterRoom(string roomName)
+    {
+        if (string.IsNullOrWhiteSpace(roomName)) return;
+        await Groups.AddToGroupAsync(Context.ConnectionId, TheaterGroupFor(roomName));
+
+        // Replay the current state (if any) so a joiner sees whatever
+        // mode + URL the host already picked, instead of dropping into
+        // a blank room.
+        var json = await _redis.GetStringAsync(TheaterStateCacheKey(roomName));
+        if (!string.IsNullOrWhiteSpace(json))
+        {
+            try
+            {
+                var state = JsonSerializer.Deserialize<TheaterStateDto>(json);
+                if (state != null)
+                {
+                    await Clients.Caller.SendAsync("TheaterStateChanged", new
+                    {
+                        mode = state.Mode,
+                        url = state.Url,
+                        hostId = (string?)null,
+                        hostName = state.HostName,
+                        at = DateTime.UtcNow,
+                        replay = true,
+                    });
+                }
+            }
+            catch
+            {
+                // Bad cache entry — drop it so next write can repopulate.
+                await _redis.DeleteKeyAsync(TheaterStateCacheKey(roomName));
+            }
+        }
+    }
+
+    public async Task LeaveTheaterRoom(string roomName)
+    {
+        if (string.IsNullOrWhiteSpace(roomName)) return;
+        await Groups.RemoveFromGroupAsync(Context.ConnectionId, TheaterGroupFor(roomName));
+    }
+
+    /// <summary>
+    /// Single broadcast for both mode and URL — keeps the wire model
+    /// simple and means viewers can never observe an inconsistent state
+    /// (mode says iframe but url is null, etc.). For screen-share mode
+    /// the url is ignored (LiveKit carries the video itself).
+    /// </summary>
+    public async Task BroadcastTheaterState(string roomName, string mode, string? url)
+    {
+        if (string.IsNullOrWhiteSpace(roomName)) return;
+
+        var normalisedMode = (mode ?? "").Trim().ToLowerInvariant();
+        if (normalisedMode != TheaterModeCobrowse && normalisedMode != TheaterModeScreenShare) return;
+
+        // URL only matters in co-browse mode; trim it down in screen-share.
+        string? normalisedUrl = null;
+        if (normalisedMode == TheaterModeCobrowse && !string.IsNullOrWhiteSpace(url))
+        {
+            if (url.Length > 2048) return;
+            if (!url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+                !url.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return;
+            normalisedUrl = url;
+        }
+
+        var hostId = JwtService.GetUserId(Context.User!).ToString();
+        var hostName = JwtService.GetUsername(Context.User!);
+
+        // Persist for late joiners — 15 minutes covers a typical movie
+        // before the host updates it.
+        var stateJson = JsonSerializer.Serialize(new TheaterStateDto
+        {
+            Mode = normalisedMode,
+            Url = normalisedUrl,
+            HostName = hostName,
+        });
+        await _redis.SetStringAsync(TheaterStateCacheKey(roomName), stateJson, TimeSpan.FromMinutes(15));
+
+        await Clients.Group(TheaterGroupFor(roomName))
+            .SendAsync("TheaterStateChanged", new
+            {
+                mode = normalisedMode,
+                url = normalisedUrl,
+                hostId,
+                hostName,
+                at = DateTime.UtcNow,
+                replay = false,
+            });
+    }
+
+    /// <summary>
+    /// Compact DTO for the Redis-cached theater state. Kept private to
+    /// the hub — no consumer outside this file deserialises this shape.
+    /// </summary>
+    private sealed class TheaterStateDto
+    {
+        [JsonPropertyName("mode")] public string Mode { get; set; } = TheaterModeCobrowse;
+        [JsonPropertyName("url")]  public string? Url { get; set; }
+        [JsonPropertyName("hostName")] public string? HostName { get; set; }
+    }
+
+    /// <summary>
+    /// Fan out play / pause / seek / drift-sync events for the YouTube
+    /// IFrame Player in the co-browse iframe. The control messages are
+    /// tiny (~80 bytes each) so even at "send on every interaction"
+    /// frequency the wire cost is negligible vs the LiveKit audio.
+    ///
+    /// Allowed actions:
+    ///   "play"   — viewer pressed play           (position = current time)
+    ///   "pause"  — viewer paused                  (position = current time)
+    ///   "seek"   — viewer scrubbed to a new time  (position = new time)
+    ///   "sync"   — periodic drift heartbeat       (position = current time)
+    ///
+    /// We DO NOT bounce the message back to the sender (GroupExcept),
+    /// otherwise their own player would seek itself in a feedback loop.
+    /// </summary>
+    public async Task BroadcastTheaterControl(string roomName, string action, double position)
+    {
+        if (string.IsNullOrWhiteSpace(roomName) || string.IsNullOrWhiteSpace(action)) return;
+
+        var act = action.Trim().ToLowerInvariant();
+        if (act != "play" && act != "pause" && act != "seek" && act != "sync") return;
+
+        // Clamp absurd positions — Web Speech / YT API sometimes return
+        // NaN or huge values during state transitions.
+        if (double.IsNaN(position) || double.IsInfinity(position)) return;
+        if (position < 0) position = 0;
+        if (position > 360_000) position = 360_000; // 100h ceiling
+
+        var senderId = JwtService.GetUserId(Context.User!).ToString();
+        var senderName = JwtService.GetUsername(Context.User!);
+
+        await Clients.GroupExcept(TheaterGroupFor(roomName), Context.ConnectionId)
+            .SendAsync("TheaterControlChanged", new
+            {
+                action = act,
+                position,
+                senderId,
+                senderName,
+                at = DateTime.UtcNow,
+            });
+    }
+
+    // ============================================================
     //  DIRECT INVITE CALLING
     //  - Caller invokes InviteToCall(targetUserId, message)
     //  - Target receives "IncomingCall" event with a per-invite id
