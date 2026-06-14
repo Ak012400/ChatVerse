@@ -814,6 +814,48 @@ public class ChatHub : Hub
         [JsonPropertyName("hostName")] public string? HostName { get; set; }
     }
 
+    /// <summary>
+    /// Fan out play / pause / seek / drift-sync events for the YouTube
+    /// IFrame Player in the co-browse iframe. The control messages are
+    /// tiny (~80 bytes each) so even at "send on every interaction"
+    /// frequency the wire cost is negligible vs the LiveKit audio.
+    ///
+    /// Allowed actions:
+    ///   "play"   — viewer pressed play           (position = current time)
+    ///   "pause"  — viewer paused                  (position = current time)
+    ///   "seek"   — viewer scrubbed to a new time  (position = new time)
+    ///   "sync"   — periodic drift heartbeat       (position = current time)
+    ///
+    /// We DO NOT bounce the message back to the sender (GroupExcept),
+    /// otherwise their own player would seek itself in a feedback loop.
+    /// </summary>
+    public async Task BroadcastTheaterControl(string roomName, string action, double position)
+    {
+        if (string.IsNullOrWhiteSpace(roomName) || string.IsNullOrWhiteSpace(action)) return;
+
+        var act = action.Trim().ToLowerInvariant();
+        if (act != "play" && act != "pause" && act != "seek" && act != "sync") return;
+
+        // Clamp absurd positions — Web Speech / YT API sometimes return
+        // NaN or huge values during state transitions.
+        if (double.IsNaN(position) || double.IsInfinity(position)) return;
+        if (position < 0) position = 0;
+        if (position > 360_000) position = 360_000; // 100h ceiling
+
+        var senderId = JwtService.GetUserId(Context.User!).ToString();
+        var senderName = JwtService.GetUsername(Context.User!);
+
+        await Clients.GroupExcept(TheaterGroupFor(roomName), Context.ConnectionId)
+            .SendAsync("TheaterControlChanged", new
+            {
+                action = act,
+                position,
+                senderId,
+                senderName,
+                at = DateTime.UtcNow,
+            });
+    }
+
     // ============================================================
     //  DIRECT INVITE CALLING
     //  - Caller invokes InviteToCall(targetUserId, message)
