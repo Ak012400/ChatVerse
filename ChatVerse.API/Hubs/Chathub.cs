@@ -687,6 +687,87 @@ public class ChatHub : Hub
     }
 
     // ============================================================
+    //  THEATER URL SYNC
+    //
+    //  Replaces the old screen-share theater. The host picks a URL
+    //  (YouTube, Vimeo, Twitch, direct video, or any iframe-friendly
+    //  source) and we broadcast it to everyone else in the same
+    //  theater room. Each viewer loads the URL in their OWN iframe —
+    //  no pixel streaming, no server-side browser, just URL fanout.
+    //
+    //  Late-joiner support: we also stash the latest URL in Redis
+    //  keyed by `theater:url:{roomName}` (15 min TTL) so anyone who
+    //  joins after the host already picked a video gets it on join.
+    //
+    //  Trust model: the theater room is private and invite-only. Per
+    //  product spec, no moderation runs here — the host who picked
+    //  the URL is responsible for whatever appears in the iframe.
+    //  We DO keep the disclaimer banner on the client so users know.
+    // ============================================================
+
+    private static string TheaterGroupFor(string roomName) => $"theater:{roomName}";
+    private static string TheaterUrlCacheKey(string roomName) => $"theater:url:{roomName}";
+
+    public async Task JoinTheaterRoom(string roomName)
+    {
+        if (string.IsNullOrWhiteSpace(roomName)) return;
+        await Groups.AddToGroupAsync(Context.ConnectionId, TheaterGroupFor(roomName));
+
+        // Replay the current URL (if any) so the joiner doesn't sit on
+        // a blank iframe waiting for the host to pick a new one.
+        var lastUrl = await _redis.GetStringAsync(TheaterUrlCacheKey(roomName));
+        if (!string.IsNullOrWhiteSpace(lastUrl))
+        {
+            await Clients.Caller.SendAsync("TheaterUrlChanged", new
+            {
+                url = lastUrl,
+                at = DateTime.UtcNow,
+                hostId = (string?)null,
+                hostName = (string?)null,
+                replay = true,
+            });
+        }
+    }
+
+    public async Task LeaveTheaterRoom(string roomName)
+    {
+        if (string.IsNullOrWhiteSpace(roomName)) return;
+        await Groups.RemoveFromGroupAsync(Context.ConnectionId, TheaterGroupFor(roomName));
+    }
+
+    /// <summary>
+    /// Host (or anyone in the room — first-come-first-serve, just like
+    /// LiveKit screen-share before) updates the shared iframe URL.
+    /// We cache it briefly in Redis so late joiners pick it up too.
+    /// </summary>
+    public async Task BroadcastTheaterUrl(string roomName, string url)
+    {
+        if (string.IsNullOrWhiteSpace(roomName) || string.IsNullOrWhiteSpace(url)) return;
+        // Defensive bounds — anything past 2KB is not a real URL.
+        if (url.Length > 2048) return;
+        // Must be http(s) — javascript:, data:, file: are off-limits.
+        if (!url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+            !url.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return;
+
+        var hostId = JwtService.GetUserId(Context.User!).ToString();
+        var hostName = JwtService.GetUsername(Context.User!);
+
+        // Persist for late joiners — 15 minutes is enough for the
+        // duration of an average movie session before the host renews.
+        await _redis.SetStringAsync(TheaterUrlCacheKey(roomName), url, TimeSpan.FromMinutes(15));
+
+        await Clients.Group(TheaterGroupFor(roomName))
+            .SendAsync("TheaterUrlChanged", new
+            {
+                url,
+                hostId,
+                hostName,
+                at = DateTime.UtcNow,
+                replay = false,
+            });
+    }
+
+    // ============================================================
     //  DIRECT INVITE CALLING
     //  - Caller invokes InviteToCall(targetUserId, message)
     //  - Target receives "IncomingCall" event with a per-invite id
