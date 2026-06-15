@@ -22,6 +22,9 @@ public partial class MongoService
     private IMongoCollection<DmMessage> DmMessages => _db.GetCollection<DmMessage>(MongoCollections.DmMessages);
     private IMongoCollection<UserBlock> UserBlocks => _db.GetCollection<UserBlock>(MongoCollections.UserBlocks);
 
+    // Phase 2 — sticky features
+    private IMongoCollection<TimeCapsule> TimeCapsules => _db.GetCollection<TimeCapsule>(MongoCollections.TimeCapsules);
+
     public MongoService(IMongoClient client, string databaseName)
     {
         // Register camelCase convention — matches MongoDB field names (isActive, displayName etc)
@@ -684,6 +687,130 @@ public partial class MongoService
     public async Task<long> GetBlockedMeCountAsync(string myUserId)
     {
         return await UserBlocks.CountDocumentsAsync(b => b.BlockedId == myUserId);
+    }
+
+    // ============================================================
+    //  TIME CAPSULES — Phase 2 sticky feature.
+    //
+    //  Author writes today, system delivers 7/14/30 days later to a
+    //  random recipient. See TimeCapsule entity for the data model.
+    //  All methods here are intentionally small + focused so the
+    //  TimeCapsuleHub + TimeCapsuleDeliveryService can compose them.
+    // ============================================================
+
+    /// <summary>Insert a fresh capsule. Returns the doc with Id set.</summary>
+    public async Task<TimeCapsule> InsertTimeCapsuleAsync(TimeCapsule capsule)
+    {
+        await TimeCapsules.InsertOneAsync(capsule);
+        return capsule;
+    }
+
+    /// <summary>List capsules the user AUTHORED (their "sent" view).</summary>
+    public async Task<List<TimeCapsule>> GetCapsulesByAuthorAsync(string authorUserId, int limit = 50)
+    {
+        return await TimeCapsules
+            .Find(c => c.AuthorUserId == authorUserId)
+            .SortByDescending(c => c.CreatedAt)
+            .Limit(limit)
+            .ToListAsync();
+    }
+
+    /// <summary>List capsules DELIVERED to the user (their "inbox").</summary>
+    public async Task<List<TimeCapsule>> GetCapsulesForRecipientAsync(string recipientUserId, int limit = 50)
+    {
+        var filter = Builders<TimeCapsule>.Filter.And(
+            Builders<TimeCapsule>.Filter.Eq(c => c.RecipientUserId, recipientUserId),
+            Builders<TimeCapsule>.Filter.Ne(c => c.DeliveredAt, null)
+        );
+        return await TimeCapsules
+            .Find(filter)
+            .SortByDescending(c => c.DeliveredAt)
+            .Limit(limit)
+            .ToListAsync();
+    }
+
+    /// <summary>Fetch a single capsule by id (caller must check authorisation).</summary>
+    public async Task<TimeCapsule?> GetCapsuleByIdAsync(string id)
+    {
+        return await TimeCapsules.Find(c => c.Id == id).FirstOrDefaultAsync();
+    }
+
+    /// <summary>Capsules whose ScheduledFor has passed but DeliveredAt is null —
+    /// these are the queue for the delivery background service.</summary>
+    public async Task<List<TimeCapsule>> GetCapsulesDueForDeliveryAsync(int batchLimit = 100)
+    {
+        var filter = Builders<TimeCapsule>.Filter.And(
+            Builders<TimeCapsule>.Filter.Lte(c => c.ScheduledFor, DateTime.UtcNow),
+            Builders<TimeCapsule>.Filter.Eq(c => c.DeliveredAt, (DateTime?)null)
+        );
+        return await TimeCapsules
+            .Find(filter)
+            .SortBy(c => c.ScheduledFor)
+            .Limit(batchLimit)
+            .ToListAsync();
+    }
+
+    /// <summary>Mark a capsule as delivered to the given recipient.
+    /// Atomic — uses FindOneAndUpdate to claim the row, so two delivery
+    /// workers racing on the same batch can't double-deliver.</summary>
+    public async Task<bool> MarkCapsuleDeliveredAsync(string capsuleId, string recipientUserId, string recipientUsername)
+    {
+        var filter = Builders<TimeCapsule>.Filter.And(
+            Builders<TimeCapsule>.Filter.Eq(c => c.Id, capsuleId),
+            Builders<TimeCapsule>.Filter.Eq(c => c.DeliveredAt, (DateTime?)null)  // claim only if still undelivered
+        );
+        var update = Builders<TimeCapsule>.Update
+            .Set(c => c.DeliveredAt, DateTime.UtcNow)
+            .Set(c => c.RecipientUserId, recipientUserId)
+            .Set(c => c.RecipientUsername, recipientUsername);
+        var result = await TimeCapsules.UpdateOneAsync(filter, update);
+        return result.ModifiedCount == 1;
+    }
+
+    /// <summary>Recipient replies (single-shot). Schedules the reply for
+    /// delivery to author 3 days later. Returns true if recorded; false
+    /// if already replied or capsule doesn't belong to recipient.</summary>
+    public async Task<bool> SetCapsuleReplyAsync(string capsuleId, string recipientUserId, string replyContent)
+    {
+        var now = DateTime.UtcNow;
+        var filter = Builders<TimeCapsule>.Filter.And(
+            Builders<TimeCapsule>.Filter.Eq(c => c.Id, capsuleId),
+            Builders<TimeCapsule>.Filter.Eq(c => c.RecipientUserId, recipientUserId),
+            Builders<TimeCapsule>.Filter.Eq(c => c.RepliedAt, (DateTime?)null)
+        );
+        var update = Builders<TimeCapsule>.Update
+            .Set(c => c.ReplyContent, replyContent)
+            .Set(c => c.RepliedAt, now)
+            .Set(c => c.ScheduledReplyDeliveryAt, now.AddDays(3));
+        var result = await TimeCapsules.UpdateOneAsync(filter, update);
+        return result.ModifiedCount == 1;
+    }
+
+    /// <summary>Replies whose ScheduledReplyDeliveryAt has passed but
+    /// ReplyDeliveredAt is null — back-channel deliveries to authors.</summary>
+    public async Task<List<TimeCapsule>> GetRepliesDueForDeliveryAsync(int batchLimit = 100)
+    {
+        var filter = Builders<TimeCapsule>.Filter.And(
+            Builders<TimeCapsule>.Filter.Ne(c => c.ScheduledReplyDeliveryAt, null),
+            Builders<TimeCapsule>.Filter.Lte(c => c.ScheduledReplyDeliveryAt, DateTime.UtcNow),
+            Builders<TimeCapsule>.Filter.Eq(c => c.ReplyDeliveredAt, (DateTime?)null)
+        );
+        return await TimeCapsules
+            .Find(filter)
+            .Limit(batchLimit)
+            .ToListAsync();
+    }
+
+    public async Task<bool> MarkReplyDeliveredAsync(string capsuleId)
+    {
+        var filter = Builders<TimeCapsule>.Filter.And(
+            Builders<TimeCapsule>.Filter.Eq(c => c.Id, capsuleId),
+            Builders<TimeCapsule>.Filter.Eq(c => c.ReplyDeliveredAt, (DateTime?)null)
+        );
+        var update = Builders<TimeCapsule>.Update
+            .Set(c => c.ReplyDeliveredAt, DateTime.UtcNow);
+        var result = await TimeCapsules.UpdateOneAsync(filter, update);
+        return result.ModifiedCount == 1;
     }
 }
 

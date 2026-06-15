@@ -175,6 +175,10 @@ public static class MongoCollections
     public const string DmMessages = "dm_messages";
     /// <summary>Directed user-block relationships. (blocker, blocked) pair.</summary>
     public const string UserBlocks = "user_blocks";
+
+    // ── Phase 2 (locked-roadmap features) ──────────────────────
+    /// <summary>Time Capsule — delayed-delivery messages to random recipients.</summary>
+    public const string TimeCapsules = "time_capsules";
 }
 
 public static class Theater
