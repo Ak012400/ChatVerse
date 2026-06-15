@@ -269,6 +269,11 @@ try
     // Ai:EnablePresence=true AND a Groq key is set, so safe to register.
     builder.Services.AddHostedService<AiPersonaService>();
 
+    // Maintenance webjob: every 6h, deletes stale guests + old chats +
+    // ended video sessions so the free-tier Postgres + Mongo don't
+    // fill up. See MaintenanceService for retention windows.
+    builder.Services.AddHostedService<ChatVerse.API.Services.MaintenanceService>();
+
     var app = builder.Build();
 
     // ── Middleware pipeline ───────────────────────────────────────
