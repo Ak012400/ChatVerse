@@ -120,6 +120,74 @@ public partial class MongoService
         await Messages.UpdateOneAsync(filter, update);
     }
 
+    // ============================================================
+    //  Maintenance: bulk-delete by age
+    //  Called by MaintenanceService (background webjob) to keep
+    //  Mongo storage from ballooning on the M0 free tier (512MB cap).
+    //  Hard delete — soft-deleted rows still cost storage, and a 30-day
+    //  cutoff is well past any reasonable "I want to read my old chats"
+    //  user expectation in an anonymous-friendly app.
+    // ============================================================
+
+    public async Task<long> DeleteMessagesOlderThanAsync(TimeSpan age)
+    {
+        var cutoff = DateTime.UtcNow - age;
+        var filter = Builders<Message>.Filter.Lt(m => m.CreatedAt, cutoff);
+        var res = await Messages.DeleteManyAsync(filter);
+        return res.DeletedCount;
+    }
+
+    public async Task<long> DeleteDmsOlderThanAsync(TimeSpan age)
+    {
+        var cutoff = DateTime.UtcNow - age;
+        var filter = Builders<DmMessage>.Filter.Lt(m => m.CreatedAt, cutoff);
+        var res = await DmMessages.DeleteManyAsync(filter);
+        return res.DeletedCount;
+    }
+
+    public async Task<long> DeleteEndedVideoSessionsOlderThanAsync(TimeSpan age)
+    {
+        var cutoff = DateTime.UtcNow - age;
+        // Only delete sessions that have ALREADY ended; in-flight ones
+        // (EndedAt == null) are still relevant for moderation review.
+        var filter = Builders<VideoSession>.Filter.And(
+            Builders<VideoSession>.Filter.Lt(s => s.EndedAt, cutoff),
+            Builders<VideoSession>.Filter.Ne(s => s.EndedAt, null));
+        var res = await VideoSessions.DeleteManyAsync(filter);
+        return res.DeletedCount;
+    }
+
+    /// <summary>
+    /// Delete every message + DM authored by the given user IDs. Used
+    /// by the maintenance webjob after Postgres has wiped guest accounts
+    /// — keeps Mongo orphan-free.
+    ///
+    /// IMPORTANT: filters by `SenderId` (the author's userId), NOT
+    /// `Id` (which is the message's own ObjectId). The original code
+    /// here mistakenly used `m.UserId` — that property doesn't exist
+    /// on Message; the author field is `SenderId`. Filtering by `Id`
+    /// against a user-guid list would never match, making the cleanup
+    /// silently a no-op.
+    /// </summary>
+    public async Task<long> DeleteMessagesByUserIdsAsync(IEnumerable<string> userIds)
+    {
+        var ids = userIds.ToList();
+        if (ids.Count == 0) return 0;
+
+        // Room messages
+        var msgFilter = Builders<Message>.Filter.In(m => m.SenderId, ids);
+        var msgRes = await Messages.DeleteManyAsync(msgFilter);
+
+        // DMs authored OR received by the wiped user — receivers might
+        // be live accounts but the conversation is half-dead anyway.
+        // We only sweep messages whose SENDER got wiped; RecipientId
+        // sweep would risk taking out live users' message history.
+        var dmFilter = Builders<DmMessage>.Filter.In(m => m.SenderId, ids);
+        var dmRes = await DmMessages.DeleteManyAsync(dmFilter);
+
+        return msgRes.DeletedCount + dmRes.DeletedCount;
+    }
+
     /// <summary>
     /// Toggle a user's reaction on a message. Returns the resulting
     /// reactions map so the hub can broadcast the authoritative state

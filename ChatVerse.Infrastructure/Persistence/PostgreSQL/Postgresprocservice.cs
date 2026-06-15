@@ -28,6 +28,60 @@ public class PostgresProcService
     }
 
     // ============================================================
+    //  MAINTENANCE PROCS
+    //  Called by MaintenanceService (background webjob) to prune
+    //  stale data so the free-tier Postgres instance doesn't fill
+    //  up. The proc itself lives in user_auth and cascades guest
+    //  user deletes to all dependent rows (iam.*, age_declarations,
+    //  ai_maturity_sessions etc.) inside a single transaction.
+    //
+    //  Returns the userIds that were deleted so the caller can
+    //  follow up with Mongo cleanup for their messages.
+    // ============================================================
+
+    public async Task<List<Guid>> CleanupOldGuestUsersAsync(TimeSpan olderThan)
+    {
+        // The cleanup is a FUNCTION (not a procedure) so it can RETURNS
+        // TABLE — much easier to read deleted IDs straight off the
+        // result set than the temp-table dance a Postgres PROCEDURE
+        // would force. See sql/usp_cleanup_old_guests.sql.
+        //
+        // We use NAMED-ARG syntax (`p_older_than_hours => @hours`) so
+        // the call survives if someone later adds a new parameter to
+        // the function with a default — Postgres won't get confused
+        // about which positional slot we mean.
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(
+            "SELECT deleted_user_id FROM user_auth.usp_cleanup_old_guests(p_older_than_hours => @hours)",
+            conn);
+        cmd.Parameters.AddWithValue("hours", (int)olderThan.TotalHours);
+
+        var deletedIds = new List<Guid>();
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            deletedIds.Add(reader.GetGuid(0));
+        }
+        return deletedIds;
+    }
+
+    /// <summary>
+    /// Generic single-int return proc helper. Used for "give me a
+    /// count" maintenance calls that don't need their own typed wrapper.
+    /// </summary>
+    public async Task<int> ExecuteScalarProcAsync(string procName, params (string name, object value)[] parameters)
+    {
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(procName, conn);
+        cmd.CommandType = CommandType.StoredProcedure;
+        foreach (var (n, v) in parameters) cmd.Parameters.AddWithValue(n, v ?? DBNull.Value);
+        cmd.Parameters.Add(new NpgsqlParameter("p_count", NpgsqlDbType.Integer) { Direction = ParameterDirection.Output });
+        await cmd.ExecuteNonQueryAsync();
+        var val = cmd.Parameters["p_count"].Value;
+        return val == DBNull.Value ? 0 : Convert.ToInt32(val);
+    }
+
+    // ============================================================
     //  AUTH PROCS
     // ============================================================
 
