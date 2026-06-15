@@ -44,7 +44,7 @@ public class PostgresProcService
     /// in the last 30 days. Used by TimeCapsuleDeliveryService to pick
     /// recipients. Returns just (id, username) — minimal payload.
     /// </summary>
-    public async Task<List<ChatVerse.API.Services.RandomUserPick>> GetRandomActiveUserSampleAsync(int sampleSize)
+    public async Task<List<RandomUserPick>> GetRandomActiveUserSampleAsync(int sampleSize)
     {
         var conn = await GetOpenConnectionAsync();
         await using var cmd = new NpgsqlCommand(@"
@@ -57,11 +57,11 @@ public class PostgresProcService
         ", conn);
         cmd.Parameters.AddWithValue("sample", sampleSize);
 
-        var results = new List<ChatVerse.API.Services.RandomUserPick>();
+        var results = new List<RandomUserPick>();
         await using var reader = await cmd.ExecuteReaderAsync();
         while (await reader.ReadAsync())
         {
-            results.Add(new ChatVerse.API.Services.RandomUserPick(
+            results.Add(new RandomUserPick(
                 reader.GetGuid(0),
                 reader.GetString(1)));
         }

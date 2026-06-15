@@ -1,6 +1,6 @@
 using ChatVerse.API.Hubs;
 using ChatVerse.Domain.Entities;
-using ChatVerse.Infrastructure.Persistence;
+using ChatVerse.Infrastructure.Persistence.MongoDB;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
 using Microsoft.AspNetCore.SignalR;
 

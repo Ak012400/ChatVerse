@@ -1,6 +1,7 @@
+using ChatVerse.API.Extensions;
 using ChatVerse.API.Services;
 using ChatVerse.Domain.Entities;
-using ChatVerse.Infrastructure.Persistence;
+using ChatVerse.Infrastructure.Persistence.MongoDB;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
 
