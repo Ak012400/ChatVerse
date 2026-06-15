@@ -387,3 +387,25 @@ chatverse-client/.env.*.local
 # OS junk
 .DS_Store
 Thumbs.db
+
+# ──────────────────────────────────────────────────────────────
+# ChatVerse — local-only documentation + DB setup files
+#
+# These contain design decisions, schema details, and DB setup
+# scripts that Arun keeps OUT of the public/shared git repo.
+# Kept on local machine only.
+#
+# If you ever need to share/back them up: copy to a private gist
+# or encrypted cloud folder, NOT this repo.
+# ──────────────────────────────────────────────────────────────
+
+# All markdown docs (VISION/TECH/PROGRESS/CONTEXT_SNAPSHOT/README etc.)
+*.md
+
+# MongoDB setup + playground scripts
+mongo/
+*.mongodb.js
+
+# All SQL files (schemas, procs, migrations, seeds)
+*.sql
+sql/
