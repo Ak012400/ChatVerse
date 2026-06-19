@@ -677,3 +677,16 @@ internal static class StringExtensions
             i > 0 && char.IsUpper(c) ? "_" + c : c.ToString()
         )).ToLower();
 }
+
+/// <summary>
+/// Lightweight (id, username) tuple returned by
+/// <see cref="PostgresProcService.GetRandomActiveUserSampleAsync"/>.
+///
+/// Lives in the Infrastructure namespace (NOT API) because the proc
+/// service that produces it lives here, and Infrastructure cannot
+/// reference API (would be a circular dependency). Consumers in the
+/// API project (TimeCapsuleDeliveryService, future delivery services)
+/// just `using ChatVerse.Infrastructure.Persistence.PostgreSQL;` to
+/// pull it in — they already do for PostgresProcService anyway.
+/// </summary>
+public sealed record RandomUserPick(Guid UserId, string Username);

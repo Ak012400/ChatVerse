@@ -1,7 +1,7 @@
 using ChatVerse.API.Hubs;
 using ChatVerse.Domain.Entities;
 using ChatVerse.Infrastructure.Persistence.MongoDB;
-using ChatVerse.Infrastructure.Persistence.PostgreSQL;
+using ChatVerse.Infrastructure.Persistence.PostgreSQL;  // RandomUserPick lives here
 using Microsoft.AspNetCore.SignalR;
 
 namespace ChatVerse.API.Services;
@@ -205,5 +205,6 @@ public sealed class TimeCapsuleDeliveryService : BackgroundService
     }
 }
 
-/// <summary>DTO for the random-user sample query.</summary>
-public sealed record RandomUserPick(Guid UserId, string Username);
+// NOTE: RandomUserPick record lives in ChatVerse.Infrastructure.Persistence.PostgreSQL
+// (defined alongside PostgresProcService) so that Infrastructure doesn't have to
+// reference API project. The using statement at the top of this file imports it.
