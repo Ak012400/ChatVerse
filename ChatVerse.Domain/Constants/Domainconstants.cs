@@ -179,6 +179,16 @@ public static class MongoCollections
     // ── Phase 2 (locked-roadmap features) ──────────────────────
     /// <summary>Time Capsule — delayed-delivery messages to random recipients.</summary>
     public const string TimeCapsules = "time_capsules";
+
+    // ── Persona Roulette ───────────────────────────────────────
+    /// <summary>Per-user daily-disposable identity.</summary>
+    public const string Personas = "personas";
+    /// <summary>Per-day rollup of which two personas DM'd, with the
+    /// underlying real users so the streak tracker can canonicalise.</summary>
+    public const string PersonaConversations = "persona_conversations";
+    /// <summary>Long-lived consecutive-day tracker between two real
+    /// users (regardless of their changing personas).</summary>
+    public const string PersonaStreaks = "persona_streaks";
 }
 
 public static class Theater

@@ -384,6 +384,126 @@ public class DmMessage
 //    • TTL via the existing maintenance webjob (90 days post-delivery).
 // ============================================================
 
+// ============================================================
+//  Persona Roulette — Phase 2 signature daily feature
+//
+//  At 00:00 UTC each day the PersonaResetService generates a new
+//  Persona row per active user. The Persona is what other users
+//  see when DMing them through the persona-roulette surface. The
+//  real ↔ persona mapping NEVER leaves the server; client only
+//  ever sees the persona's display fields.
+//
+//  Streak tracking lives in PersonaStreak, keyed by the (RealUserA,
+//  RealUserB) tuple sorted canonically so we don't double-insert
+//  when A messages B vs B messages A.
+//
+//  Why split into 3 collections vs one fat doc:
+//    • personas — daily-disposable, indexed by (UserId, Date)
+//    • persona_conversations — per-day rollup of persona ↔ persona DM
+//      activity, used by the reset service to decide whether the day
+//      counts toward a streak
+//    • persona_streaks — long-lived per-real-user-pair tracker
+// ============================================================
+
+public class Persona
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    /// <summary>Real user this persona belongs to. Server-only —
+    /// never serialised to other clients.</summary>
+    public string UserId { get; set; } = default!;
+
+    /// <summary>YYYY-MM-DD (UTC) of the day this persona is valid for.
+    /// Indexed alongside UserId so "get today's persona for user X"
+    /// is one hit.</summary>
+    public string Date { get; set; } = default!;
+
+    /// <summary>What other users see — e.g. "Velvet Comet". Generated
+    /// from an adjective + noun word list, with a small numeric tail
+    /// added if a collision is detected within the same day.</summary>
+    public string DisplayName { get; set; } = default!;
+
+    /// <summary>Seed for dicebear-style avatar generation. Client
+    /// resolves seed → image URL. Stable for the day.</summary>
+    public string AvatarSeed { get; set; } = default!;
+
+    /// <summary>One-line bio shown on the persona card. Picked from
+    /// a curated pool of poetic / cryptic / playful one-liners.</summary>
+    public string Bio { get; set; } = default!;
+
+    /// <summary>Short label like "playful" / "wistful" / "curious"
+    /// — drives UI accent colour on the persona card.</summary>
+    public string Mood { get; set; } = default!;
+
+    /// <summary>UTC midnight of the NEXT day. PersonaResetService
+    /// uses this for batch-archival when generating the next day's
+    /// personas.</summary>
+    public DateTime ExpiresAt { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+}
+
+public class PersonaConversation
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    /// <summary>YYYY-MM-DD of the day these personas interacted. The
+    /// (PersonaIdA, PersonaIdB, Date) tuple is unique per day.</summary>
+    public string Date { get; set; } = default!;
+
+    public string PersonaIdA { get; set; } = default!;
+    public string PersonaIdB { get; set; } = default!;
+
+    /// <summary>Underlying real user IDs, sorted ascending. This is
+    /// the canonical key the streak tracker reads — it doesn't care
+    /// who messaged first, only that the same real pair conversed.</summary>
+    public string RealUserA { get; set; } = default!;
+    public string RealUserB { get; set; } = default!;
+
+    public int MessagesCount { get; set; }
+    public DateTime LastInteraction { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+}
+
+public class PersonaStreak
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    /// <summary>Real user IDs sorted ascending so the pair has ONE
+    /// canonical key regardless of who initiated. Indexed unique.</summary>
+    public string RealUserA { get; set; } = default!;
+    public string RealUserB { get; set; } = default!;
+
+    /// <summary>Consecutive UTC days these two have conversed (at
+    /// least one PersonaConversation row per day, regardless of
+    /// their changing personas).</summary>
+    public int ConsecutiveDays { get; set; }
+
+    /// <summary>YYYY-MM-DD of the most recent day that counted toward
+    /// the streak. If today &gt; LastDay + 1, the streak resets.</summary>
+    public string LastDay { get; set; } = default!;
+
+    /// <summary>Set when BOTH sides accepted the Mutual Unmask offer
+    /// (only available at ConsecutiveDays >= 7). Once set, the two
+    /// real usernames become visible to each other inside the
+    /// Persona Roulette surface.</summary>
+    public DateTime? UnmaskedAt { get; set; }
+
+    /// <summary>True when ConsecutiveDays first crossed 30 — flips
+    /// the conversation into the Memory Vault archive.</summary>
+    public DateTime? VaultedAt { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+    public DateTime UpdatedAt { get; set; }
+}
+
 public class TimeCapsule
 {
     [BsonId]
