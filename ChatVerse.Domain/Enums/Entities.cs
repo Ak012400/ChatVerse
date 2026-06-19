@@ -571,6 +571,61 @@ public class TimeCapsule
 //      since rolled over.
 // ============================================================
 
+// ============================================================
+//  Story Chain — Phase 1 sticky creative-engagement loop.
+//
+//  Daily 3pm IST: StoryChainService spawns a new chain with a
+//  prompt sentence (curated bank). Users join a turn queue; the
+//  active turn-holder has 10 min to submit ONE sentence. After
+//  50 unique contributions the chain locks and is published to
+//  the public Stories archive. At midnight IST any still-active
+//  chain locks too — partial stories ship.
+//
+//  One sentence per user per chain (enforced via the canonical
+//  ContributorUserIds set). The same user can contribute again
+//  to tomorrow's chain.
+// ============================================================
+
+public class StoryChain
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    /// <summary>The IST date this chain belongs to (YYYY-MM-DD).
+    /// One chain per day — unique-indexed.</summary>
+    public string PromptDate { get; set; } = default!;
+
+    /// <summary>Opening line of the story — drawn from the curated
+    /// prompt bank at chain creation. Frozen for the chain's life.</summary>
+    public string Prompt { get; set; } = default!;
+
+    /// <summary>Ordered list of contributions. Position 0 is the
+    /// first contributor's sentence; new ones append.</summary>
+    public List<StoryContribution> Sentences { get; set; } = new();
+
+    /// <summary>Canonical set of user IDs who've already contributed
+    /// — used for the "one sentence per user" check.</summary>
+    public List<string> ContributorUserIds { get; set; } = new();
+
+    /// <summary>"active" | "locked" | "published". Locked happens
+    /// before published — locking freezes contributions, publishing
+    /// is what surfaces it on the archive feed.</summary>
+    public string Status { get; set; } = "active";
+
+    public DateTime? LockedAt { get; set; }
+    public DateTime? PublishedAt { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+
+public class StoryContribution
+{
+    public string SentenceText { get; set; } = default!;
+    public string AuthorUserId { get; set; } = default!;
+    public string AuthorUsername { get; set; } = default!;
+    public DateTime AddedAt { get; set; }
+}
+
 public class PersonaMessage
 {
     [BsonId]

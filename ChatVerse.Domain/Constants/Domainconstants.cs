@@ -192,6 +192,10 @@ public static class MongoCollections
     /// <summary>Persona-to-persona DM thread, keyed by sorted real
     /// user pair so it persists across daily rotations.</summary>
     public const string PersonaMessages = "persona_messages";
+
+    // ── Story Chain ────────────────────────────────────────────
+    /// <summary>Daily collaborative story — one chain per IST date.</summary>
+    public const string StoryChains = "story_chains";
 }
 
 public static class Theater
