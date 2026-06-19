@@ -280,6 +280,13 @@ try
     // below in the middleware pipeline.
     builder.Services.AddHostedService<ChatVerse.API.Services.TimeCapsuleDeliveryService>();
 
+    // Persona Roulette (Phase 2 signature daily feature) — daily 00:00
+    // UTC roll-over. The service checks once per hour whether the UTC
+    // date has changed and runs idempotently. Generates personas for
+    // an active-user sample + bumps streaks from yesterday's
+    // conversation rollup.
+    builder.Services.AddHostedService<ChatVerse.API.Services.PersonaResetService>();
+
     var app = builder.Build();
 
     // ── Middleware pipeline ───────────────────────────────────────
@@ -317,6 +324,12 @@ try
     app.MapHub<GameHub>("/hubs/game");
     // Phase 2 hub — Time Capsule write/reply/inbox + real-time delivery push.
     app.MapHub<ChatVerse.API.Hubs.TimeCapsuleHub>("/hubs/time-capsule");
+
+    // Phase 2 hub — Persona Roulette: GetMyPersona / GetActiveStreaks /
+    // Request+AcceptMutualUnmask. Real-time events (PersonaRolled,
+    // StreakMilestone, StreakUnmasked) will land alongside the
+    // frontend page.
+    app.MapHub<ChatVerse.API.Hubs.PersonaHub>("/hubs/persona");
 
     // ── Startup banner ────────────────────────────────────────────
     // Emit a clear, grep-friendly summary of WHICH hubs got mapped.

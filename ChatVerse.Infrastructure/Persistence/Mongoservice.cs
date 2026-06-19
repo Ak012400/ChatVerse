@@ -25,6 +25,11 @@ public partial class MongoService
     // Phase 2 — sticky features
     private IMongoCollection<TimeCapsule> TimeCapsules => _db.GetCollection<TimeCapsule>(MongoCollections.TimeCapsules);
 
+    // Persona Roulette — daily-disposable identity + streak tracking
+    private IMongoCollection<Persona> Personas => _db.GetCollection<Persona>(MongoCollections.Personas);
+    private IMongoCollection<PersonaConversation> PersonaConversations => _db.GetCollection<PersonaConversation>(MongoCollections.PersonaConversations);
+    private IMongoCollection<PersonaStreak> PersonaStreaks => _db.GetCollection<PersonaStreak>(MongoCollections.PersonaStreaks);
+
     public MongoService(IMongoClient client, string databaseName)
     {
         // Register camelCase convention — matches MongoDB field names (isActive, displayName etc)
@@ -811,6 +816,208 @@ public partial class MongoService
             .Set(c => c.ReplyDeliveredAt, DateTime.UtcNow);
         var result = await TimeCapsules.UpdateOneAsync(filter, update);
         return result.ModifiedCount == 1;
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  PERSONA ROULETTE — CRUD for personas, conversations, streaks.
+    //
+    //  Pattern matches TimeCapsule: server services compose these
+    //  primitives. PersonaResetService writes Personas at midnight UTC,
+    //  PersonaHub reads them on demand, BumpPersonaConversationAsync
+    //  flushes an upsert per persona-DM, and BumpStreakForDayAsync
+    //  is called by the reset service when it rolls the day over.
+    // ════════════════════════════════════════════════════════════
+
+    /// <summary>Upsert the persona for (userId, date). Idempotent —
+    /// safe to call from a retried reset tick.</summary>
+    public async Task UpsertPersonaAsync(Persona persona)
+    {
+        var filter = Builders<Persona>.Filter.And(
+            Builders<Persona>.Filter.Eq(p => p.UserId, persona.UserId),
+            Builders<Persona>.Filter.Eq(p => p.Date,   persona.Date));
+        var update = Builders<Persona>.Update
+            .SetOnInsert(p => p.UserId,      persona.UserId)
+            .SetOnInsert(p => p.Date,        persona.Date)
+            .SetOnInsert(p => p.DisplayName, persona.DisplayName)
+            .SetOnInsert(p => p.AvatarSeed,  persona.AvatarSeed)
+            .SetOnInsert(p => p.Bio,         persona.Bio)
+            .SetOnInsert(p => p.Mood,        persona.Mood)
+            .SetOnInsert(p => p.ExpiresAt,   persona.ExpiresAt)
+            .SetOnInsert(p => p.CreatedAt,   persona.CreatedAt);
+        await Personas.UpdateOneAsync(filter, update, new UpdateOptions { IsUpsert = true });
+    }
+
+    /// <summary>Return today's persona for the user, if one exists.
+    /// Hub uses this on GetMyPersona().</summary>
+    public async Task<Persona?> GetPersonaForDayAsync(string userId, string dateUtc)
+    {
+        return await Personas
+            .Find(p => p.UserId == userId && p.Date == dateUtc)
+            .FirstOrDefaultAsync();
+    }
+
+    /// <summary>Look up a persona by its id — used when one user
+    /// tries to DM another via persona id.</summary>
+    public async Task<Persona?> GetPersonaByIdAsync(string id)
+    {
+        return await Personas.Find(p => p.Id == id).FirstOrDefaultAsync();
+    }
+
+    /// <summary>Sweep expired personas. Cheap because we have an
+    /// index on Date. Called by the reset service after generating
+    /// the new day's batch.</summary>
+    public async Task<long> DeletePersonasBeforeAsync(string dateUtc)
+    {
+        var filter = Builders<Persona>.Filter.Lt(p => p.Date, dateUtc);
+        var result = await Personas.DeleteManyAsync(filter);
+        return result.DeletedCount;
+    }
+
+    // ─── Conversation rollup ────────────────────────────────────
+
+    /// <summary>Upsert the daily persona-conversation rollup, bumping
+    /// MessagesCount + LastInteraction. The (PersonaIdA, PersonaIdB,
+    /// Date) tuple is the unique key — we sort the pair before the
+    /// call so it doesn't matter who sent the message.</summary>
+    public async Task BumpPersonaConversationAsync(
+        string personaIdA, string personaIdB,
+        string realUserA,  string realUserB,
+        string dateUtc)
+    {
+        // Canonicalise order so (A,B) and (B,A) hit the same row.
+        var (pA, pB, uA, uB) = string.CompareOrdinal(personaIdA, personaIdB) <= 0
+            ? (personaIdA, personaIdB, realUserA, realUserB)
+            : (personaIdB, personaIdA, realUserB, realUserA);
+
+        var filter = Builders<PersonaConversation>.Filter.And(
+            Builders<PersonaConversation>.Filter.Eq(c => c.PersonaIdA, pA),
+            Builders<PersonaConversation>.Filter.Eq(c => c.PersonaIdB, pB),
+            Builders<PersonaConversation>.Filter.Eq(c => c.Date,       dateUtc));
+
+        var update = Builders<PersonaConversation>.Update
+            .SetOnInsert(c => c.PersonaIdA, pA)
+            .SetOnInsert(c => c.PersonaIdB, pB)
+            .SetOnInsert(c => c.RealUserA,  uA)
+            .SetOnInsert(c => c.RealUserB,  uB)
+            .SetOnInsert(c => c.Date,       dateUtc)
+            .SetOnInsert(c => c.CreatedAt,  DateTime.UtcNow)
+            .Inc(c => c.MessagesCount, 1)
+            .Set(c => c.LastInteraction, DateTime.UtcNow);
+
+        await PersonaConversations.UpdateOneAsync(
+            filter, update, new UpdateOptions { IsUpsert = true });
+    }
+
+    /// <summary>All conversation rollups for a given day. The reset
+    /// service consumes this on day-rollover to bump streaks.</summary>
+    public async Task<List<PersonaConversation>> GetConversationsForDayAsync(string dateUtc)
+    {
+        return await PersonaConversations
+            .Find(c => c.Date == dateUtc)
+            .ToListAsync();
+    }
+
+    // ─── Streak tracker ─────────────────────────────────────────
+
+    /// <summary>Look up the streak row for a real-user pair (sorted
+    /// canonically). Hub uses this for GetActiveStreaks().</summary>
+    public async Task<List<PersonaStreak>> GetStreaksForUserAsync(string realUserId)
+    {
+        var filter = Builders<PersonaStreak>.Filter.Or(
+            Builders<PersonaStreak>.Filter.Eq(s => s.RealUserA, realUserId),
+            Builders<PersonaStreak>.Filter.Eq(s => s.RealUserB, realUserId));
+        return await PersonaStreaks
+            .Find(filter)
+            .SortByDescending(s => s.ConsecutiveDays)
+            .Limit(100)
+            .ToListAsync();
+    }
+
+    public async Task<PersonaStreak?> GetStreakAsync(string realUserA, string realUserB)
+    {
+        var (a, b) = SortPair(realUserA, realUserB);
+        return await PersonaStreaks
+            .Find(s => s.RealUserA == a && s.RealUserB == b)
+            .FirstOrDefaultAsync();
+    }
+
+    /// <summary>Apply a day's interaction to the streak between two
+    /// real users. If LastDay is yesterday relative to `dateUtc`,
+    /// bump ConsecutiveDays. If gap > 1 day, reset to 1. Idempotent
+    /// when LastDay == dateUtc (re-runs same day are no-ops).</summary>
+    public async Task<PersonaStreak> BumpStreakForDayAsync(
+        string realUserA, string realUserB, string dateUtc)
+    {
+        var (a, b) = SortPair(realUserA, realUserB);
+
+        var existing = await GetStreakAsync(a, b);
+        var now = DateTime.UtcNow;
+
+        if (existing is null)
+        {
+            var fresh = new PersonaStreak
+            {
+                RealUserA       = a,
+                RealUserB       = b,
+                ConsecutiveDays = 1,
+                LastDay         = dateUtc,
+                CreatedAt       = now,
+                UpdatedAt       = now,
+            };
+            await PersonaStreaks.InsertOneAsync(fresh);
+            return fresh;
+        }
+
+        // Same-day re-run is a no-op (idempotent).
+        if (existing.LastDay == dateUtc) return existing;
+
+        var newConsecutive = IsConsecutiveDay(existing.LastDay, dateUtc)
+            ? existing.ConsecutiveDays + 1
+            : 1;
+
+        var update = Builders<PersonaStreak>.Update
+            .Set(s => s.ConsecutiveDays, newConsecutive)
+            .Set(s => s.LastDay,         dateUtc)
+            .Set(s => s.UpdatedAt,       now);
+
+        // First-time 30-day cross triggers Memory Vault.
+        if (newConsecutive >= 30 && existing.VaultedAt is null)
+            update = update.Set(s => s.VaultedAt, now);
+
+        var filter = Builders<PersonaStreak>.Filter.Eq(s => s.Id, existing.Id);
+        await PersonaStreaks.UpdateOneAsync(filter, update);
+
+        existing.ConsecutiveDays = newConsecutive;
+        existing.LastDay         = dateUtc;
+        existing.UpdatedAt       = now;
+        if (newConsecutive >= 30 && existing.VaultedAt is null) existing.VaultedAt = now;
+        return existing;
+    }
+
+    /// <summary>Mark a streak as mutually unmasked (both sides accepted).
+    /// Idempotent — second accept on same streak doesn't change
+    /// UnmaskedAt. Returns true if THIS call performed the flip.</summary>
+    public async Task<bool> SetStreakUnmaskedAsync(string streakId)
+    {
+        var filter = Builders<PersonaStreak>.Filter.And(
+            Builders<PersonaStreak>.Filter.Eq(s => s.Id, streakId),
+            Builders<PersonaStreak>.Filter.Eq(s => s.UnmaskedAt, (DateTime?)null));
+        var update = Builders<PersonaStreak>.Update
+            .Set(s => s.UnmaskedAt, DateTime.UtcNow);
+        var result = await PersonaStreaks.UpdateOneAsync(filter, update);
+        return result.ModifiedCount == 1;
+    }
+
+    private static (string a, string b) SortPair(string x, string y) =>
+        string.CompareOrdinal(x, y) <= 0 ? (x, y) : (y, x);
+
+    private static bool IsConsecutiveDay(string previousDate, string currentDate)
+    {
+        // Both are YYYY-MM-DD UTC strings. Parse both, ask if the
+        // current is exactly previous + 1 day.
+        if (!DateTime.TryParse(previousDate, out var prev)) return false;
+        if (!DateTime.TryParse(currentDate,  out var curr)) return false;
+        return curr.Date == prev.Date.AddDays(1);
     }
 }
 
