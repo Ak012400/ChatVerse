@@ -189,6 +189,9 @@ public static class MongoCollections
     /// <summary>Long-lived consecutive-day tracker between two real
     /// users (regardless of their changing personas).</summary>
     public const string PersonaStreaks = "persona_streaks";
+    /// <summary>Persona-to-persona DM thread, keyed by sorted real
+    /// user pair so it persists across daily rotations.</summary>
+    public const string PersonaMessages = "persona_messages";
 }
 
 public static class Theater
