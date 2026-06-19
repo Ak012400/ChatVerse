@@ -287,6 +287,11 @@ try
     // conversation rollup.
     builder.Services.AddHostedService<ChatVerse.API.Services.PersonaResetService>();
 
+    // Story Chain (Phase 1 creative-engagement loop) — 10-min tick
+    // handles "spawn today's chain at 3pm IST" + "lock+publish any
+    // chain whose IST date is in the past". Idempotent.
+    builder.Services.AddHostedService<ChatVerse.API.Services.StoryChainService>();
+
     var app = builder.Build();
 
     // ── Middleware pipeline ───────────────────────────────────────
@@ -330,6 +335,11 @@ try
     // StreakMilestone, StreakUnmasked) will land alongside the
     // frontend page.
     app.MapHub<ChatVerse.API.Hubs.PersonaHub>("/hubs/persona");
+
+    // Phase 1 hub — Story Chain: GetCurrentChain / JoinQueue /
+    // LeaveQueue / AddSentence / GetArchive. Turn queue lives in
+    // Redis; push events fan out via SignalR groups.
+    app.MapHub<ChatVerse.API.Hubs.StoryChainHub>("/hubs/story-chain");
 
     // ── Startup banner ────────────────────────────────────────────
     // Emit a clear, grep-friendly summary of WHICH hubs got mapped.

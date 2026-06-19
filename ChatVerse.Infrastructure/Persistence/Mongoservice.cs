@@ -32,6 +32,9 @@ public partial class MongoService
     private IMongoCollection<PersonaStreak> PersonaStreaks => _db.GetCollection<PersonaStreak>(MongoCollections.PersonaStreaks);
     private IMongoCollection<PersonaMessage> PersonaMessages => _db.GetCollection<PersonaMessage>(MongoCollections.PersonaMessages);
 
+    // Story Chain — daily collaborative writing
+    private IMongoCollection<StoryChain> StoryChains => _db.GetCollection<StoryChain>(MongoCollections.StoryChains);
+
     public MongoService(IMongoClient client, string databaseName)
     {
         // Register camelCase convention — matches MongoDB field names (isActive, displayName etc)
@@ -1118,6 +1121,139 @@ public partial class MongoService
         if (!DateTime.TryParse(previousDate, out var prev)) return false;
         if (!DateTime.TryParse(currentDate,  out var curr)) return false;
         return curr.Date == prev.Date.AddDays(1);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  STORY CHAIN — daily collaborative writing
+    // ════════════════════════════════════════════════════════════
+
+    public const int StoryChainMaxContributions = 50;
+    public const int StoryChainMaxSentenceChars = 280;  // tweet-sized — keeps pacing tight
+
+    /// <summary>Insert today's chain if not already present.
+    /// Returns the chain row regardless. Idempotent.</summary>
+    public async Task<StoryChain> EnsureDailyStoryChainAsync(string promptDate, string prompt)
+    {
+        var existing = await StoryChains
+            .Find(c => c.PromptDate == promptDate)
+            .FirstOrDefaultAsync();
+        if (existing is not null) return existing;
+
+        var chain = new StoryChain
+        {
+            PromptDate = promptDate,
+            Prompt     = prompt,
+            Sentences  = new List<StoryContribution>(),
+            ContributorUserIds = new List<string>(),
+            Status     = "active",
+            CreatedAt  = DateTime.UtcNow,
+        };
+        try
+        {
+            await StoryChains.InsertOneAsync(chain);
+            return chain;
+        }
+        catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+        {
+            // Race: another instance just inserted. Re-read and return.
+            return await StoryChains
+                .Find(c => c.PromptDate == promptDate)
+                .FirstAsync();
+        }
+    }
+
+    public async Task<StoryChain?> GetActiveStoryChainAsync(string promptDate)
+    {
+        return await StoryChains
+            .Find(c => c.PromptDate == promptDate)
+            .FirstOrDefaultAsync();
+    }
+
+    /// <summary>Append a contribution atomically. Guards:
+    ///   • chain must be active
+    ///   • author hasn't already contributed (one sentence per user)
+    ///   • cap of 50 contributions not yet hit
+    /// Returns true if THIS call wrote the contribution; false if it
+    /// lost the race (someone else's contribution claimed the slot,
+    /// or the chain locked, or the author had already written).</summary>
+    public async Task<bool> AppendStoryContributionAsync(
+        string chainId, StoryContribution contribution)
+    {
+        var filter = Builders<StoryChain>.Filter.And(
+            Builders<StoryChain>.Filter.Eq(c => c.Id, chainId),
+            Builders<StoryChain>.Filter.Eq(c => c.Status, "active"),
+            // Author hasn't already contributed to this chain.
+            // Not(AnyEq) is the array-aware way to say "value not in list".
+            Builders<StoryChain>.Filter.Not(
+                Builders<StoryChain>.Filter.AnyEq(c => c.ContributorUserIds, contribution.AuthorUserId)),
+            // Cap at 50 sentences. SizeLt on the array uses Mongo's
+            // $expr + $lt under the hood — cheap on a small list.
+            Builders<StoryChain>.Filter.SizeLt(c => c.Sentences, StoryChainMaxContributions));
+
+        var update = Builders<StoryChain>.Update
+            .Push(c => c.Sentences,          contribution)
+            .Push(c => c.ContributorUserIds, contribution.AuthorUserId);
+
+        var result = await StoryChains.UpdateOneAsync(filter, update);
+        return result.ModifiedCount == 1;
+    }
+
+    /// <summary>Flip chain to locked. Idempotent — second call on an
+    /// already-locked chain is a no-op (returns false).</summary>
+    public async Task<bool> LockStoryChainAsync(string chainId)
+    {
+        var filter = Builders<StoryChain>.Filter.And(
+            Builders<StoryChain>.Filter.Eq(c => c.Id, chainId),
+            Builders<StoryChain>.Filter.Eq(c => c.Status, "active"));
+        var update = Builders<StoryChain>.Update
+            .Set(c => c.Status,   "locked")
+            .Set(c => c.LockedAt, DateTime.UtcNow);
+        var result = await StoryChains.UpdateOneAsync(filter, update);
+        return result.ModifiedCount == 1;
+    }
+
+    /// <summary>Mark a locked chain as published — surfaces it on the
+    /// Stories feed. Service runs this immediately after lock.</summary>
+    public async Task<bool> PublishStoryChainAsync(string chainId)
+    {
+        var filter = Builders<StoryChain>.Filter.And(
+            Builders<StoryChain>.Filter.Eq(c => c.Id, chainId),
+            Builders<StoryChain>.Filter.Eq(c => c.Status, "locked"));
+        var update = Builders<StoryChain>.Update
+            .Set(c => c.Status,      "published")
+            .Set(c => c.PublishedAt, DateTime.UtcNow);
+        var result = await StoryChains.UpdateOneAsync(filter, update);
+        return result.ModifiedCount == 1;
+    }
+
+    /// <summary>All chains still in "active" status — the background
+    /// service sweeps this for the auto-lock-at-midnight pass.</summary>
+    public async Task<List<StoryChain>> GetActiveChainsAsync()
+    {
+        return await StoryChains
+            .Find(c => c.Status == "active")
+            .ToListAsync();
+    }
+
+    /// <summary>All chains in "locked" status (not yet published).
+    /// Background tick promotes these to published in a follow-up
+    /// pass — kept separate so a moderation hook could be slotted
+    /// between lock and publish later.</summary>
+    public async Task<List<StoryChain>> GetLockedChainsAsync()
+    {
+        return await StoryChains
+            .Find(c => c.Status == "locked")
+            .ToListAsync();
+    }
+
+    /// <summary>Recent published chains for the archive feed.</summary>
+    public async Task<List<StoryChain>> GetPublishedChainsAsync(int limit = 30)
+    {
+        return await StoryChains
+            .Find(c => c.Status == "published")
+            .SortByDescending(c => c.PublishedAt)
+            .Limit(limit)
+            .ToListAsync();
     }
 }
 
