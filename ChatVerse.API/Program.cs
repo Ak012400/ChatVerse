@@ -274,6 +274,12 @@ try
     // fill up. See MaintenanceService for retention windows.
     builder.Services.AddHostedService<ChatVerse.API.Services.MaintenanceService>();
 
+    // Time Capsule (Phase 2 sticky feature) — delivery sweeper runs
+    // every 30 minutes. Picks recipients from a random-active sample and
+    // pushes SignalR events via TimeCapsuleHub. Hub itself is mapped
+    // below in the middleware pipeline.
+    builder.Services.AddHostedService<ChatVerse.API.Services.TimeCapsuleDeliveryService>();
+
     var app = builder.Build();
 
     // ── Middleware pipeline ───────────────────────────────────────
@@ -309,6 +315,8 @@ try
     app.MapHub<ChatHub>("/hubs/chat");
     app.MapHub<VideoHub>("/hubs/video");
     app.MapHub<GameHub>("/hubs/game");
+    // Phase 2 hub — Time Capsule write/reply/inbox + real-time delivery push.
+    app.MapHub<ChatVerse.API.Hubs.TimeCapsuleHub>("/hubs/time-capsule");
 
     // ── Startup banner ────────────────────────────────────────────
     // Emit a clear, grep-friendly summary of WHICH hubs got mapped.

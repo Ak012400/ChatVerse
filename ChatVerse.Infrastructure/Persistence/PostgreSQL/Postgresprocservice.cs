@@ -39,6 +39,35 @@ public class PostgresProcService
     //  follow up with Mongo cleanup for their messages.
     // ============================================================
 
+    /// <summary>
+    /// Sample N random REGISTERED (non-guest) users who've been active
+    /// in the last 30 days. Used by TimeCapsuleDeliveryService to pick
+    /// recipients. Returns just (id, username) — minimal payload.
+    /// </summary>
+    public async Task<List<RandomUserPick>> GetRandomActiveUserSampleAsync(int sampleSize)
+    {
+        var conn = await GetOpenConnectionAsync();
+        await using var cmd = new NpgsqlCommand(@"
+            SELECT id, username
+            FROM   user_auth.users
+            WHERE  is_guest = FALSE
+              AND  last_active_date >= CURRENT_DATE - INTERVAL '30 days'
+            ORDER  BY RANDOM()
+            LIMIT  @sample
+        ", conn);
+        cmd.Parameters.AddWithValue("sample", sampleSize);
+
+        var results = new List<RandomUserPick>();
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            results.Add(new RandomUserPick(
+                reader.GetGuid(0),
+                reader.GetString(1)));
+        }
+        return results;
+    }
+
     public async Task<List<Guid>> CleanupOldGuestUsersAsync(TimeSpan olderThan)
     {
         // The cleanup is a FUNCTION (not a procedure) so it can RETURNS
@@ -648,3 +677,16 @@ internal static class StringExtensions
             i > 0 && char.IsUpper(c) ? "_" + c : c.ToString()
         )).ToLower();
 }
+
+/// <summary>
+/// Lightweight (id, username) tuple returned by
+/// <see cref="PostgresProcService.GetRandomActiveUserSampleAsync"/>.
+///
+/// Lives in the Infrastructure namespace (NOT API) because the proc
+/// service that produces it lives here, and Infrastructure cannot
+/// reference API (would be a circular dependency). Consumers in the
+/// API project (TimeCapsuleDeliveryService, future delivery services)
+/// just `using ChatVerse.Infrastructure.Persistence.PostgreSQL;` to
+/// pull it in — they already do for PostgresProcService anyway.
+/// </summary>
+public sealed record RandomUserPick(Guid UserId, string Username);

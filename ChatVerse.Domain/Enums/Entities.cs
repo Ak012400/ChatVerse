@@ -367,3 +367,63 @@ public class DmMessage
     // Same Spotify enrichment as room messages.
     public SpotifyEmbed? Spotify { get; set; }
 }
+
+// ============================================================
+//  TimeCapsule — Phase 2 sticky feature
+//
+//  Author writes a message TODAY → system delivers it to a RANDOM
+//  anonymous recipient 7/14/30 days later. Recipient can reply ONCE
+//  (delivered back to author 3 days later).
+//
+//  Why this design:
+//    • Anonymous-by-default — AuthorUserId stored but never revealed
+//      unless author explicitly opted to sign their capsule.
+//    • Recipient chosen AT DELIVERY TIME, not write time, so the
+//      pool of active users is freshest.
+//    • Single reply max — keeps it a "moment", not a thread.
+//    • TTL via the existing maintenance webjob (90 days post-delivery).
+// ============================================================
+
+public class TimeCapsule
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    /// <summary>Author's user id. NULL if posted anonymously
+    /// (author opted to hide identity even from server logs).</summary>
+    public string? AuthorUserId { get; set; }
+
+    /// <summary>Author display name at time of write. Frozen here so
+    /// rename later doesn't retroactively change old capsules.</summary>
+    public string? AuthorUsername { get; set; }
+
+    /// <summary>True if author wants their name shown on delivery.
+    /// False means recipient sees "Anonymous voyager".</summary>
+    public bool AuthorRevealed { get; set; } = false;
+
+    public string Content { get; set; } = default!;
+    public string Type { get; set; } = "text";  // text / image / audio
+    public string? MediaUrl { get; set; }
+
+    /// <summary>Days the author chose: 7 / 14 / 30.</summary>
+    public int DeliveryWindowDays { get; set; }
+
+    /// <summary>The actual delivery target time. ScheduledFor + small jitter
+    /// so 100 capsules written at noon don't all fire at the same second.</summary>
+    public DateTime ScheduledFor { get; set; }
+
+    public DateTime? DeliveredAt { get; set; }
+    public string? RecipientUserId { get; set; }
+    public string? RecipientUsername { get; set; }
+
+    /// <summary>Single-shot reply from recipient. Null until they choose
+    /// to reply. Replies have their own scheduledReplyDeliveryAt so
+    /// they arrive 3 days later, not instantly.</summary>
+    public string? ReplyContent { get; set; }
+    public DateTime? RepliedAt { get; set; }
+    public DateTime? ScheduledReplyDeliveryAt { get; set; }
+    public DateTime? ReplyDeliveredAt { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+}
