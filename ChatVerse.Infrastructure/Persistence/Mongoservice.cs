@@ -1,6 +1,7 @@
 ﻿using ChatVerse.Domain.Constants;
 using ChatVerse.Domain.Entities;
 using MongoDB.Bson;
+using MongoDB.Bson.Serialization;
 using MongoDB.Bson.Serialization.Conventions;
 using MongoDB.Driver;
 
@@ -29,6 +30,7 @@ public partial class MongoService
     private IMongoCollection<Persona> Personas => _db.GetCollection<Persona>(MongoCollections.Personas);
     private IMongoCollection<PersonaConversation> PersonaConversations => _db.GetCollection<PersonaConversation>(MongoCollections.PersonaConversations);
     private IMongoCollection<PersonaStreak> PersonaStreaks => _db.GetCollection<PersonaStreak>(MongoCollections.PersonaStreaks);
+    private IMongoCollection<PersonaMessage> PersonaMessages => _db.GetCollection<PersonaMessage>(MongoCollections.PersonaMessages);
 
     public MongoService(IMongoClient client, string databaseName)
     {
@@ -994,18 +996,116 @@ public partial class MongoService
         return existing;
     }
 
-    /// <summary>Mark a streak as mutually unmasked (both sides accepted).
-    /// Idempotent — second accept on same streak doesn't change
-    /// UnmaskedAt. Returns true if THIS call performed the flip.</summary>
-    public async Task<bool> SetStreakUnmaskedAsync(string streakId)
+    /// <summary>Register a real user's "I'd like to unmask" tap on the
+    /// streak. Adds them to UnmaskRequestedBy if not already there.
+    /// If BOTH RealUserA and RealUserB are now in the list, the streak
+    /// flips to UnmaskedAt. Returns the post-state of the streak so
+    /// the caller can tell client what to render.</summary>
+    public async Task<PersonaStreak?> RequestStreakUnmaskAsync(
+        string streakId, string requestingRealUserId)
     {
-        var filter = Builders<PersonaStreak>.Filter.And(
-            Builders<PersonaStreak>.Filter.Eq(s => s.Id, streakId),
-            Builders<PersonaStreak>.Filter.Eq(s => s.UnmaskedAt, (DateTime?)null));
-        var update = Builders<PersonaStreak>.Update
-            .Set(s => s.UnmaskedAt, DateTime.UtcNow);
-        var result = await PersonaStreaks.UpdateOneAsync(filter, update);
-        return result.ModifiedCount == 1;
+        var streak = await PersonaStreaks
+            .Find(s => s.Id == streakId)
+            .FirstOrDefaultAsync();
+        if (streak is null) return null;
+
+        // Authorisation: caller must be one of the two real users on
+        // this streak. Anything else is a 404-equivalent so we don't
+        // leak that the streak exists.
+        if (streak.RealUserA != requestingRealUserId &&
+            streak.RealUserB != requestingRealUserId)
+        {
+            return null;
+        }
+
+        // 7-day floor — per VISION.md spec, mutual unmask only
+        // unlocks after a full week of consecutive conversation.
+        if (streak.ConsecutiveDays < 7) return streak;
+
+        // Idempotent — already on the list = nothing to do.
+        if (!streak.UnmaskRequestedBy.Contains(requestingRealUserId))
+        {
+            streak.UnmaskRequestedBy.Add(requestingRealUserId);
+
+            var bothSidesRequested =
+                streak.UnmaskRequestedBy.Contains(streak.RealUserA) &&
+                streak.UnmaskRequestedBy.Contains(streak.RealUserB);
+
+            var update = Builders<PersonaStreak>.Update
+                .Set(s => s.UnmaskRequestedBy, streak.UnmaskRequestedBy)
+                .Set(s => s.UpdatedAt, DateTime.UtcNow);
+
+            if (bothSidesRequested && streak.UnmaskedAt is null)
+            {
+                update = update.Set(s => s.UnmaskedAt, DateTime.UtcNow);
+                streak.UnmaskedAt = DateTime.UtcNow;
+            }
+
+            await PersonaStreaks.UpdateOneAsync(
+                Builders<PersonaStreak>.Filter.Eq(s => s.Id, streakId),
+                update);
+        }
+        return streak;
+    }
+
+    // ─── Discovery ──────────────────────────────────────────────
+
+    /// <summary>Random sample of today's personas, excluding the
+    /// caller's own. Used by the "Discover" tab to seed first-contact
+    /// conversations. $sample is the cheapest way to pull a random
+    /// subset server-side — Mongo handles the reservoir.</summary>
+    public async Task<List<Persona>> GetRandomTodayPersonasAsync(
+        string excludeUserId, string dateUtc, int limit = 10)
+    {
+        return await Personas
+            .Aggregate()
+            .Match(p => p.Date == dateUtc && p.UserId != excludeUserId)
+            .AppendStage<Persona>(new BsonDocument("$sample", new BsonDocument("size", limit)))
+            .ToListAsync();
+    }
+
+    // ─── Persona-to-persona messages ────────────────────────────
+
+    /// <summary>Insert a persona message and bump the daily
+    /// conversation rollup in the same logical step. Sender + recipient
+    /// real-user IDs are sorted canonically before write so the thread
+    /// has ONE stable key regardless of direction.</summary>
+    public async Task<PersonaMessage> InsertPersonaMessageAsync(
+        PersonaMessage message, string recipientRealUserId, string dateUtc,
+        string recipientPersonaId)
+    {
+        var (a, b) = SortPair(message.SenderRealUserId, recipientRealUserId);
+        message.RealUserA = a;
+        message.RealUserB = b;
+        message.CreatedAt = DateTime.UtcNow;
+        await PersonaMessages.InsertOneAsync(message);
+
+        // Bump the per-day rollup so PersonaResetService can roll it
+        // into a streak tomorrow.
+        await BumpPersonaConversationAsync(
+            personaIdA: message.SenderPersonaId,
+            personaIdB: recipientPersonaId,
+            realUserA:  message.SenderRealUserId,
+            realUserB:  recipientRealUserId,
+            dateUtc:    dateUtc);
+
+        return message;
+    }
+
+    /// <summary>Fetch the most recent N messages between two real
+    /// users. Pair is sorted internally.</summary>
+    public async Task<List<PersonaMessage>> GetPersonaThreadAsync(
+        string realUserX, string realUserY, int limit = 100)
+    {
+        var (a, b) = SortPair(realUserX, realUserY);
+        var filter = Builders<PersonaMessage>.Filter.And(
+            Builders<PersonaMessage>.Filter.Eq(m => m.RealUserA, a),
+            Builders<PersonaMessage>.Filter.Eq(m => m.RealUserB, b));
+        return await PersonaMessages
+            .Find(filter)
+            .SortBy(m => m.CreatedAt)
+            .Limit(limit)
+            .ToListAsync();
     }
 
     private static (string a, string b) SortPair(string x, string y) =>

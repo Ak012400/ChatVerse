@@ -490,6 +490,12 @@ public class PersonaStreak
     /// the streak. If today &gt; LastDay + 1, the streak resets.</summary>
     public string LastDay { get; set; } = default!;
 
+    /// <summary>Real user IDs that have tapped "Request unmask" on
+    /// their side. The streak only flips to UnmaskedAt when BOTH
+    /// RealUserA and RealUserB appear in this list — single-tap
+    /// accidents can't reveal identities.</summary>
+    public List<string> UnmaskRequestedBy { get; set; } = new();
+
     /// <summary>Set when BOTH sides accepted the Mutual Unmask offer
     /// (only available at ConsecutiveDays >= 7). Once set, the two
     /// real usernames become visible to each other inside the
@@ -544,6 +550,50 @@ public class TimeCapsule
     public DateTime? RepliedAt { get; set; }
     public DateTime? ScheduledReplyDeliveryAt { get; set; }
     public DateTime? ReplyDeliveredAt { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+}
+
+// ============================================================
+//  PersonaMessage — a single line of text between two personas.
+//
+//  Stored against the REAL user pair (sorted canonically) so the
+//  thread survives daily persona rotation: A and B keep chatting
+//  even though both their visible names change at 00:00 UTC.
+//
+//  Privacy:
+//    • Client never sees raw real user IDs — server resolves
+//      "who is the other party today?" via PersonaStreak +
+//      today's Persona.
+//    • Sender's persona display fields are SNAPSHOTTED into the
+//      message at send time. That way the recipient sees who
+//      sent it AT THE TIME, even if the sender's persona has
+//      since rolled over.
+// ============================================================
+
+public class PersonaMessage
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    /// <summary>Sorted real-user pair, lower id first. Same key the
+    /// PersonaStreak uses. Indexed for thread queries.</summary>
+    public string RealUserA { get; set; } = default!;
+    public string RealUserB { get; set; } = default!;
+
+    /// <summary>Which side sent this message — must be one of
+    /// (RealUserA, RealUserB).</summary>
+    public string SenderRealUserId { get; set; } = default!;
+
+    /// <summary>Snapshot of sender's persona AT SEND TIME. Frozen so
+    /// the message bubble displays the right name even after the
+    /// persona expires.</summary>
+    public string SenderPersonaId { get; set; } = default!;
+    public string SenderDisplayName { get; set; } = default!;
+    public string SenderAvatarSeed { get; set; } = default!;
+
+    public string Content { get; set; } = default!;
 
     public DateTime CreatedAt { get; set; }
 }
