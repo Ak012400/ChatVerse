@@ -210,6 +210,15 @@ public static class MongoCollections
     /// <summary>Per-date message thread (kept separate from regular
     /// DMs so privacy lifecycle is isolated).</summary>
     public const string GhostDateMessages = "ghost_date_messages";
+
+    // ── Love Triangle ──────────────────────────────────────────
+    /// <summary>Weekly opt-in pool for Sunday 10pm IST love triangles.</summary>
+    public const string LoveTriangleRegistrations = "love_triangle_registrations";
+    /// <summary>Active + completed triangles with voting state.</summary>
+    public const string LoveTriangles = "love_triangles";
+    /// <summary>Per-pair DM thread inside a triangle. Sharable as
+    /// anonymous excerpts.</summary>
+    public const string LoveTrianglePairMessages = "love_triangle_pair_messages";
 }
 
 public static class Theater

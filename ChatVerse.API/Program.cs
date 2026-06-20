@@ -302,6 +302,11 @@ try
     // 9:35pm decision-deadline expiry. All idempotent.
     builder.Services.AddHostedService<ChatVerse.API.Services.GhostDateService>();
 
+    // Love Triangle (Phase 2 weekly drama) — 5-min tick handles
+    // Sunday 10pm IST formation + 7-day chat-end voting open +
+    // 8-day completion. All idempotent.
+    builder.Services.AddHostedService<ChatVerse.API.Services.LoveTriangleService>();
+
     var app = builder.Build();
 
     // ── Middleware pipeline ───────────────────────────────────────
@@ -362,6 +367,12 @@ try
     // GetMyHistory. Push: GhostDateMatched / GhostDateMessage /
     // GhostDateEnded / GhostDateOutcome.
     app.MapHub<ChatVerse.API.Hubs.GhostDateHub>("/hubs/ghost-date");
+
+    // Phase 2 hub — Love Triangle: Register / Withdraw / GetMyStatus /
+    // GetMyTriangle / SendPairMessage / ToggleShareExcerpt /
+    // GetPublicTriangles / Vote / GetMyHistory. Push: TriangleFormed /
+    // PairMessage / ExcerptShared / VotingOpened / TriangleCompleted.
+    app.MapHub<ChatVerse.API.Hubs.LoveTriangleHub>("/hubs/love-triangle");
 
     // ── Startup banner ────────────────────────────────────────────
     // Emit a clear, grep-friendly summary of WHICH hubs got mapped.
