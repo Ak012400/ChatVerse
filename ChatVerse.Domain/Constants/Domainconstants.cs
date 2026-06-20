@@ -196,6 +196,11 @@ public static class MongoCollections
     // ── Story Chain ────────────────────────────────────────────
     /// <summary>Daily collaborative story — one chain per IST date.</summary>
     public const string StoryChains = "story_chains";
+
+    // ── Confession Box ─────────────────────────────────────────
+    /// <summary>Anonymous daily confessions. Top of the day gets
+    /// reveal offer; archives roll into the Lore Wall.</summary>
+    public const string Confessions = "confessions";
 }
 
 public static class Theater

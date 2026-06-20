@@ -586,6 +586,74 @@ public class TimeCapsule
 //  to tomorrow's chain.
 // ============================================================
 
+// ============================================================
+//  Confession — Phase 2 drama feature.
+//
+//  Anonymous daily confessions. Every day, the
+//  ConfessionRankingService picks the previous day's top-reaction
+//  confession and offers its author a "reveal" — accept = author
+//  goes public on the platform with a featured banner, decline =
+//  a permanent "Ghost Voice" badge on their profile.
+//
+//  Privacy:
+//    • AuthorUserId stored server-side only — DTOs NEVER include it
+//      unless the author has explicitly accepted reveal.
+//    • Reactions are stored as a map {emoji → list-of-user-ids}.
+//      Client view only ever sees aggregate counts unless THE caller
+//      has reacted (so we can highlight their pick).
+// ============================================================
+
+public class Confession
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    /// <summary>Server-only. NEVER serialised to other clients
+    /// unless AuthorRevealed flips true.</summary>
+    public string AuthorUserId { get; set; } = default!;
+
+    /// <summary>Snapshot of author username at write time — used for
+    /// the reveal banner if the author later accepts. Frozen, so a
+    /// later rename doesn't retroactively change the public reveal.</summary>
+    public string AuthorUsername { get; set; } = default!;
+
+    public string Content { get; set; } = default!;
+
+    /// <summary>Emoji → distinct user IDs who reacted with that emoji.
+    /// Map values are List&lt;string&gt; for "set"-style toggle semantics
+    /// (presence = the user picked that emoji). One emoji per user
+    /// total — switching to a different one removes the previous.</summary>
+    public Dictionary<string, List<string>> Reactions { get; set; } = new();
+
+    /// <summary>Cached count = sum of distinct reactors across all
+    /// emojis. Updated atomically on every React call so the ranking
+    /// service doesn't have to recompute.</summary>
+    public int TotalReactions { get; set; }
+
+    /// <summary>YYYY-MM-DD UTC bucket. Confessions are ranked per day.
+    /// Indexed for the daily-feed query.</summary>
+    public string Date { get; set; } = default!;
+
+    /// <summary>Set by ConfessionRankingService when this confession
+    /// is crowned the top of its day. Null otherwise.</summary>
+    public DateTime? TopRankedAt { get; set; }
+
+    /// <summary>Author's response to the reveal offer:
+    ///   null  = not yet offered OR offered and not yet decided
+    ///   true  = accepted reveal (RevealedAt set, public banner)
+    ///   false = declined (Ghost Voice badge on profile)</summary>
+    public bool? AuthorOptedReveal { get; set; }
+
+    public DateTime? RevealedAt { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+    /// <summary>30 days after CreatedAt — Maintenance webjob sweeps
+    /// confessions past this point unless they were top-ranked +
+    /// revealed (those stay in the Lore Wall forever).</summary>
+    public DateTime ExpiresAt { get; set; }
+}
+
 public class StoryChain
 {
     [BsonId]
