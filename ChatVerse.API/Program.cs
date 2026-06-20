@@ -313,6 +313,11 @@ try
     // 11pm IST closes + scores all Hunter submissions.
     builder.Services.AddHostedService<ChatVerse.API.Services.CipherRoundService>();
 
+    // PYAAR LIVE (Phase 3 flagship) — 1-min tick orchestrates the
+    // Saturday 8pm IST mass dating show end-to-end: formation,
+    // 4-round advancement, mid-show elimination, completion + winners.
+    builder.Services.AddHostedService<ChatVerse.API.Services.PyaarLiveOrchestrator>();
+
     var app = builder.Build();
 
     // ── Middleware pipeline ───────────────────────────────────────
@@ -385,6 +390,20 @@ try
     // Push: CipherRoundStarted (all) / CipherFragmentAssigned (per
     // Member) / CipherRoundClosed (all).
     app.MapHub<ChatVerse.API.Hubs.CipherHub>("/hubs/cipher");
+
+    // Phase 3 hub — PYAAR LIVE: Register / Withdraw / GetMyStatus /
+    // GetActiveShow / GetMyCouple / SendCoupleMessage / GetSpectatorView /
+    // Vote / GetMyHistory. Push: ShowStarted / RoundAdvanced /
+    // CoupleMessage (couple only) / SpectatorMessage (whole show group) /
+    // EliminationAnnounced / ShowEnded.
+    app.MapHub<ChatVerse.API.Hubs.PyaarLiveHub>("/hubs/pyaar-live");
+
+    // Phase 4 hub — MEHFIL (creator platform): Discover / GetRoom /
+    // MyRooms / CreateRoom / CancelRoom / StartRoom / EndRoom /
+    // JoinRoom / LeaveRoom / SendMessage / Tip. Push (per-room
+    // group): RoomStarted / RoomEnded / RoomAudience / RoomMessage /
+    // RoomTip. Host verification + payment settlement are Phase 5.
+    app.MapHub<ChatVerse.API.Hubs.MehfilHub>("/hubs/mehfil");
 
     // ── Startup banner ────────────────────────────────────────────
     // Emit a clear, grep-friendly summary of WHICH hubs got mapped.
