@@ -46,6 +46,14 @@ public partial class MongoService
     private IMongoCollection<GhostDateMessage> GhostDateMessages =>
         _db.GetCollection<GhostDateMessage>(MongoCollections.GhostDateMessages);
 
+    // Love Triangle — weekly Sunday 10pm IST 3-person drama
+    private IMongoCollection<LoveTriangleRegistration> LoveTriangleRegistrations =>
+        _db.GetCollection<LoveTriangleRegistration>(MongoCollections.LoveTriangleRegistrations);
+    private IMongoCollection<LoveTriangle> LoveTriangles =>
+        _db.GetCollection<LoveTriangle>(MongoCollections.LoveTriangles);
+    private IMongoCollection<LoveTrianglePairMessage> LoveTrianglePairMessages =>
+        _db.GetCollection<LoveTrianglePairMessage>(MongoCollections.LoveTrianglePairMessages);
+
     public MongoService(IMongoClient client, string databaseName)
     {
         // Register camelCase convention — matches MongoDB field names (isActive, displayName etc)
@@ -1724,6 +1732,301 @@ public partial class MongoService
         return await GhostDateMessages
             .Find(m => m.DateId == dateId)
             .SortBy(m => m.CreatedAt)
+            .Limit(limit)
+            .ToListAsync();
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  LOVE TRIANGLE — weekly Sunday 10pm IST 3-person drama
+    // ════════════════════════════════════════════════════════════
+
+    public const int LoveTriangleChatDays         = 7;
+    public const int LoveTriangleVotingDays       = 1;
+    public const int LoveTrianglePairMessageMax   = 1000;
+    public static readonly string[] LoveTrianglePairKeys = new[] { "a-b", "b-c", "a-c" };
+
+    // ─── Registration ──────────────────────────────────────────
+
+    public async Task<LoveTriangleRegistration> RegisterForLoveTriangleAsync(
+        string userId, string weekStart)
+    {
+        var filter = Builders<LoveTriangleRegistration>.Filter.And(
+            Builders<LoveTriangleRegistration>.Filter.Eq(r => r.UserId, userId),
+            Builders<LoveTriangleRegistration>.Filter.Eq(r => r.WeekStart, weekStart));
+        var existing = await LoveTriangleRegistrations.Find(filter).FirstOrDefaultAsync();
+        if (existing is not null)
+        {
+            if (existing.Status == "withdrew")
+            {
+                var revive = Builders<LoveTriangleRegistration>.Update
+                    .Set(r => r.Status, "pending")
+                    .Set(r => r.RegisteredAt, DateTime.UtcNow);
+                await LoveTriangleRegistrations.UpdateOneAsync(filter, revive);
+                existing.Status = "pending";
+                existing.RegisteredAt = DateTime.UtcNow;
+            }
+            return existing;
+        }
+
+        var fresh = new LoveTriangleRegistration
+        {
+            UserId       = userId,
+            WeekStart    = weekStart,
+            RegisteredAt = DateTime.UtcNow,
+            Status       = "pending",
+        };
+        await LoveTriangleRegistrations.InsertOneAsync(fresh);
+        return fresh;
+    }
+
+    public async Task<bool> WithdrawFromLoveTriangleAsync(string userId, string weekStart)
+    {
+        var filter = Builders<LoveTriangleRegistration>.Filter.And(
+            Builders<LoveTriangleRegistration>.Filter.Eq(r => r.UserId, userId),
+            Builders<LoveTriangleRegistration>.Filter.Eq(r => r.WeekStart, weekStart),
+            Builders<LoveTriangleRegistration>.Filter.Eq(r => r.Status, "pending"));
+        var update = Builders<LoveTriangleRegistration>.Update.Set(r => r.Status, "withdrew");
+        var result = await LoveTriangleRegistrations.UpdateOneAsync(filter, update);
+        return result.ModifiedCount == 1;
+    }
+
+    public async Task<LoveTriangleRegistration?> GetMyLoveTriangleRegistrationAsync(
+        string userId, string weekStart)
+    {
+        return await LoveTriangleRegistrations.Find(
+            r => r.UserId == userId && r.WeekStart == weekStart
+        ).FirstOrDefaultAsync();
+    }
+
+    public async Task<List<LoveTriangleRegistration>> GetPendingLoveTriangleRegistrationsAsync(
+        string weekStart)
+    {
+        return await LoveTriangleRegistrations.Find(
+            r => r.WeekStart == weekStart && r.Status == "pending"
+        ).ToListAsync();
+    }
+
+    public async Task MarkLoveTriangleRegistrationAssignedAsync(
+        string registrationId, string triangleId, string status)
+    {
+        var filter = Builders<LoveTriangleRegistration>.Filter.Eq(r => r.Id, registrationId);
+        var update = Builders<LoveTriangleRegistration>.Update
+            .Set(r => r.Status,     status)
+            .Set(r => r.TriangleId, triangleId);
+        await LoveTriangleRegistrations.UpdateOneAsync(filter, update);
+    }
+
+    // ─── Triangle CRUD ─────────────────────────────────────────
+
+    public async Task<LoveTriangle> InsertLoveTriangleAsync(LoveTriangle t)
+    {
+        t.CreatedAt = DateTime.UtcNow;
+        await LoveTriangles.InsertOneAsync(t);
+        return t;
+    }
+
+    public async Task<LoveTriangle?> GetLoveTriangleByIdAsync(string id)
+    {
+        return await LoveTriangles.Find(t => t.Id == id).FirstOrDefaultAsync();
+    }
+
+    /// <summary>The user's CURRENTLY-ACTIVE triangle if any
+    /// (status = active or voting).</summary>
+    public async Task<LoveTriangle?> GetMyActiveLoveTriangleAsync(string userId)
+    {
+        var memberFilter = Builders<LoveTriangle>.Filter.Or(
+            Builders<LoveTriangle>.Filter.Eq(t => t.UserAId, userId),
+            Builders<LoveTriangle>.Filter.Eq(t => t.UserBId, userId),
+            Builders<LoveTriangle>.Filter.Eq(t => t.UserCId, userId));
+        var statusFilter = Builders<LoveTriangle>.Filter.In(t => t.Status, new[] { "active", "voting" });
+        return await LoveTriangles
+            .Find(Builders<LoveTriangle>.Filter.And(memberFilter, statusFilter))
+            .SortByDescending(t => t.ScheduledFor)
+            .FirstOrDefaultAsync();
+    }
+
+    public async Task<List<LoveTriangle>> GetTrianglesReadyForVotingAsync()
+    {
+        var now = DateTime.UtcNow;
+        var filter = Builders<LoveTriangle>.Filter.And(
+            Builders<LoveTriangle>.Filter.Eq(t => t.Status, "active"),
+            Builders<LoveTriangle>.Filter.Lte(t => t.ChatEndsAt, now));
+        return await LoveTriangles.Find(filter).ToListAsync();
+    }
+
+    public async Task<List<LoveTriangle>> GetTrianglesReadyForCompletionAsync()
+    {
+        var now = DateTime.UtcNow;
+        var filter = Builders<LoveTriangle>.Filter.And(
+            Builders<LoveTriangle>.Filter.Eq(t => t.Status, "voting"),
+            Builders<LoveTriangle>.Filter.Lte(t => t.VotingEndsAt, now));
+        return await LoveTriangles.Find(filter).ToListAsync();
+    }
+
+    public async Task<bool> OpenLoveTriangleVotingAsync(string triangleId)
+    {
+        var filter = Builders<LoveTriangle>.Filter.And(
+            Builders<LoveTriangle>.Filter.Eq(t => t.Id, triangleId),
+            Builders<LoveTriangle>.Filter.Eq(t => t.Status, "active"));
+        var update = Builders<LoveTriangle>.Update.Set(t => t.Status, "voting");
+        var result = await LoveTriangles.UpdateOneAsync(filter, update);
+        return result.ModifiedCount == 1;
+    }
+
+    public async Task<LoveTriangle?> CompleteLoveTriangleAsync(string triangleId)
+    {
+        var triangle = await GetLoveTriangleByIdAsync(triangleId);
+        if (triangle is null || triangle.Status == "completed") return triangle;
+
+        // Resolve winning pair from current VotesByPair counts.
+        var counts = LoveTrianglePairKeys
+            .ToDictionary(k => k, k => triangle.VotesByPair.TryGetValue(k, out var v) ? v.Count : 0);
+        var max = counts.Values.DefaultIfEmpty(0).Max();
+        var winners = counts.Where(kv => kv.Value == max && max > 0).Select(kv => kv.Key).ToList();
+        var winningPair = winners.Count switch
+        {
+            0 => "no_votes",
+            1 => winners[0],
+            _ => "tie",
+        };
+
+        var filter = Builders<LoveTriangle>.Filter.And(
+            Builders<LoveTriangle>.Filter.Eq(t => t.Id, triangleId),
+            Builders<LoveTriangle>.Filter.Eq(t => t.Status, "voting"));
+        var update = Builders<LoveTriangle>.Update
+            .Set(t => t.Status,      "completed")
+            .Set(t => t.WinningPair, winningPair)
+            .Set(t => t.CompletedAt, DateTime.UtcNow);
+        await LoveTriangles.UpdateOneAsync(filter, update);
+        return await GetLoveTriangleByIdAsync(triangleId);
+    }
+
+    /// <summary>Cast a vote. One vote per non-member viewer; switching
+    /// pairs silently retracts the previous. Members of the triangle
+    /// can't vote (caller guard).</summary>
+    public async Task<LoveTriangle?> VoteOnLoveTriangleAsync(
+        string triangleId, string voterUserId, string pairKey)
+    {
+        if (!LoveTrianglePairKeys.Contains(pairKey)) return null;
+
+        var triangle = await GetLoveTriangleByIdAsync(triangleId);
+        if (triangle is null) return null;
+        if (triangle.Status != "voting") return triangle;
+        // Triangle members can't vote.
+        if (voterUserId == triangle.UserAId
+            || voterUserId == triangle.UserBId
+            || voterUserId == triangle.UserCId)
+            return triangle;
+
+        // Find the voter's current pick (if any) to retract.
+        string? prev = null;
+        foreach (var (k, list) in triangle.VotesByPair)
+        {
+            if (list.Contains(voterUserId)) { prev = k; break; }
+        }
+        if (prev == pairKey) return triangle;       // no-op re-vote same pair
+
+        var updateBuilder = Builders<LoveTriangle>.Update;
+        var updates = new List<UpdateDefinition<LoveTriangle>>();
+        if (prev is not null)
+            updates.Add(updateBuilder.Pull<string>($"votesByPair.{prev}", voterUserId));
+        updates.Add(updateBuilder.AddToSet<string>($"votesByPair.{pairKey}", voterUserId));
+        await LoveTriangles.UpdateOneAsync(
+            Builders<LoveTriangle>.Filter.Eq(t => t.Id, triangleId),
+            updateBuilder.Combine(updates));
+
+        return await GetLoveTriangleByIdAsync(triangleId);
+    }
+
+    public async Task<List<LoveTriangle>> GetPublicLoveTrianglesAsync(int weekOffset = 0)
+    {
+        // Active + voting triangles (both phases of "spectator-ready").
+        // Newest first; cap at 30 to keep payloads tight.
+        var allow = new[] { "active", "voting" };
+        if (weekOffset > 0) allow = new[] { "completed" };
+        var filter = Builders<LoveTriangle>.Filter.In(t => t.Status, allow);
+        return await LoveTriangles
+            .Find(filter)
+            .SortByDescending(t => t.ScheduledFor)
+            .Limit(30)
+            .ToListAsync();
+    }
+
+    public async Task<List<LoveTriangle>> GetMyLoveTriangleHistoryAsync(string userId, int limit = 10)
+    {
+        var filter = Builders<LoveTriangle>.Filter.Or(
+            Builders<LoveTriangle>.Filter.Eq(t => t.UserAId, userId),
+            Builders<LoveTriangle>.Filter.Eq(t => t.UserBId, userId),
+            Builders<LoveTriangle>.Filter.Eq(t => t.UserCId, userId));
+        return await LoveTriangles
+            .Find(filter)
+            .SortByDescending(t => t.ScheduledFor)
+            .Limit(limit)
+            .ToListAsync();
+    }
+
+    // ─── Pair messages ─────────────────────────────────────────
+
+    public async Task<LoveTrianglePairMessage> InsertLoveTrianglePairMessageAsync(
+        LoveTrianglePairMessage m)
+    {
+        m.CreatedAt = DateTime.UtcNow;
+        await LoveTrianglePairMessages.InsertOneAsync(m);
+        return m;
+    }
+
+    public async Task<List<LoveTrianglePairMessage>> GetLoveTrianglePairThreadAsync(
+        string triangleId, string pairKey, int limit = 200)
+    {
+        return await LoveTrianglePairMessages
+            .Find(m => m.TriangleId == triangleId && m.PairKey == pairKey)
+            .SortBy(m => m.CreatedAt)
+            .Limit(limit)
+            .ToListAsync();
+    }
+
+    public async Task<LoveTrianglePairMessage?> ToggleLoveTriangleExcerptAsync(
+        string messageId, string callerUserId)
+    {
+        var msg = await LoveTrianglePairMessages
+            .Find(m => m.Id == messageId)
+            .FirstOrDefaultAsync();
+        if (msg is null) return null;
+
+        // Only the author OR the person who previously shared it can toggle.
+        bool currentlyShared = msg.IsShared;
+        bool callerCanToggle = msg.SenderUserId == callerUserId
+            || msg.SharedByUserId == callerUserId;
+        if (currentlyShared && !callerCanToggle) return msg;
+
+        var filter = Builders<LoveTrianglePairMessage>.Filter.Eq(m => m.Id, messageId);
+        UpdateDefinition<LoveTrianglePairMessage> update;
+        if (currentlyShared)
+        {
+            update = Builders<LoveTrianglePairMessage>.Update
+                .Set(m => m.IsShared, false)
+                .Set(m => m.SharedByUserId, (string?)null)
+                .Set(m => m.SharedAt, (DateTime?)null);
+        }
+        else
+        {
+            update = Builders<LoveTrianglePairMessage>.Update
+                .Set(m => m.IsShared, true)
+                .Set(m => m.SharedByUserId, callerUserId)
+                .Set(m => m.SharedAt, DateTime.UtcNow);
+        }
+        await LoveTrianglePairMessages.UpdateOneAsync(filter, update);
+        return await LoveTrianglePairMessages.Find(m => m.Id == messageId).FirstOrDefaultAsync();
+    }
+
+    /// <summary>Public excerpts across all pairs in a triangle, newest
+    /// first. Used by the audience feed view.</summary>
+    public async Task<List<LoveTrianglePairMessage>> GetLoveTrianglePublicExcerptsAsync(
+        string triangleId, int limit = 50)
+    {
+        return await LoveTrianglePairMessages
+            .Find(m => m.TriangleId == triangleId && m.IsShared)
+            .SortByDescending(m => m.SharedAt)
             .Limit(limit)
             .ToListAsync();
     }

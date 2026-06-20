@@ -587,6 +587,113 @@ public class TimeCapsule
 // ============================================================
 
 // ============================================================
+//  Love Triangle — Phase 2 weekly 3-person drama.
+//
+//  Sunday 10pm IST cadence. The LoveTriangleService picks the
+//  pending pool, shuffles into trios. Each trio has THREE pair-
+//  threads (A↔B, B↔C, A↔C) open for 7 days. Either participant
+//  in a pair-thread can mark a message as "share" — that publishes
+//  it as an anonymous excerpt on the public Triangle feed where
+//  the wider audience can watch the drama unfold.
+//
+//  At day-7: chat closes, voting opens for 24 hours. Audience
+//  votes for one of three pairs (a-b / b-c / a-c). At day-8:
+//  voting closes, winning pair declared, triangle archived.
+//
+//  Privacy levels:
+//    • Inside a pair-thread → both members see each other's
+//      real usernames (this is a relationship-building exercise,
+//      not anonymous).
+//    • Public excerpt feed → triangle members surface as
+//      "Member A/B/C" with abstract names; the pair-label
+//      becomes "A↔B" / "B↔C" / "A↔C".
+//    • Voting is one ballot per non-member viewer.
+// ============================================================
+
+public class LoveTriangleRegistration
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string UserId { get; set; } = default!;
+
+    /// <summary>YYYY-MM-DD of the target Sunday. One row per
+    /// (user, week) — unique.</summary>
+    public string WeekStart { get; set; } = default!;
+
+    public DateTime RegisteredAt { get; set; }
+
+    /// <summary>"pending" → "matched" / "no_match" / "withdrew".</summary>
+    public string Status { get; set; } = "pending";
+
+    public string? TriangleId { get; set; }
+}
+
+public class LoveTriangle
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string UserAId { get; set; } = default!;
+    public string UserBId { get; set; } = default!;
+    public string UserCId { get; set; } = default!;
+
+    public string UserAUsername { get; set; } = default!;
+    public string UserBUsername { get; set; } = default!;
+    public string UserCUsername { get; set; } = default!;
+
+    public string WeekStart { get; set; } = default!;
+    public DateTime ScheduledFor { get; set; }            // Sunday 10pm IST in UTC
+    public DateTime ChatEndsAt   { get; set; }            // + 7 days
+    public DateTime VotingEndsAt { get; set; }            // + 8 days
+
+    /// <summary>"active" (chat phase) → "voting" → "completed".</summary>
+    public string Status { get; set; } = "active";
+
+    /// <summary>Pair key (a-b / b-c / a-c) → list of distinct voter
+    /// user IDs. One vote per viewer; switching pairs silently
+    /// retracts their previous vote.</summary>
+    public Dictionary<string, List<string>> VotesByPair { get; set; } = new();
+
+    /// <summary>Set when voting closes. "tie" if multiple pairs
+    /// share the top count.</summary>
+    public string? WinningPair { get; set; }
+    public DateTime? CompletedAt { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+}
+
+public class LoveTrianglePairMessage
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string TriangleId { get; set; } = default!;
+
+    /// <summary>"a-b" / "b-c" / "a-c". Member letters are
+    /// canonically alphabetical — frontend uses the same convention.</summary>
+    public string PairKey { get; set; } = default!;
+
+    public string SenderUserId   { get; set; } = default!;
+    public string SenderUsername { get; set; } = default!;
+    public string Content        { get; set; } = default!;
+
+    /// <summary>True when SOMEONE in the pair tapped "share excerpt"
+    /// — exposes this line on the public triangle feed (anonymised).</summary>
+    public bool IsShared { get; set; }
+
+    /// <summary>Who toggled the share — kept so toggling back off
+    /// is restricted to the same person who shared it.</summary>
+    public string? SharedByUserId { get; set; }
+    public DateTime? SharedAt { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+}
+
+// ============================================================
 //  Ghost Date — Phase 2 weekly anonymous dating.
 //
 //  Thursday 9pm IST cadence (per VISION). Users opt-in any time
