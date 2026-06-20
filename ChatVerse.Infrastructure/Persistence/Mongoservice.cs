@@ -35,6 +35,9 @@ public partial class MongoService
     // Story Chain — daily collaborative writing
     private IMongoCollection<StoryChain> StoryChains => _db.GetCollection<StoryChain>(MongoCollections.StoryChains);
 
+    // Confession Box — anonymous daily confessions
+    private IMongoCollection<Confession> Confessions => _db.GetCollection<Confession>(MongoCollections.Confessions);
+
     public MongoService(IMongoClient client, string databaseName)
     {
         // Register camelCase convention — matches MongoDB field names (isActive, displayName etc)
@@ -1252,6 +1255,185 @@ public partial class MongoService
         return await StoryChains
             .Find(c => c.Status == "published")
             .SortByDescending(c => c.PublishedAt)
+            .Limit(limit)
+            .ToListAsync();
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  CONFESSION BOX — anonymous daily reveals
+    // ════════════════════════════════════════════════════════════
+
+    public const int ConfessionMaxChars = 500;
+    public const int ConfessionTtlDays  = 30;
+    public static readonly string[] ConfessionAllowedEmojis = new[]
+    {
+        "🔥",   // fire — relatable / hit
+        "😭",   // crying — felt this
+        "🫂",   // hug — sending love
+        "💀",   // skull — dark relatable humour
+        "👀",   // eyes — saw something
+        "🙏",   // pray — solidarity
+    };
+
+    public async Task<Confession> InsertConfessionAsync(Confession c)
+    {
+        c.CreatedAt = DateTime.UtcNow;
+        c.ExpiresAt = c.CreatedAt.AddDays(ConfessionTtlDays);
+        await Confessions.InsertOneAsync(c);
+        return c;
+    }
+
+    /// <summary>Paginated feed for a given UTC date. Sorted newest
+    /// first within the day so freshly-posted confessions surface.</summary>
+    public async Task<List<Confession>> GetConfessionsForDateAsync(
+        string dateUtc, int skip = 0, int limit = 20)
+    {
+        return await Confessions
+            .Find(c => c.Date == dateUtc)
+            .SortByDescending(c => c.CreatedAt)
+            .Skip(skip)
+            .Limit(limit)
+            .ToListAsync();
+    }
+
+    public async Task<Confession?> GetConfessionByIdAsync(string id)
+    {
+        return await Confessions.Find(c => c.Id == id).FirstOrDefaultAsync();
+    }
+
+    /// <summary>Toggle a user's reaction on a confession. ONE emoji
+    /// per user per confession — switching emojis silently swaps.
+    /// Re-tapping the same emoji removes the reaction. Returns the
+    /// fresh confession state.
+    ///
+    /// Renamed from ToggleReactionAsync to avoid a CS0111 clash with
+    /// the existing message-reaction toggler (same (string, string,
+    /// string) signature). Note also that we use STRING field paths
+    /// (e.g. "reactions.🔥") for the AddToSet/Pull calls — the C#
+    /// driver's expression visitor can't translate `c.Reactions[emoji]`
+    /// because dictionary indexer access isn't a supported node.</summary>
+    public async Task<Confession?> ToggleConfessionReactionAsync(
+        string confessionId, string userId, string emoji)
+    {
+        if (!ConfessionAllowedEmojis.Contains(emoji)) return null;
+
+        var confession = await GetConfessionByIdAsync(confessionId);
+        if (confession is null) return null;
+
+        // Figure out what the user currently has.
+        string? currentEmoji = null;
+        foreach (var (e, users) in confession.Reactions)
+        {
+            if (users.Contains(userId)) { currentEmoji = e; break; }
+        }
+
+        // Three cases:
+        //   (a) user has no reaction yet     → add to `emoji`
+        //   (b) user already has THIS emoji  → remove
+        //   (c) user has a DIFFERENT emoji   → remove old, add new
+        var updateBuilder = Builders<Confession>.Update;
+        var updates = new List<UpdateDefinition<Confession>>();
+        int delta = 0;
+
+        // CamelCase convention is registered on the client, so the
+        // server-side field is "reactions". Emoji keys nested under it.
+        string PathFor(string e) => $"reactions.{e}";
+
+        if (currentEmoji is null)
+        {
+            updates.Add(updateBuilder.AddToSet<string>(PathFor(emoji), userId));
+            delta = 1;
+        }
+        else if (currentEmoji == emoji)
+        {
+            updates.Add(updateBuilder.Pull<string>(PathFor(emoji), userId));
+            delta = -1;
+        }
+        else
+        {
+            updates.Add(updateBuilder.Pull<string>(PathFor(currentEmoji), userId));
+            updates.Add(updateBuilder.AddToSet<string>(PathFor(emoji), userId));
+            delta = 0;  // net distinct reactors unchanged
+        }
+
+        if (delta != 0)
+            updates.Add(updateBuilder.Inc(c => c.TotalReactions, delta));
+
+        var combined = updateBuilder.Combine(updates);
+        var filter = Builders<Confession>.Filter.Eq(c => c.Id, confessionId);
+
+        await Confessions.UpdateOneAsync(filter, combined);
+        return await GetConfessionByIdAsync(confessionId);
+    }
+
+    /// <summary>Top confession of a given UTC date by total reactions.
+    /// Tiebreaker = earlier-posted wins (rewards conviction).</summary>
+    public async Task<Confession?> GetTopForDateAsync(string dateUtc)
+    {
+        return await Confessions
+            .Find(c => c.Date == dateUtc && c.TotalReactions > 0)
+            .SortByDescending(c => c.TotalReactions)
+            .ThenBy(c => c.CreatedAt)
+            .Limit(1)
+            .FirstOrDefaultAsync();
+    }
+
+    public async Task<bool> MarkTopRankedAsync(string confessionId)
+    {
+        var filter = Builders<Confession>.Filter.And(
+            Builders<Confession>.Filter.Eq(c => c.Id, confessionId),
+            Builders<Confession>.Filter.Eq(c => c.TopRankedAt, (DateTime?)null));
+        var update = Builders<Confession>.Update.Set(c => c.TopRankedAt, DateTime.UtcNow);
+        var result = await Confessions.UpdateOneAsync(filter, update);
+        return result.ModifiedCount == 1;
+    }
+
+    /// <summary>Lock the author's reveal decision. Idempotent — once
+    /// set (true OR false) it doesn't change.</summary>
+    public async Task<bool> SetAuthorRevealDecisionAsync(
+        string confessionId, string authorUserId, bool accept)
+    {
+        var filter = Builders<Confession>.Filter.And(
+            Builders<Confession>.Filter.Eq(c => c.Id, confessionId),
+            Builders<Confession>.Filter.Eq(c => c.AuthorUserId, authorUserId),
+            Builders<Confession>.Filter.Eq(c => c.AuthorOptedReveal, (bool?)null));
+        var update = Builders<Confession>.Update
+            .Set(c => c.AuthorOptedReveal, accept);
+        if (accept)
+            update = update.Set(c => c.RevealedAt, DateTime.UtcNow);
+        var result = await Confessions.UpdateOneAsync(filter, update);
+        return result.ModifiedCount == 1;
+    }
+
+    /// <summary>Returns the caller's UN-decided top-ranked confession,
+    /// if any — used by GetMyTopOffer on the hub.</summary>
+    public async Task<Confession?> GetUndecidedTopOfferForAuthorAsync(string authorUserId)
+    {
+        var filter = Builders<Confession>.Filter.And(
+            Builders<Confession>.Filter.Eq(c => c.AuthorUserId, authorUserId),
+            Builders<Confession>.Filter.Ne(c => c.TopRankedAt, (DateTime?)null),
+            Builders<Confession>.Filter.Eq(c => c.AuthorOptedReveal, (bool?)null));
+        return await Confessions
+            .Find(filter)
+            .SortByDescending(c => c.TopRankedAt)
+            .Limit(1)
+            .FirstOrDefaultAsync();
+    }
+
+    /// <summary>Lore Wall — top 5 top-ranked confessions in a given
+    /// week (sundayStart inclusive, +7 days exclusive).</summary>
+    public async Task<List<Confession>> GetLoreWallAsync(
+        DateTime weekStart, int limit = 5)
+    {
+        var weekEnd = weekStart.AddDays(7);
+        var filter = Builders<Confession>.Filter.And(
+            Builders<Confession>.Filter.Ne(c => c.TopRankedAt, (DateTime?)null),
+            Builders<Confession>.Filter.Gte(c => c.CreatedAt, weekStart),
+            Builders<Confession>.Filter.Lt(c => c.CreatedAt,  weekEnd));
+        return await Confessions
+            .Find(filter)
+            .SortByDescending(c => c.TotalReactions)
+            .ThenBy(c => c.CreatedAt)
             .Limit(limit)
             .ToListAsync();
     }

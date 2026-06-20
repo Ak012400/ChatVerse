@@ -292,6 +292,11 @@ try
     // chain whose IST date is in the past". Idempotent.
     builder.Services.AddHostedService<ChatVerse.API.Services.StoryChainService>();
 
+    // Confession Box (Phase 2 daily drama) — 30-min tick crowns the
+    // previous UTC day's top confession + fires a reveal offer to
+    // its author. Idempotent per UTC date.
+    builder.Services.AddHostedService<ChatVerse.API.Services.ConfessionRankingService>();
+
     var app = builder.Build();
 
     // ── Middleware pipeline ───────────────────────────────────────
@@ -340,6 +345,12 @@ try
     // LeaveQueue / AddSentence / GetArchive. Turn queue lives in
     // Redis; push events fan out via SignalR groups.
     app.MapHub<ChatVerse.API.Hubs.StoryChainHub>("/hubs/story-chain");
+
+    // Phase 2 hub — Confession Box: Post / GetTodaysFeed / React /
+    // GetMyTopOffer / Accept|DeclineReveal / GetLoreWall. Push:
+    // ConfessionPosted / ReactionUpdated / ConfessionRevealed /
+    // TopConfessionOffered.
+    app.MapHub<ChatVerse.API.Hubs.ConfessionHub>("/hubs/confessions");
 
     // ── Startup banner ────────────────────────────────────────────
     // Emit a clear, grep-friendly summary of WHICH hubs got mapped.
