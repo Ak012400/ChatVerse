@@ -227,6 +227,32 @@ public static class MongoCollections
     public const string CipherMembers     = "cipher_members";
     /// <summary>Hunter submissions per round.</summary>
     public const string CipherSubmissions = "cipher_submissions";
+
+    // ── PYAAR LIVE ─────────────────────────────────────────────
+    /// <summary>Weekly opt-in pool for Saturday 8pm IST shows.</summary>
+    public const string PyaarRegistrations = "pyaar_registrations";
+    /// <summary>Per-Saturday show with round state + winners.</summary>
+    public const string PyaarShows         = "pyaar_shows";
+    /// <summary>Paired couples for a show with vote tally + rank.</summary>
+    public const string PyaarCouples       = "pyaar_couples";
+    /// <summary>Per-couple chat thread for the duration of the show.</summary>
+    public const string PyaarMessages      = "pyaar_messages";
+    /// <summary>Spectator votes; one row per (show, voter) — last
+    /// write wins, the cached PyaarCouple.VoteCount is the source
+    /// of truth for ranking.</summary>
+    public const string PyaarVotes         = "pyaar_votes";
+
+    // ── MEHFIL ─────────────────────────────────────────────────
+    /// <summary>Host-created rooms with template + lifecycle.</summary>
+    public const string MehfilRooms       = "mehfil_rooms";
+    /// <summary>Per-attendance row — used for unique attendee count
+    /// and time-spent analytics.</summary>
+    public const string MehfilAttendances = "mehfil_attendances";
+    /// <summary>In-room chat thread.</summary>
+    public const string MehfilMessages    = "mehfil_messages";
+    /// <summary>Audience tips (MVP records intent only — settlement
+    /// in Phase 5 token economy).</summary>
+    public const string MehfilTips        = "mehfil_tips";
 }
 
 public static class Theater

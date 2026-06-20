@@ -59,6 +59,19 @@ public partial class MongoService
     private IMongoCollection<CipherMember>     CipherMembers     => _db.GetCollection<CipherMember>(MongoCollections.CipherMembers);
     private IMongoCollection<CipherSubmission> CipherSubmissions => _db.GetCollection<CipherSubmission>(MongoCollections.CipherSubmissions);
 
+    // PYAAR LIVE — flagship Saturday mass dating show
+    private IMongoCollection<PyaarRegistration> PyaarRegistrations => _db.GetCollection<PyaarRegistration>(MongoCollections.PyaarRegistrations);
+    private IMongoCollection<PyaarShow>         PyaarShows         => _db.GetCollection<PyaarShow>(MongoCollections.PyaarShows);
+    private IMongoCollection<PyaarCouple>       PyaarCouples       => _db.GetCollection<PyaarCouple>(MongoCollections.PyaarCouples);
+    private IMongoCollection<PyaarMessage>      PyaarMessages      => _db.GetCollection<PyaarMessage>(MongoCollections.PyaarMessages);
+    private IMongoCollection<PyaarVote>         PyaarVotes         => _db.GetCollection<PyaarVote>(MongoCollections.PyaarVotes);
+
+    // MEHFIL — creator-room platform
+    private IMongoCollection<MehfilRoom>       MehfilRooms       => _db.GetCollection<MehfilRoom>(MongoCollections.MehfilRooms);
+    private IMongoCollection<MehfilAttendance> MehfilAttendances => _db.GetCollection<MehfilAttendance>(MongoCollections.MehfilAttendances);
+    private IMongoCollection<MehfilMessage>    MehfilMessages    => _db.GetCollection<MehfilMessage>(MongoCollections.MehfilMessages);
+    private IMongoCollection<MehfilTip>        MehfilTips        => _db.GetCollection<MehfilTip>(MongoCollections.MehfilTips);
+
     public MongoService(IMongoClient client, string databaseName)
     {
         // Register camelCase convention — matches MongoDB field names (isActive, displayName etc)
@@ -2175,6 +2188,431 @@ public partial class MongoService
             .Limit(limit)
             .ToListAsync();
     }
+
+    // ════════════════════════════════════════════════════════════
+    //  PYAAR LIVE — flagship Saturday mass dating show
+    // ════════════════════════════════════════════════════════════
+
+    public const int PyaarCoupleCount        = 10;
+    public const int PyaarMessageMaxChars    = 1000;
+    public const int PyaarEliminationCount   = 3;
+    public const int PyaarWinnerCount        = 3;
+
+    // ─── Registration ──────────────────────────────────────────
+
+    public async Task<PyaarRegistration> RegisterForPyaarLiveAsync(string userId, string eventDate)
+    {
+        var filter = Builders<PyaarRegistration>.Filter.And(
+            Builders<PyaarRegistration>.Filter.Eq(r => r.UserId, userId),
+            Builders<PyaarRegistration>.Filter.Eq(r => r.EventDate, eventDate));
+        var existing = await PyaarRegistrations.Find(filter).FirstOrDefaultAsync();
+        if (existing is not null)
+        {
+            if (existing.Status == "withdrew")
+            {
+                await PyaarRegistrations.UpdateOneAsync(filter,
+                    Builders<PyaarRegistration>.Update
+                        .Set(r => r.Status, "pending")
+                        .Set(r => r.RegisteredAt, DateTime.UtcNow));
+                existing.Status = "pending";
+                existing.RegisteredAt = DateTime.UtcNow;
+            }
+            return existing;
+        }
+        var fresh = new PyaarRegistration
+        {
+            UserId       = userId,
+            EventDate    = eventDate,
+            RegisteredAt = DateTime.UtcNow,
+            Status       = "pending",
+        };
+        await PyaarRegistrations.InsertOneAsync(fresh);
+        return fresh;
+    }
+
+    public async Task<bool> WithdrawFromPyaarLiveAsync(string userId, string eventDate)
+    {
+        var filter = Builders<PyaarRegistration>.Filter.And(
+            Builders<PyaarRegistration>.Filter.Eq(r => r.UserId, userId),
+            Builders<PyaarRegistration>.Filter.Eq(r => r.EventDate, eventDate),
+            Builders<PyaarRegistration>.Filter.Eq(r => r.Status, "pending"));
+        var result = await PyaarRegistrations.UpdateOneAsync(filter,
+            Builders<PyaarRegistration>.Update.Set(r => r.Status, "withdrew"));
+        return result.ModifiedCount == 1;
+    }
+
+    public async Task<PyaarRegistration?> GetMyPyaarRegistrationAsync(string userId, string eventDate) =>
+        await PyaarRegistrations
+            .Find(r => r.UserId == userId && r.EventDate == eventDate)
+            .FirstOrDefaultAsync();
+
+    public async Task<List<PyaarRegistration>> GetPendingPyaarRegistrationsAsync(string eventDate) =>
+        await PyaarRegistrations
+            .Find(r => r.EventDate == eventDate && r.Status == "pending")
+            .ToListAsync();
+
+    public async Task UpdatePyaarRegistrationStatusAsync(string id, string status, string? showId, string? coupleId)
+    {
+        var update = Builders<PyaarRegistration>.Update
+            .Set(r => r.Status, status)
+            .Set(r => r.ShowId, showId)
+            .Set(r => r.CoupleId, coupleId);
+        await PyaarRegistrations.UpdateOneAsync(
+            Builders<PyaarRegistration>.Filter.Eq(r => r.Id, id), update);
+    }
+
+    // ─── Shows ─────────────────────────────────────────────────
+
+    public async Task<PyaarShow> InsertPyaarShowAsync(PyaarShow s)
+    {
+        s.CreatedAt = DateTime.UtcNow;
+        await PyaarShows.InsertOneAsync(s);
+        return s;
+    }
+
+    public async Task<PyaarShow?> GetPyaarShowByIdAsync(string id) =>
+        await PyaarShows.Find(s => s.Id == id).FirstOrDefaultAsync();
+
+    public async Task<PyaarShow?> GetActivePyaarShowAsync() =>
+        await PyaarShows
+            .Find(s => s.Status == "live")
+            .SortByDescending(s => s.ScheduledFor)
+            .FirstOrDefaultAsync();
+
+    public async Task<List<PyaarShow>> GetPyaarShowsNeedingAdvanceAsync()
+    {
+        var now = DateTime.UtcNow;
+        return await PyaarShows.Find(
+            s => s.Status == "live"
+              && s.CurrentRoundEndsAt != null
+              && s.CurrentRoundEndsAt <= now).ToListAsync();
+    }
+
+    public async Task UpdatePyaarShowRoundAsync(
+        string showId, int round, string label, DateTime? endsAt, string status)
+    {
+        var update = Builders<PyaarShow>.Update
+            .Set(s => s.CurrentRound, round)
+            .Set(s => s.CurrentRoundLabel, label)
+            .Set(s => s.CurrentRoundEndsAt, endsAt)
+            .Set(s => s.Status, status);
+        if (status == "live" && round == 1)
+            update = update.Set(s => s.StartedAt, DateTime.UtcNow);
+        if (status == "completed")
+            update = update.Set(s => s.EndedAt, DateTime.UtcNow);
+        await PyaarShows.UpdateOneAsync(
+            Builders<PyaarShow>.Filter.Eq(s => s.Id, showId), update);
+    }
+
+    public async Task SetPyaarShowEliminationAsync(string showId, List<string> eliminatedCoupleIds)
+    {
+        await PyaarShows.UpdateOneAsync(
+            Builders<PyaarShow>.Filter.Eq(s => s.Id, showId),
+            Builders<PyaarShow>.Update.Set(s => s.EliminatedCoupleIds, eliminatedCoupleIds));
+    }
+
+    public async Task SetPyaarShowWinnersAsync(string showId, List<string> winnerIdsOrdered)
+    {
+        await PyaarShows.UpdateOneAsync(
+            Builders<PyaarShow>.Filter.Eq(s => s.Id, showId),
+            Builders<PyaarShow>.Update.Set(s => s.WinningCoupleIds, winnerIdsOrdered));
+    }
+
+    public async Task<List<PyaarShow>> GetCompletedPyaarShowsAsync(int limit = 10) =>
+        await PyaarShows
+            .Find(s => s.Status == "completed")
+            .SortByDescending(s => s.EndedAt)
+            .Limit(limit)
+            .ToListAsync();
+
+    // ─── Couples ───────────────────────────────────────────────
+
+    public async Task InsertPyaarCouplesAsync(IEnumerable<PyaarCouple> couples)
+    {
+        var list = couples.ToList();
+        foreach (var c in list) c.CreatedAt = DateTime.UtcNow;
+        if (list.Count > 0) await PyaarCouples.InsertManyAsync(list);
+    }
+
+    public async Task<List<PyaarCouple>> GetCouplesForShowAsync(string showId) =>
+        await PyaarCouples.Find(c => c.ShowId == showId).SortBy(c => c.CoupleNumber).ToListAsync();
+
+    public async Task<PyaarCouple?> GetCoupleByIdAsync(string id) =>
+        await PyaarCouples.Find(c => c.Id == id).FirstOrDefaultAsync();
+
+    public async Task<PyaarCouple?> GetMyCoupleAsync(string showId, string userId)
+    {
+        var filter = Builders<PyaarCouple>.Filter.And(
+            Builders<PyaarCouple>.Filter.Eq(c => c.ShowId, showId),
+            Builders<PyaarCouple>.Filter.Or(
+                Builders<PyaarCouple>.Filter.Eq(c => c.UserAId, userId),
+                Builders<PyaarCouple>.Filter.Eq(c => c.UserBId, userId)));
+        return await PyaarCouples.Find(filter).FirstOrDefaultAsync();
+    }
+
+    public async Task EliminatePyaarCouplesAsync(IEnumerable<string> coupleIds, int round)
+    {
+        var ids = coupleIds.ToList();
+        if (ids.Count == 0) return;
+        var filter = Builders<PyaarCouple>.Filter.In(c => c.Id, ids);
+        var update = Builders<PyaarCouple>.Update
+            .Set(c => c.EliminatedAt, DateTime.UtcNow)
+            .Set(c => c.EliminatedInRound, round);
+        await PyaarCouples.UpdateManyAsync(filter, update);
+    }
+
+    public async Task SetPyaarCoupleRanksAsync(IEnumerable<(string Id, int Rank)> ranked)
+    {
+        foreach (var (id, rank) in ranked)
+        {
+            await PyaarCouples.UpdateOneAsync(
+                Builders<PyaarCouple>.Filter.Eq(c => c.Id, id),
+                Builders<PyaarCouple>.Update.Set(c => c.FinalRank, rank));
+        }
+    }
+
+    // ─── Messages ──────────────────────────────────────────────
+
+    public async Task<PyaarMessage> InsertPyaarMessageAsync(PyaarMessage m)
+    {
+        m.CreatedAt = DateTime.UtcNow;
+        await PyaarMessages.InsertOneAsync(m);
+        return m;
+    }
+
+    public async Task<List<PyaarMessage>> GetPyaarCoupleThreadAsync(string coupleId, int limit = 200) =>
+        await PyaarMessages
+            .Find(m => m.CoupleId == coupleId)
+            .SortBy(m => m.CreatedAt)
+            .Limit(limit)
+            .ToListAsync();
+
+    /// <summary>Last N messages PER couple in a show — used for the
+    /// spectator grid. Returns a flat list; client groups by couple.</summary>
+    public async Task<List<PyaarMessage>> GetPyaarShowRecentMessagesAsync(string showId, int perCoupleLimit = 5)
+    {
+        // Simple approach: pull all then trim client-side.
+        // Show only spans 2 hours / 10 couples so volume is small.
+        var msgs = await PyaarMessages
+            .Find(m => m.ShowId == showId)
+            .SortByDescending(m => m.CreatedAt)
+            .Limit(perCoupleLimit * PyaarCoupleCount * 4)
+            .ToListAsync();
+        // Group + trim to last N per couple, preserve chronological.
+        return msgs
+            .GroupBy(m => m.CoupleId)
+            .SelectMany(g => g.OrderByDescending(m => m.CreatedAt).Take(perCoupleLimit))
+            .OrderBy(m => m.CreatedAt)
+            .ToList();
+    }
+
+    // ─── Votes ─────────────────────────────────────────────────
+
+    /// <summary>One vote per voter per show, last-write-wins. Switching
+    /// couples retracts the previous vote (decrements VoteCount on the
+    /// old couple, increments on the new). Voters who are themselves
+    /// in a couple of this show are blocked at the hub layer.</summary>
+    public async Task<PyaarVote?> CastPyaarVoteAsync(string showId, string voterUserId, string coupleId)
+    {
+        // Find caller's existing vote on this show, if any.
+        var prev = await PyaarVotes.Find(
+            v => v.ShowId == showId && v.VoterUserId == voterUserId
+        ).FirstOrDefaultAsync();
+
+        if (prev is not null && prev.CoupleId == coupleId)
+            return prev;  // no-op same vote
+
+        if (prev is not null)
+        {
+            // Decrement old couple, delete old vote row.
+            await PyaarCouples.UpdateOneAsync(
+                Builders<PyaarCouple>.Filter.Eq(c => c.Id, prev.CoupleId),
+                Builders<PyaarCouple>.Update.Inc(c => c.VoteCount, -1));
+            await PyaarVotes.DeleteOneAsync(v => v.Id == prev.Id);
+        }
+
+        var fresh = new PyaarVote
+        {
+            ShowId       = showId,
+            CoupleId     = coupleId,
+            VoterUserId  = voterUserId,
+            Weight       = 1,
+            CreatedAt    = DateTime.UtcNow,
+        };
+        await PyaarVotes.InsertOneAsync(fresh);
+        await PyaarCouples.UpdateOneAsync(
+            Builders<PyaarCouple>.Filter.Eq(c => c.Id, coupleId),
+            Builders<PyaarCouple>.Update.Inc(c => c.VoteCount, 1));
+        return fresh;
+    }
+
+    public async Task<PyaarVote?> GetMyPyaarVoteAsync(string showId, string voterUserId) =>
+        await PyaarVotes.Find(v => v.ShowId == showId && v.VoterUserId == voterUserId).FirstOrDefaultAsync();
+
+    // ════════════════════════════════════════════════════════════
+    //  MEHFIL — creator-room platform
+    // ════════════════════════════════════════════════════════════
+
+    public const int MehfilMessageMaxChars = 1000;
+    public const int MehfilTitleMaxChars   = 120;
+    public static readonly string[] MehfilTemplates = new[]
+    {
+        "dating_show", "open_mic", "debate", "watch_party", "game_night",
+        "podcast", "story_circle", "trivia", "talent_show", "networking", "custom",
+    };
+    public static readonly Dictionary<string, int> MehfilGifts = new()
+    {
+        ["rose"]    = 10,
+        ["bouquet"] = 50,
+        ["crown"]   = 500,
+    };
+
+    // ─── Rooms ─────────────────────────────────────────────────
+
+    public async Task<MehfilRoom> InsertMehfilRoomAsync(MehfilRoom r)
+    {
+        r.CreatedAt = DateTime.UtcNow;
+        await MehfilRooms.InsertOneAsync(r);
+        return r;
+    }
+
+    public async Task<MehfilRoom?> GetMehfilRoomByIdAsync(string id) =>
+        await MehfilRooms.Find(r => r.Id == id).FirstOrDefaultAsync();
+
+    public async Task<List<MehfilRoom>> GetLiveMehfilRoomsAsync(int limit = 30) =>
+        await MehfilRooms
+            .Find(r => r.Status == "live")
+            .SortByDescending(r => r.CurrentAudienceCount)
+            .Limit(limit)
+            .ToListAsync();
+
+    public async Task<List<MehfilRoom>> GetUpcomingMehfilRoomsAsync(int limit = 30)
+    {
+        var now = DateTime.UtcNow;
+        return await MehfilRooms
+            .Find(r => r.Status == "scheduled" && r.ScheduledFor >= now)
+            .SortBy(r => r.ScheduledFor)
+            .Limit(limit)
+            .ToListAsync();
+    }
+
+    public async Task<List<MehfilRoom>> GetMehfilRoomsByTemplateAsync(string template, int limit = 30) =>
+        await MehfilRooms
+            .Find(r => r.TemplateKind == template && r.Status != "ended" && r.Status != "cancelled")
+            .SortByDescending(r => r.Status == "live" ? 1 : 0)
+            .ThenBy(r => r.ScheduledFor)
+            .Limit(limit)
+            .ToListAsync();
+
+    public async Task<List<MehfilRoom>> GetMyHostedMehfilRoomsAsync(string hostUserId, int limit = 20) =>
+        await MehfilRooms
+            .Find(r => r.HostUserId == hostUserId)
+            .SortByDescending(r => r.CreatedAt)
+            .Limit(limit)
+            .ToListAsync();
+
+    public async Task UpdateMehfilRoomStatusAsync(string roomId, string status, bool setStartedAt = false, bool setEndedAt = false)
+    {
+        var update = Builders<MehfilRoom>.Update.Set(r => r.Status, status);
+        if (setStartedAt) update = update.Set(r => r.StartedAt, DateTime.UtcNow);
+        if (setEndedAt)   update = update.Set(r => r.EndedAt,   DateTime.UtcNow);
+        await MehfilRooms.UpdateOneAsync(Builders<MehfilRoom>.Filter.Eq(r => r.Id, roomId), update);
+    }
+
+    // ─── Attendance ────────────────────────────────────────────
+
+    /// <summary>Idempotent join — if the user already has an open
+    /// attendance row (LeftAt null) for this room, returns it. Else
+    /// inserts and increments the cached audience count.</summary>
+    public async Task<MehfilAttendance> JoinMehfilRoomAsync(string roomId, string userId, string username)
+    {
+        var existing = await MehfilAttendances.Find(
+            a => a.RoomId == roomId && a.UserId == userId && a.LeftAt == null
+        ).FirstOrDefaultAsync();
+        if (existing is not null) return existing;
+
+        var fresh = new MehfilAttendance
+        {
+            RoomId   = roomId,
+            UserId   = userId,
+            Username = username,
+            JoinedAt = DateTime.UtcNow,
+        };
+        await MehfilAttendances.InsertOneAsync(fresh);
+        await MehfilRooms.UpdateOneAsync(
+            Builders<MehfilRoom>.Filter.Eq(r => r.Id, roomId),
+            Builders<MehfilRoom>.Update
+                .Inc(r => r.CurrentAudienceCount, 1)
+                .Inc(r => r.TotalAttendeesCount,  1));
+        return fresh;
+    }
+
+    public async Task<bool> LeaveMehfilRoomAsync(string roomId, string userId)
+    {
+        var filter = Builders<MehfilAttendance>.Filter.And(
+            Builders<MehfilAttendance>.Filter.Eq(a => a.RoomId, roomId),
+            Builders<MehfilAttendance>.Filter.Eq(a => a.UserId, userId),
+            Builders<MehfilAttendance>.Filter.Eq(a => a.LeftAt, (DateTime?)null));
+        var update = Builders<MehfilAttendance>.Update.Set(a => a.LeftAt, DateTime.UtcNow);
+        var result = await MehfilAttendances.UpdateOneAsync(filter, update);
+        if (result.ModifiedCount == 1)
+        {
+            await MehfilRooms.UpdateOneAsync(
+                Builders<MehfilRoom>.Filter.Eq(r => r.Id, roomId),
+                Builders<MehfilRoom>.Update.Inc(r => r.CurrentAudienceCount, -1));
+        }
+        return result.ModifiedCount == 1;
+    }
+
+    public async Task<List<MehfilAttendance>> GetMehfilLiveAttendeesAsync(string roomId, int limit = 100) =>
+        await MehfilAttendances
+            .Find(a => a.RoomId == roomId && a.LeftAt == null)
+            .SortBy(a => a.JoinedAt)
+            .Limit(limit)
+            .ToListAsync();
+
+    // ─── Messages ──────────────────────────────────────────────
+
+    public async Task<MehfilMessage> InsertMehfilMessageAsync(MehfilMessage m)
+    {
+        m.CreatedAt = DateTime.UtcNow;
+        await MehfilMessages.InsertOneAsync(m);
+        return m;
+    }
+
+    public async Task<List<MehfilMessage>> GetMehfilRoomMessagesAsync(string roomId, int limit = 200) =>
+        await MehfilMessages
+            .Find(m => m.RoomId == roomId)
+            .SortByDescending(m => m.CreatedAt)
+            .Limit(limit)
+            .ToListAsync()
+            .ContinueWith(t => t.Result.OrderBy(m => m.CreatedAt).ToList());
+
+    // ─── Tips ──────────────────────────────────────────────────
+
+    /// <summary>Record a tip intent and bump the room's totalTipsTokens
+    /// counter. MVP only — Phase 5 token economy will hook a real
+    /// balance ledger transaction here.</summary>
+    public async Task<MehfilTip> InsertMehfilTipAsync(MehfilTip tip)
+    {
+        if (!MehfilGifts.TryGetValue(tip.GiftType, out var tokens))
+            throw new ArgumentException("Unknown gift type", nameof(tip));
+        tip.TokenAmount = tokens;
+        tip.CreatedAt = DateTime.UtcNow;
+        await MehfilTips.InsertOneAsync(tip);
+
+        await MehfilRooms.UpdateOneAsync(
+            Builders<MehfilRoom>.Filter.Eq(r => r.Id, tip.RoomId),
+            Builders<MehfilRoom>.Update.Inc(r => r.TotalTipsTokens, tokens));
+        return tip;
+    }
+
+    public async Task<List<MehfilTip>> GetMehfilRoomTipsAsync(string roomId, int limit = 50) =>
+        await MehfilTips
+            .Find(t => t.RoomId == roomId)
+            .SortByDescending(t => t.CreatedAt)
+            .Limit(limit)
+            .ToListAsync();
 }
 
 // ── Supporting result types ───────────────────────────────────

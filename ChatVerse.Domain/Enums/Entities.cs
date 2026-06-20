@@ -587,6 +587,253 @@ public class TimeCapsule
 // ============================================================
 
 // ============================================================
+//  MEHFIL — Phase 4 creator platform.
+//
+//  User-created host rooms (Twitch + Discord + Bumble model).
+//  MVP scope: 11 templates, audience attendance, in-room chat,
+//  tip placeholder, host-triggered start/end. Skipped for MVP:
+//    • Host verification (ID + ₹100 deposit) → MVP allows any
+//      registered user. Verification model lands with Phase 5.
+//    • Revenue split + payments → settlement is Phase 5 (tokens).
+//      MVP records `Tip` rows as INTENT only; no balance move.
+//    • Auto-start scheduler (MehfilSchedulerService) → MVP relies
+//      on host triggering Start manually from their room page.
+//
+//  Templates (locked enum):
+//    "dating_show" / "open_mic" / "debate" / "watch_party" /
+//    "game_night" / "podcast" / "story_circle" / "trivia" /
+//    "talent_show" / "networking" / "custom"
+// ============================================================
+
+public class MehfilRoom
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string HostUserId   { get; set; } = default!;
+    public string HostUsername { get; set; } = default!;
+
+    /// <summary>One of the 11 locked template keys.</summary>
+    public string TemplateKind { get; set; } = default!;
+
+    public string Title       { get; set; } = default!;
+    public string Description { get; set; } = "";
+
+    public DateTime ScheduledFor { get; set; }
+    public DateTime? StartedAt   { get; set; }
+    public DateTime? EndedAt     { get; set; }
+
+    /// <summary>0 for MVP (Phase 5 monetization adds real entry-fee
+    /// support). Field reserved here to avoid a follow-up migration.</summary>
+    public int EntryFee  { get; set; }
+    public int MaxAudience { get; set; } = 100;
+
+    /// <summary>"scheduled" → "live" → "ended" / "cancelled".</summary>
+    public string Status { get; set; } = "scheduled";
+
+    /// <summary>Cached counters — bumped on attendance + tip events.</summary>
+    public int CurrentAudienceCount { get; set; }
+    public int TotalAttendeesCount  { get; set; }
+    public int TotalTipsTokens      { get; set; }   // sum of placeholder tip amounts (Phase 5 binds to real ledger)
+
+    public DateTime CreatedAt { get; set; }
+}
+
+public class MehfilAttendance
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string UserId { get; set; } = default!;
+    public string Username { get; set; } = default!;
+
+    public DateTime JoinedAt { get; set; }
+    public DateTime? LeftAt  { get; set; }
+
+    public int TokensPaid { get; set; } = 0;
+}
+
+public class MehfilMessage
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string SenderUserId   { get; set; } = default!;
+    public string SenderUsername { get; set; } = default!;
+    /// <summary>True if the sender is the host of the room. Cached
+    /// at write time to avoid a per-message lookup in the feed.</summary>
+    public bool IsHost { get; set; }
+    public string Content { get; set; } = default!;
+    public DateTime CreatedAt { get; set; }
+}
+
+public class MehfilTip
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string SenderUserId { get; set; } = default!;
+    public string SenderUsername { get; set; } = default!;
+    public string RecipientUserId { get; set; } = default!;   // usually host
+
+    /// <summary>"rose" (10) / "bouquet" (50) / "crown" (500) — keys
+    /// stay short for storage but UI maps to display strings.</summary>
+    public string GiftType { get; set; } = default!;
+    public int TokenAmount { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+}
+
+// ============================================================
+//  PYAAR LIVE — Phase 3 flagship Saturday mass dating spectacle.
+//
+//  Saturday 8pm IST cadence (MVP single region; multi-region
+//  follow-up scoped in PROGRESS). Anyone can opt in throughout
+//  the week. At showtime the PyaarLiveOrchestrator picks 20
+//  participants → 10 couples, opens the show, runs 4 timed rounds
+//  with one mid-show elimination:
+//
+//    Round 1 Icebreaker      (30m)
+//    Round 2 Free chat       (45m)
+//    → Bottom 3 couples by spectator votes are eliminated
+//    Round 3 Deeper Q's      (30m)   (audience-cued in v2)
+//    Round 4 Final pitch     (15m)
+//    → Top 3 by final votes share the prize pool
+//
+//  Couples DM each other in private threads. Spectators (everyone
+//  not in a couple) get a read-only grid of all couples' threads
+//  and a vote button. One vote per spectator per show, last-write-
+//  wins (switching couples retracts the previous).
+//
+//  Schema deviation note: TECH.md specced Postgres "dating" schema
+//  (dating_pool_entries / pyaar_live_shows / pyaar_live_couples /
+//  pyaar_live_votes). We implement in Mongo for consistency with
+//  every other Phase 1-2 feature. Same shapes, Postgres migration
+//  is straightforward if scale demands it. Documented in PROGRESS.
+// ============================================================
+
+public class PyaarRegistration
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string UserId { get; set; } = default!;
+
+    /// <summary>YYYY-MM-DD of the target Saturday (IST). Unique
+    /// per (user, event-date).</summary>
+    public string EventDate { get; set; } = default!;
+    public string Region    { get; set; } = "IST";
+
+    public DateTime RegisteredAt { get; set; }
+
+    /// <summary>"pending" → "matched" / "no_match" / "withdrew".</summary>
+    public string Status     { get; set; } = "pending";
+    public string? ShowId    { get; set; }
+    public string? CoupleId  { get; set; }
+}
+
+public class PyaarShow
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string Region    { get; set; } = "IST";
+    public string EventDate { get; set; } = default!;
+    public DateTime ScheduledFor { get; set; }
+    /// <summary>"pending" (registration window) → "live" → "completed".</summary>
+    public string Status { get; set; } = "pending";
+
+    /// <summary>0 = pre-show / lobby; 1..4 = active round; 5 = post-show.</summary>
+    public int CurrentRound { get; set; }
+    public DateTime? CurrentRoundEndsAt { get; set; }
+    public string? CurrentRoundLabel { get; set; }
+
+    /// <summary>Set after Round 2 — couples kicked from the show.</summary>
+    public List<string> EliminatedCoupleIds { get; set; } = new();
+
+    /// <summary>Set on show completion — top 3 by final votes.
+    /// Ordered first → first place.</summary>
+    public List<string> WinningCoupleIds { get; set; } = new();
+
+    public int PrizePool { get; set; }
+    public int TotalSpectators { get; set; }
+
+    public DateTime? StartedAt { get; set; }
+    public DateTime? EndedAt { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+
+public class PyaarCouple
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string ShowId { get; set; } = default!;
+
+    public string UserAId { get; set; } = default!;
+    public string UserBId { get; set; } = default!;
+    public string UserAUsername { get; set; } = default!;
+    public string UserBUsername { get; set; } = default!;
+
+    /// <summary>"Couple 1" .. "Couple 10" — stable spectator-facing
+    /// label that doesn't leak usernames pre-show.</summary>
+    public string Codename { get; set; } = default!;
+    public int CoupleNumber { get; set; }
+
+    /// <summary>Cached vote tally — bumped + decremented by the
+    /// vote-toggle Mongo method so ranking queries are O(N) instead
+    /// of an aggregate over the votes collection.</summary>
+    public int VoteCount { get; set; }
+
+    public DateTime? EliminatedAt { get; set; }
+    public int? EliminatedInRound { get; set; }
+
+    /// <summary>1 = first place, 2 = second, 3 = third, null = not
+    /// in top 3. Set at show completion.</summary>
+    public int? FinalRank { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+}
+
+public class PyaarMessage
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string ShowId   { get; set; } = default!;
+    public string CoupleId { get; set; } = default!;
+    public string SenderUserId { get; set; } = default!;
+    public string SenderUsername { get; set; } = default!;
+    public int RoundNumber { get; set; }
+    public string Content  { get; set; } = default!;
+    public DateTime CreatedAt { get; set; }
+}
+
+public class PyaarVote
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string ShowId   { get; set; } = default!;
+    public string CoupleId { get; set; } = default!;
+    public string VoterUserId { get; set; } = default!;
+    public int Weight { get; set; } = 1;
+    public DateTime CreatedAt { get; set; }
+}
+
+// ============================================================
 //  The Cipher — Phase 2 weekly community ARG.
 //
 //  Monday 9am IST cadence. CipherRoundService picks ~7 users from
