@@ -54,6 +54,11 @@ public partial class MongoService
     private IMongoCollection<LoveTrianglePairMessage> LoveTrianglePairMessages =>
         _db.GetCollection<LoveTrianglePairMessage>(MongoCollections.LoveTrianglePairMessages);
 
+    // The Cipher — weekly community ARG
+    private IMongoCollection<CipherRound>      CipherRounds      => _db.GetCollection<CipherRound>(MongoCollections.CipherRounds);
+    private IMongoCollection<CipherMember>     CipherMembers     => _db.GetCollection<CipherMember>(MongoCollections.CipherMembers);
+    private IMongoCollection<CipherSubmission> CipherSubmissions => _db.GetCollection<CipherSubmission>(MongoCollections.CipherSubmissions);
+
     public MongoService(IMongoClient client, string databaseName)
     {
         // Register camelCase convention — matches MongoDB field names (isActive, displayName etc)
@@ -2027,6 +2032,146 @@ public partial class MongoService
         return await LoveTrianglePairMessages
             .Find(m => m.TriangleId == triangleId && m.IsShared)
             .SortByDescending(m => m.SharedAt)
+            .Limit(limit)
+            .ToListAsync();
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  THE CIPHER — weekly community ARG
+    // ════════════════════════════════════════════════════════════
+
+    public const int CipherWinningAccuracyThreshold = 50;  // ≥ 50% wins
+
+    public async Task<CipherRound> InsertCipherRoundAsync(CipherRound r)
+    {
+        r.CreatedAt = DateTime.UtcNow;
+        await CipherRounds.InsertOneAsync(r);
+        return r;
+    }
+
+    public async Task<CipherRound?> GetActiveCipherRoundAsync()
+    {
+        return await CipherRounds
+            .Find(r => r.Status == "active")
+            .SortByDescending(r => r.StartsAt)
+            .FirstOrDefaultAsync();
+    }
+
+    public async Task<CipherRound?> GetCipherRoundByIdAsync(string id) =>
+        await CipherRounds.Find(r => r.Id == id).FirstOrDefaultAsync();
+
+    public async Task<List<CipherRound>> GetCipherRoundsReadyToCloseAsync()
+    {
+        var now = DateTime.UtcNow;
+        return await CipherRounds
+            .Find(r => r.Status == "active" && r.EndsAt <= now)
+            .ToListAsync();
+    }
+
+    public async Task<List<CipherRound>> GetCipherArchiveAsync(int limit = 10) =>
+        await CipherRounds
+            .Find(r => r.Status == "closed")
+            .SortByDescending(r => r.EndsAt)
+            .Limit(limit)
+            .ToListAsync();
+
+    public async Task<bool> CloseCipherRoundAsync(
+        string roundId, List<string> winningHunterIds)
+    {
+        var filter = Builders<CipherRound>.Filter.And(
+            Builders<CipherRound>.Filter.Eq(r => r.Id, roundId),
+            Builders<CipherRound>.Filter.Eq(r => r.Status, "active"));
+        var update = Builders<CipherRound>.Update
+            .Set(r => r.Status, "closed")
+            .Set(r => r.ClosedAt, DateTime.UtcNow)
+            .Set(r => r.WinningHunterIds, winningHunterIds);
+        var result = await CipherRounds.UpdateOneAsync(filter, update);
+        return result.ModifiedCount == 1;
+    }
+
+    // ─── Members ───────────────────────────────────────────────
+
+    public async Task InsertCipherMembersAsync(IEnumerable<CipherMember> members)
+    {
+        var list = members.ToList();
+        foreach (var m in list) m.CreatedAt = DateTime.UtcNow;
+        if (list.Count > 0) await CipherMembers.InsertManyAsync(list);
+    }
+
+    public async Task<CipherMember?> GetMyCipherMemberAsync(string roundId, string userId) =>
+        await CipherMembers.Find(m => m.RoundId == roundId && m.UserId == userId)
+                           .FirstOrDefaultAsync();
+
+    public async Task<List<CipherMember>> GetCipherMembersAsync(string roundId) =>
+        await CipherMembers.Find(m => m.RoundId == roundId).ToListAsync();
+
+    public async Task BulkUpdateCipherMemberScoresAsync(
+        Dictionary<string, int> correctGuessersCountByMemberId)
+    {
+        foreach (var (memberId, count) in correctGuessersCountByMemberId)
+        {
+            var filter = Builders<CipherMember>.Filter.Eq(m => m.Id, memberId);
+            var update = Builders<CipherMember>.Update
+                .Set(m => m.CorrectGuessersCount, count)
+                .Set(m => m.WasIdentified, count > 0);
+            await CipherMembers.UpdateOneAsync(filter, update);
+        }
+    }
+
+    // ─── Submissions ───────────────────────────────────────────
+
+    /// <summary>Upsert a Hunter's submission for a round — re-submitting
+    /// overwrites the previous guess (last write wins, by design).</summary>
+    public async Task<CipherSubmission> UpsertCipherSubmissionAsync(CipherSubmission s)
+    {
+        var filter = Builders<CipherSubmission>.Filter.And(
+            Builders<CipherSubmission>.Filter.Eq(x => x.RoundId, s.RoundId),
+            Builders<CipherSubmission>.Filter.Eq(x => x.HunterUserId, s.HunterUserId));
+        var update = Builders<CipherSubmission>.Update
+            .SetOnInsert(x => x.RoundId,        s.RoundId)
+            .SetOnInsert(x => x.HunterUserId,   s.HunterUserId)
+            .SetOnInsert(x => x.HunterUsername, s.HunterUsername)
+            .SetOnInsert(x => x.CreatedAt,      DateTime.UtcNow)
+            .Set(x => x.GuessedPhrase,          s.GuessedPhrase)
+            .Set(x => x.NamedUserIds,           s.NamedUserIds)
+            .Set(x => x.SubmittedAt,            DateTime.UtcNow);
+        await CipherSubmissions.UpdateOneAsync(filter, update,
+            new UpdateOptions { IsUpsert = true });
+        return (await CipherSubmissions.Find(filter).FirstAsync());
+    }
+
+    public async Task<CipherSubmission?> GetMyCipherSubmissionAsync(string roundId, string userId) =>
+        await CipherSubmissions.Find(s => s.RoundId == roundId && s.HunterUserId == userId)
+                               .FirstOrDefaultAsync();
+
+    public async Task<List<CipherSubmission>> GetCipherSubmissionsForRoundAsync(string roundId) =>
+        await CipherSubmissions.Find(s => s.RoundId == roundId).ToListAsync();
+
+    public async Task BulkUpdateCipherSubmissionScoresAsync(
+        IEnumerable<(string Id, int Accuracy, bool Won)> scored)
+    {
+        foreach (var (id, acc, won) in scored)
+        {
+            var filter = Builders<CipherSubmission>.Filter.Eq(s => s.Id, id);
+            var update = Builders<CipherSubmission>.Update
+                .Set(s => s.AccuracyPct,   acc)
+                .Set(s => s.WonPrizeShare, won);
+            await CipherSubmissions.UpdateOneAsync(filter, update);
+        }
+    }
+
+    /// <summary>Top scorers across all past Cipher rounds (or one round
+    /// if roundId provided). Used for the leaderboard.</summary>
+    public async Task<List<CipherSubmission>> GetCipherLeaderboardAsync(
+        string? roundId = null, int limit = 20)
+    {
+        var filter = roundId is null
+            ? Builders<CipherSubmission>.Filter.Empty
+            : Builders<CipherSubmission>.Filter.Eq(s => s.RoundId, roundId);
+        return await CipherSubmissions
+            .Find(filter)
+            .SortByDescending(s => s.AccuracyPct)
+            .ThenBy(s => s.SubmittedAt)
             .Limit(limit)
             .ToListAsync();
     }
