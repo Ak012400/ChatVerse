@@ -318,6 +318,16 @@ try
     // 4-round advancement, mid-show elimination, completion + winners.
     builder.Services.AddHostedService<ChatVerse.API.Services.PyaarLiveOrchestrator>();
 
+    // ── Phase 5 token economy ────────────────────────────────────
+    //    TokenLedgerService is the only place that writes balance +
+    //    audit rows. IPaymentGateway is swappable — MockPaymentGateway
+    //    today, RazorpayPaymentGateway tomorrow without touching the
+    //    hubs or feature code. Both are scoped so the request-scoped
+    //    HubContext + MongoService dependencies resolve correctly.
+    builder.Services.AddScoped<ChatVerse.API.Services.Tokens.TokenLedgerService>();
+    builder.Services.AddScoped<ChatVerse.API.Services.Tokens.IPaymentGateway,
+                               ChatVerse.API.Services.Tokens.MockPaymentGateway>();
+
     var app = builder.Build();
 
     // ── Middleware pipeline ───────────────────────────────────────
@@ -402,8 +412,14 @@ try
     // MyRooms / CreateRoom / CancelRoom / StartRoom / EndRoom /
     // JoinRoom / LeaveRoom / SendMessage / Tip. Push (per-room
     // group): RoomStarted / RoomEnded / RoomAudience / RoomMessage /
-    // RoomTip. Host verification + payment settlement are Phase 5.
+    // RoomTip. Tip settlement runs through TokenLedgerService now
+    // that Phase 5 lands; host verification still deferred.
     app.MapHub<ChatVerse.API.Hubs.MehfilHub>("/hubs/mehfil");
+
+    // Phase 5 hub — Tokens wallet: GetBalance / GetLedger / GetMyOrders /
+    // GetPacks / CreateTopupOrder / ConfirmMockPayment / CancelTopupOrder /
+    // EnsureSignupBonus. Push: BalanceChanged (per-user).
+    app.MapHub<ChatVerse.API.Hubs.TokensHub>("/hubs/tokens");
 
     // ── Startup banner ────────────────────────────────────────────
     // Emit a clear, grep-friendly summary of WHICH hubs got mapped.

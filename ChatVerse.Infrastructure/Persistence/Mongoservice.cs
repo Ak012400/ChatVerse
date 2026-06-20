@@ -2778,6 +2778,20 @@ public partial class MongoService
         var result = await TokenTopupOrders.UpdateOneAsync(filter, update);
         return result.ModifiedCount == 1;
     }
+
+    /// <summary>Stamp the gateway-issued ref + redirect URL onto an
+    /// order immediately after CreateAsync — these come back AFTER
+    /// the order row already exists, so we persist them here. Status
+    /// is not touched.</summary>
+    public async Task StampTokenTopupOrderGatewayDetailsAsync(
+        string orderId, string gatewayRef, string redirectUrl)
+    {
+        var filter = Builders<TokenTopupOrder>.Filter.Eq(o => o.Id, orderId);
+        var update = Builders<TokenTopupOrder>.Update
+            .Set(o => o.GatewayRef, gatewayRef)
+            .Set(o => o.GatewayRedirectUrl, redirectUrl);
+        await TokenTopupOrders.UpdateOneAsync(filter, update);
+    }
 }
 
 // ── Supporting result types ───────────────────────────────────

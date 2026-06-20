@@ -133,15 +133,14 @@ public class TokensHub : Hub
         };
         var saved = await _mongo.InsertTokenTopupOrderAsync(order);
 
-        // Ask the gateway to set up its side of the transaction.
+        // Ask the gateway to set up its side of the transaction, then
+        // persist the gateway-issued ref + redirect URL so the order
+        // survives a client reload mid-flow.
         var gw = await _gateway.CreateAsync(saved);
-        // Stamp the gateway-issued ref + redirect URL onto the order.
-        await _mongo.SetTokenTopupOrderStatusAsync(saved.Id!, "created", gw.GatewayRef);
+        await _mongo.StampTokenTopupOrderGatewayDetailsAsync(
+            saved.Id!, gw.GatewayRef, gw.RedirectUrl);
         saved.GatewayRef = gw.GatewayRef;
         saved.GatewayRedirectUrl = gw.RedirectUrl;
-
-        // Save the redirect URL too (the SetStatus update didn\'t touch it).
-        await UpdateRedirectUrlAsync(saved.Id!, gw.RedirectUrl);
 
         return ToOrderDto(saved);
     }
@@ -196,15 +195,4 @@ public class TokensHub : Hub
         completedAt         = o.CompletedAt,
     };
 
-    /// <summary>Stamp the gateway redirect URL onto a created order.
-    /// Avoids needing to wire it into SetTokenTopupOrderStatusAsync.</summary>
-    private async Task UpdateRedirectUrlAsync(string orderId, string redirectUrl)
-    {
-        var coll = typeof(MongoService).GetField("_db", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-        // Simpler: just rely on a fresh helper. We don\'t reflect — let
-        // future devs add a proper setter if they need it. For now we
-        // mutate the in-memory object; the DTO uses that value.
-        _ = coll; _ = orderId; _ = redirectUrl;
-        await Task.CompletedTask;
-    }
 }
