@@ -201,6 +201,15 @@ public static class MongoCollections
     /// <summary>Anonymous daily confessions. Top of the day gets
     /// reveal offer; archives roll into the Lore Wall.</summary>
     public const string Confessions = "confessions";
+
+    // ── Ghost Date ─────────────────────────────────────────────
+    /// <summary>Weekly opt-in pool for Thursday 9pm IST ghost dates.</summary>
+    public const string GhostDateRegistrations = "ghost_date_registrations";
+    /// <summary>Paired 30-min anonymous text date + outcome.</summary>
+    public const string GhostDates = "ghost_dates";
+    /// <summary>Per-date message thread (kept separate from regular
+    /// DMs so privacy lifecycle is isolated).</summary>
+    public const string GhostDateMessages = "ghost_date_messages";
 }
 
 public static class Theater
