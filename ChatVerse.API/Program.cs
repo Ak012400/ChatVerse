@@ -297,6 +297,11 @@ try
     // its author. Idempotent per UTC date.
     builder.Services.AddHostedService<ChatVerse.API.Services.ConfessionRankingService>();
 
+    // Ghost Date (Phase 2 weekly anonymous dating) — 60-second tick
+    // handles Thursday 9pm IST pairing + 9:30pm chat-ended push +
+    // 9:35pm decision-deadline expiry. All idempotent.
+    builder.Services.AddHostedService<ChatVerse.API.Services.GhostDateService>();
+
     var app = builder.Build();
 
     // ── Middleware pipeline ───────────────────────────────────────
@@ -351,6 +356,12 @@ try
     // ConfessionPosted / ReactionUpdated / ConfessionRevealed /
     // TopConfessionOffered.
     app.MapHub<ChatVerse.API.Hubs.ConfessionHub>("/hubs/confessions");
+
+    // Phase 2 hub — Ghost Date: Register / Withdraw / GetMyStatus /
+    // GetActiveDate / SendMessage / GetThread / SubmitDecision /
+    // GetMyHistory. Push: GhostDateMatched / GhostDateMessage /
+    // GhostDateEnded / GhostDateOutcome.
+    app.MapHub<ChatVerse.API.Hubs.GhostDateHub>("/hubs/ghost-date");
 
     // ── Startup banner ────────────────────────────────────────────
     // Emit a clear, grep-friendly summary of WHICH hubs got mapped.

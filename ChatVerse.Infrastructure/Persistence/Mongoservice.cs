@@ -38,6 +38,14 @@ public partial class MongoService
     // Confession Box — anonymous daily confessions
     private IMongoCollection<Confession> Confessions => _db.GetCollection<Confession>(MongoCollections.Confessions);
 
+    // Ghost Date — weekly Thursday 9pm IST anonymous dating
+    private IMongoCollection<GhostDateRegistration> GhostDateRegistrations =>
+        _db.GetCollection<GhostDateRegistration>(MongoCollections.GhostDateRegistrations);
+    private IMongoCollection<GhostDate> GhostDates =>
+        _db.GetCollection<GhostDate>(MongoCollections.GhostDates);
+    private IMongoCollection<GhostDateMessage> GhostDateMessages =>
+        _db.GetCollection<GhostDateMessage>(MongoCollections.GhostDateMessages);
+
     public MongoService(IMongoClient client, string databaseName)
     {
         // Register camelCase convention — matches MongoDB field names (isActive, displayName etc)
@@ -1434,6 +1442,288 @@ public partial class MongoService
             .Find(filter)
             .SortByDescending(c => c.TotalReactions)
             .ThenBy(c => c.CreatedAt)
+            .Limit(limit)
+            .ToListAsync();
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  GHOST DATE — weekly Thursday 9pm IST anonymous dating
+    // ════════════════════════════════════════════════════════════
+
+    public const int GhostDateChatMinutes     = 30;
+    public const int GhostDateDecisionMinutes = 5;
+    public const int GhostDateMessageMaxChars = 1000;
+    public const int GhostDateRepairCooldownDays = 60;
+
+    // ─── Registration pool ─────────────────────────────────────
+
+    /// <summary>Idempotent register — same user calling twice for
+    /// the same target event date is a no-op. Returns the row.</summary>
+    public async Task<GhostDateRegistration> RegisterForGhostDateAsync(
+        string userId, string targetEventDate)
+    {
+        var filter = Builders<GhostDateRegistration>.Filter.And(
+            Builders<GhostDateRegistration>.Filter.Eq(r => r.UserId, userId),
+            Builders<GhostDateRegistration>.Filter.Eq(r => r.TargetEventDate, targetEventDate));
+
+        var existing = await GhostDateRegistrations.Find(filter).FirstOrDefaultAsync();
+        if (existing is not null)
+        {
+            // If they previously withdrew, flip back to pending.
+            if (existing.Status == "withdrew")
+            {
+                var revive = Builders<GhostDateRegistration>.Update
+                    .Set(r => r.Status, "pending")
+                    .Set(r => r.RegisteredAt, DateTime.UtcNow);
+                await GhostDateRegistrations.UpdateOneAsync(filter, revive);
+                existing.Status = "pending";
+                existing.RegisteredAt = DateTime.UtcNow;
+            }
+            return existing;
+        }
+
+        var fresh = new GhostDateRegistration
+        {
+            UserId          = userId,
+            TargetEventDate = targetEventDate,
+            RegisteredAt    = DateTime.UtcNow,
+            Status          = "pending",
+        };
+        await GhostDateRegistrations.InsertOneAsync(fresh);
+        return fresh;
+    }
+
+    /// <summary>Withdraw before the pairing tick. After matching this
+    /// becomes a no-op (PairedDateId set means it's locked in).</summary>
+    public async Task<bool> WithdrawFromGhostDateAsync(
+        string userId, string targetEventDate)
+    {
+        var filter = Builders<GhostDateRegistration>.Filter.And(
+            Builders<GhostDateRegistration>.Filter.Eq(r => r.UserId, userId),
+            Builders<GhostDateRegistration>.Filter.Eq(r => r.TargetEventDate, targetEventDate),
+            Builders<GhostDateRegistration>.Filter.Eq(r => r.Status, "pending"));
+        var update = Builders<GhostDateRegistration>.Update
+            .Set(r => r.Status, "withdrew");
+        var result = await GhostDateRegistrations.UpdateOneAsync(filter, update);
+        return result.ModifiedCount == 1;
+    }
+
+    public async Task<GhostDateRegistration?> GetMyRegistrationAsync(
+        string userId, string targetEventDate)
+    {
+        return await GhostDateRegistrations.Find(
+            r => r.UserId == userId && r.TargetEventDate == targetEventDate
+        ).FirstOrDefaultAsync();
+    }
+
+    /// <summary>The pool the pairing service picks from.</summary>
+    public async Task<List<GhostDateRegistration>> GetPendingRegistrationsAsync(
+        string targetEventDate)
+    {
+        return await GhostDateRegistrations.Find(
+            r => r.TargetEventDate == targetEventDate && r.Status == "pending"
+        ).ToListAsync();
+    }
+
+    /// <summary>Set status + paired-date pointer atomically (the
+    /// pairing service updates two registrations per pair).</summary>
+    public async Task MarkRegistrationMatchedAsync(
+        string registrationId, string pairedDateId)
+    {
+        var filter = Builders<GhostDateRegistration>.Filter.Eq(r => r.Id, registrationId);
+        var update = Builders<GhostDateRegistration>.Update
+            .Set(r => r.Status,       "matched")
+            .Set(r => r.PairedDateId, pairedDateId);
+        await GhostDateRegistrations.UpdateOneAsync(filter, update);
+    }
+
+    public async Task MarkRegistrationNoMatchAsync(string registrationId)
+    {
+        var filter = Builders<GhostDateRegistration>.Filter.Eq(r => r.Id, registrationId);
+        var update = Builders<GhostDateRegistration>.Update.Set(r => r.Status, "no_match");
+        await GhostDateRegistrations.UpdateOneAsync(filter, update);
+    }
+
+    // ─── Live dates ────────────────────────────────────────────
+
+    public async Task<GhostDate> InsertGhostDateAsync(GhostDate date)
+    {
+        date.CreatedAt = DateTime.UtcNow;
+        await GhostDates.InsertOneAsync(date);
+        return date;
+    }
+
+    public async Task<GhostDate?> GetGhostDateByIdAsync(string id)
+    {
+        return await GhostDates.Find(d => d.Id == id).FirstOrDefaultAsync();
+    }
+
+    /// <summary>The user's CURRENTLY-LIVE date if any — i.e. now is
+    /// between ScheduledFor and DecisionDeadline. Used by the hub
+    /// to surface the active-date UI on connect.</summary>
+    public async Task<GhostDate?> GetMyActiveGhostDateAsync(string userId)
+    {
+        var now = DateTime.UtcNow;
+        var filter = Builders<GhostDate>.Filter.And(
+            Builders<GhostDate>.Filter.Or(
+                Builders<GhostDate>.Filter.Eq(d => d.UserAId, userId),
+                Builders<GhostDate>.Filter.Eq(d => d.UserBId, userId)),
+            Builders<GhostDate>.Filter.Lte(d => d.ScheduledFor,      now),
+            Builders<GhostDate>.Filter.Gte(d => d.DecisionDeadline,  now));
+        return await GhostDates
+            .Find(filter)
+            .SortByDescending(d => d.ScheduledFor)
+            .FirstOrDefaultAsync();
+    }
+
+    /// <summary>All dates whose chat window is over but decision
+    /// deadline hasn't yet passed — the lock service hits these
+    /// to push "chat ended" events at the right moment.</summary>
+    public async Task<List<GhostDate>> GetDatesAwaitingDecisionAsync()
+    {
+        var now = DateTime.UtcNow;
+        var filter = Builders<GhostDate>.Filter.And(
+            Builders<GhostDate>.Filter.Lte(d => d.ExpiresAt, now),
+            Builders<GhostDate>.Filter.Gt(d => d.DecisionDeadline, now),
+            Builders<GhostDate>.Filter.Eq(d => d.Outcome, (string?)null));
+        return await GhostDates.Find(filter).ToListAsync();
+    }
+
+    /// <summary>Dates whose decision deadline has passed without
+    /// outcome being set → service marks them expired.</summary>
+    public async Task<List<GhostDate>> GetExpiredUndecidedDatesAsync()
+    {
+        var now = DateTime.UtcNow;
+        var filter = Builders<GhostDate>.Filter.And(
+            Builders<GhostDate>.Filter.Lte(d => d.DecisionDeadline, now),
+            Builders<GhostDate>.Filter.Eq(d => d.Outcome, (string?)null));
+        return await GhostDates.Find(filter).ToListAsync();
+    }
+
+    /// <summary>Record this side's decision atomically. Resolves
+    /// the outcome the moment both decisions are in. Returns the
+    /// post-state of the date.</summary>
+    public async Task<GhostDate?> SubmitGhostDateDecisionAsync(
+        string dateId, string userId, bool reveal)
+    {
+        var date = await GetGhostDateByIdAsync(dateId);
+        if (date is null) return null;
+
+        // Author check + already-decided guard.
+        bool isA = date.UserAId == userId;
+        bool isB = date.UserBId == userId;
+        if (!isA && !isB) return null;
+        if (date.Outcome != null) return date;        // already resolved
+        if (isA && date.UserARevealedAfter != null) return date;
+        if (isB && date.UserBRevealedAfter != null) return date;
+        // Decision must land within window.
+        if (DateTime.UtcNow > date.DecisionDeadline) return date;
+
+        var update = Builders<GhostDate>.Update.Combine(
+            isA
+                ? Builders<GhostDate>.Update.Set(d => d.UserARevealedAfter, reveal)
+                                            .Set(d => d.UserADecidedAt, DateTime.UtcNow)
+                : Builders<GhostDate>.Update.Set(d => d.UserBRevealedAfter, reveal)
+                                            .Set(d => d.UserBDecidedAt, DateTime.UtcNow));
+
+        var filter = Builders<GhostDate>.Filter.Eq(d => d.Id, dateId);
+        await GhostDates.UpdateOneAsync(filter, update);
+
+        // Re-read fresh, then resolve outcome if both sides in.
+        var fresh = await GetGhostDateByIdAsync(dateId);
+        if (fresh is null) return null;
+        if (fresh.UserARevealedAfter is bool a && fresh.UserBRevealedAfter is bool b
+            && fresh.Outcome is null)
+        {
+            var outcome = (a, b) switch
+            {
+                (true,  true)  => "mutual_reveal",
+                (false, false) => "mutual_pass",
+                _              => "bittersweet",
+            };
+
+            var outcomeUpdate = Builders<GhostDate>.Update
+                .Set(d => d.Outcome,   outcome)
+                .Set(d => d.OutcomeAt, DateTime.UtcNow);
+
+            if (outcome == "mutual_pass")
+            {
+                outcomeUpdate = outcomeUpdate.Set(
+                    d => d.NextEligibleMatchAt,
+                    fresh.ScheduledFor.AddDays(GhostDateRepairCooldownDays));
+            }
+            await GhostDates.UpdateOneAsync(filter, outcomeUpdate);
+            fresh.Outcome   = outcome;
+            fresh.OutcomeAt = DateTime.UtcNow;
+        }
+        return fresh;
+    }
+
+    /// <summary>Force-resolve a date whose decision window has
+    /// passed. Treats nulls as "pass" for outcome calculation
+    /// (= bittersweet if one side decided to reveal, else mutual_pass).</summary>
+    public async Task<GhostDate?> MarkGhostDateExpiredAsync(string dateId)
+    {
+        var date = await GetGhostDateByIdAsync(dateId);
+        if (date is null || date.Outcome != null) return date;
+
+        bool a = date.UserARevealedAfter ?? false;
+        bool b = date.UserBRevealedAfter ?? false;
+        // If at least one side missed the window we mark it "expired"
+        // rather than computing an outcome — UX-wise it's a clearer
+        // surface for the user who DID decide.
+        bool anyMissed = date.UserARevealedAfter is null || date.UserBRevealedAfter is null;
+        var outcome = anyMissed ? "expired"
+            : (a, b) switch
+            {
+                (true,  true)  => "mutual_reveal",
+                (false, false) => "mutual_pass",
+                _              => "bittersweet",
+            };
+
+        var filter = Builders<GhostDate>.Filter.And(
+            Builders<GhostDate>.Filter.Eq(d => d.Id, dateId),
+            Builders<GhostDate>.Filter.Eq(d => d.Outcome, (string?)null));
+        var update = Builders<GhostDate>.Update
+            .Set(d => d.Outcome,   outcome)
+            .Set(d => d.OutcomeAt, DateTime.UtcNow);
+        if (outcome == "mutual_pass")
+        {
+            update = update.Set(d => d.NextEligibleMatchAt,
+                date.ScheduledFor.AddDays(GhostDateRepairCooldownDays));
+        }
+        await GhostDates.UpdateOneAsync(filter, update);
+        return await GetGhostDateByIdAsync(dateId);
+    }
+
+    public async Task<List<GhostDate>> GetGhostDateHistoryAsync(
+        string userId, int limit = 20)
+    {
+        var filter = Builders<GhostDate>.Filter.Or(
+            Builders<GhostDate>.Filter.Eq(d => d.UserAId, userId),
+            Builders<GhostDate>.Filter.Eq(d => d.UserBId, userId));
+        return await GhostDates
+            .Find(filter)
+            .SortByDescending(d => d.ScheduledFor)
+            .Limit(limit)
+            .ToListAsync();
+    }
+
+    // ─── Per-date thread ───────────────────────────────────────
+
+    public async Task<GhostDateMessage> InsertGhostDateMessageAsync(GhostDateMessage m)
+    {
+        m.CreatedAt = DateTime.UtcNow;
+        await GhostDateMessages.InsertOneAsync(m);
+        return m;
+    }
+
+    public async Task<List<GhostDateMessage>> GetGhostDateThreadAsync(
+        string dateId, int limit = 200)
+    {
+        return await GhostDateMessages
+            .Find(m => m.DateId == dateId)
+            .SortBy(m => m.CreatedAt)
             .Limit(limit)
             .ToListAsync();
     }

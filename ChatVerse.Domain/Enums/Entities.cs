@@ -587,6 +587,109 @@ public class TimeCapsule
 // ============================================================
 
 // ============================================================
+//  Ghost Date — Phase 2 weekly anonymous dating.
+//
+//  Thursday 9pm IST cadence (per VISION). Users opt-in any time
+//  during the week; at 9pm Thursday the GhostDateService shuffles
+//  the pending pool and pairs them. Each pair gets a private 30-min
+//  text chat where neither side sees the other's real identity.
+//
+//  At 9:30pm IST chat ends + a 5-minute decision window opens.
+//  Both sides independently submit "reveal" (✓) or "pass" (✗):
+//    • both ✓  → mutual_reveal     (identities surface, can continue as DMs)
+//    • mixed   → bittersweet       (no reveal either side, no follow-up)
+//    • both ✗  → mutual_pass       (no reveal, but system stores the
+//                                   pair with NextEligibleMatchAt for
+//                                   possible re-pair months later)
+//    • expired → expired           (either side missed the decision window)
+//
+//  Privacy:
+//    • Real user IDs NEVER leave the server during a live date.
+//      Each side knows the other only as "them"/persona-style.
+//    • On mutual_reveal we surface the *usernames* via DTO — never
+//      raw IDs.
+// ============================================================
+
+public class GhostDateRegistration
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string UserId { get; set; } = default!;
+
+    /// <summary>The IST date (YYYY-MM-DD) of the Thursday this
+    /// registration targets. Indexed unique together with UserId
+    /// so a user can only register once per event.</summary>
+    public string TargetEventDate { get; set; } = default!;
+
+    public DateTime RegisteredAt { get; set; }
+
+    /// <summary>"pending" → "matched" → terminal.
+    /// "no_match"  — odd-one-out at pairing time.
+    /// "withdrew"  — user unregistered before the event.</summary>
+    public string Status { get; set; } = "pending";
+
+    /// <summary>Set when the user gets paired — points at the
+    /// GhostDate row.</summary>
+    public string? PairedDateId { get; set; }
+}
+
+public class GhostDate
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string UserAId { get; set; } = default!;
+    public string UserBId { get; set; } = default!;
+
+    /// <summary>Usernames captured at pairing time — used for
+    /// the mutual-reveal moment so a later rename doesn't
+    /// retroactively change history.</summary>
+    public string UserAUsername { get; set; } = default!;
+    public string UserBUsername { get; set; } = default!;
+
+    public string EventDate { get; set; } = default!;  // YYYY-MM-DD IST
+    public DateTime ScheduledFor { get; set; }          // 9pm IST in UTC
+    public DateTime ExpiresAt { get; set; }             // ScheduledFor + 30 min
+    public DateTime DecisionDeadline { get; set; }      // ExpiresAt + 5 min
+
+    /// <summary>Per-side decision: true = "reveal/continue", false = "pass".
+    /// Null until that side has submitted.</summary>
+    public bool? UserARevealedAfter { get; set; }
+    public bool? UserBRevealedAfter { get; set; }
+    public DateTime? UserADecidedAt { get; set; }
+    public DateTime? UserBDecidedAt { get; set; }
+
+    /// <summary>"mutual_reveal" | "bittersweet" | "mutual_pass" |
+    /// "expired" — set the moment both sides have decided (or the
+    /// deadline passes).</summary>
+    public string? Outcome { get; set; }
+    public DateTime? OutcomeAt { get; set; }
+
+    /// <summary>For the re-pair magic: when outcome is mutual_pass,
+    /// service writes ScheduledFor + 60 days here. Matching algo
+    /// (future enhancement) preferentially pairs voyagers who
+    /// crossed paths once before but missed the moment.</summary>
+    public DateTime? NextEligibleMatchAt { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+}
+
+public class GhostDateMessage
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string DateId { get; set; } = default!;
+    public string SenderUserId { get; set; } = default!;
+    public string Content { get; set; } = default!;
+    public DateTime CreatedAt { get; set; }
+}
+
+// ============================================================
 //  Confession — Phase 2 drama feature.
 //
 //  Anonymous daily confessions. Every day, the
