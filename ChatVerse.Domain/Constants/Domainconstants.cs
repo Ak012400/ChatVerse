@@ -219,6 +219,14 @@ public static class MongoCollections
     /// <summary>Per-pair DM thread inside a triangle. Sharable as
     /// anonymous excerpts.</summary>
     public const string LoveTrianglePairMessages = "love_triangle_pair_messages";
+
+    // ── The Cipher ─────────────────────────────────────────────
+    /// <summary>Weekly Cipher rounds with phrase + status + window.</summary>
+    public const string CipherRounds      = "cipher_rounds";
+    /// <summary>Per-round Cipher Member assignments with fragments.</summary>
+    public const string CipherMembers     = "cipher_members";
+    /// <summary>Hunter submissions per round.</summary>
+    public const string CipherSubmissions = "cipher_submissions";
 }
 
 public static class Theater

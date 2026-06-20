@@ -587,6 +587,115 @@ public class TimeCapsule
 // ============================================================
 
 // ============================================================
+//  The Cipher — Phase 2 weekly community ARG.
+//
+//  Monday 9am IST cadence. CipherRoundService picks ~7 users from
+//  the weekly-active pool, assigns each a single word from a
+//  curated poetic phrase. They have one week to weave their word
+//  into chats naturally. The remaining 95% (Hunters) try to figure
+//  out (a) the full phrase and (b) which users were the Cipher
+//  Members. Sunday 11pm IST: round closes, scoring runs.
+//
+//  Spec note: TECH.md originally specced this as Postgres tables.
+//  We implement in Mongo for consistency with the rest of Phase 1
+//  and 2 (all using Mongo). Documented as a deliberate deviation
+//  in PROGRESS.md.
+//
+//  Scoring:
+//    • Each Hunter submission has:
+//      - phrase guess  → similarity score vs canonical phrase
+//      - named user ids → percent overlap with actual member set
+//    • AccuracyPct = (phraseSim * 0.6) + (memberOverlap * 0.4)
+//    • Hunters with ≥ 50% accuracy win a share of the prize pool.
+// ============================================================
+
+public class CipherRound
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    /// <summary>ISO week number — "2026-W25" style. Used as a stable
+    /// human handle in chat / leaderboard / share copy.</summary>
+    public string WeekLabel { get; set; } = default!;
+
+    /// <summary>The canonical phrase Hunters are trying to recover.
+    /// Words are space-delimited; each word is one Member's fragment.</summary>
+    public string Phrase { get; set; } = default!;
+
+    /// <summary>Stable lowercase phrase hash — quick "did the Hunter
+    /// match exactly?" check before doing a similarity sweep.</summary>
+    public string PhraseHash { get; set; } = default!;
+
+    /// <summary>"active" → "closed". Closed rounds keep their data
+    /// for the archive + leaderboard.</summary>
+    public string Status { get; set; } = "active";
+
+    public DateTime StartsAt { get; set; }    // Monday 9am IST in UTC
+    public DateTime EndsAt   { get; set; }    // Sunday 11pm IST in UTC
+    public DateTime? ClosedAt { get; set; }
+
+    /// <summary>The IDs of Hunters who beat the 50% accuracy bar
+    /// after scoring. Set when the round closes.</summary>
+    public List<string> WinningHunterIds { get; set; } = new();
+
+    public int PrizePool { get; set; }        // tokens; populated when token economy lands
+    public DateTime CreatedAt { get; set; }
+}
+
+public class CipherMember
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoundId { get; set; } = default!;
+    public string UserId  { get; set; } = default!;
+    public string Username { get; set; } = default!;
+
+    /// <summary>Single word from the round's phrase. Members weave
+    /// this naturally into their chats during the week.</summary>
+    public string AssignedFragment { get; set; } = default!;
+
+    /// <summary>Set by scoring: true if at least one Hunter named this
+    /// user correctly in their submission.</summary>
+    public bool WasIdentified { get; set; }
+
+    /// <summary>How many Hunters correctly named this user. Drives the
+    /// "stealth score" on the closed-round display.</summary>
+    public int CorrectGuessersCount { get; set; }
+
+    public int WonPrizeShare { get; set; }   // 0 until token economy ships
+    public DateTime CreatedAt { get; set; }
+}
+
+public class CipherSubmission
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoundId { get; set; } = default!;
+    public string HunterUserId { get; set; } = default!;
+    public string HunterUsername { get; set; } = default!;
+
+    public string GuessedPhrase { get; set; } = default!;
+
+    /// <summary>The user IDs the Hunter thinks are the Members.
+    /// One submission per Hunter per round (re-submission overwrites).</summary>
+    public List<string> NamedUserIds { get; set; } = new();
+
+    /// <summary>0-100 — set at round close.</summary>
+    public int AccuracyPct { get; set; }
+
+    /// <summary>Set to true at round-close if AccuracyPct >= 50.</summary>
+    public bool WonPrizeShare { get; set; }
+
+    public DateTime SubmittedAt { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+
+// ============================================================
 //  Love Triangle — Phase 2 weekly 3-person drama.
 //
 //  Sunday 10pm IST cadence. The LoveTriangleService picks the

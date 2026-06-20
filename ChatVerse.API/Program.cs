@@ -307,6 +307,12 @@ try
     // 8-day completion. All idempotent.
     builder.Services.AddHostedService<ChatVerse.API.Services.LoveTriangleService>();
 
+    // The Cipher (Phase 2 weekly community ARG) — 5-min tick:
+    // Monday 9am IST opens new round, picks N Cipher Members from
+    // an active-user sample + assigns one phrase-word each. Sunday
+    // 11pm IST closes + scores all Hunter submissions.
+    builder.Services.AddHostedService<ChatVerse.API.Services.CipherRoundService>();
+
     var app = builder.Build();
 
     // ── Middleware pipeline ───────────────────────────────────────
@@ -373,6 +379,12 @@ try
     // GetPublicTriangles / Vote / GetMyHistory. Push: TriangleFormed /
     // PairMessage / ExcerptShared / VotingOpened / TriangleCompleted.
     app.MapHub<ChatVerse.API.Hubs.LoveTriangleHub>("/hubs/love-triangle");
+
+    // Phase 2 hub — The Cipher: GetCurrentRound / GetMyFragment /
+    // SubmitGuess / GetMySubmission / GetLeaderboard / GetArchive.
+    // Push: CipherRoundStarted (all) / CipherFragmentAssigned (per
+    // Member) / CipherRoundClosed (all).
+    app.MapHub<ChatVerse.API.Hubs.CipherHub>("/hubs/cipher");
 
     // ── Startup banner ────────────────────────────────────────────
     // Emit a clear, grep-friendly summary of WHICH hubs got mapped.
