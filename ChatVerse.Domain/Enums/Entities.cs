@@ -587,6 +587,132 @@ public class TimeCapsule
 // ============================================================
 
 // ============================================================
+//  Token Economy — Phase 5 foundation.
+//
+//  Three-collection ledger pattern:
+//    1. TokenBalance        → one row per user, holds the AUTHORITATIVE
+//                             current balance + cumulative totals. Read by
+//                             every other feature that needs to spend tokens.
+//    2. TokenLedgerEntry    → append-only audit log. EVERY balance change
+//                             (credit OR debit) writes a row here with the
+//                             balanceAfter snapshotted, so we can reconstruct
+//                             balance state at any point in time. Single
+//                             source of truth for disputes / audits.
+//    3. TokenTopupOrder     → payment-intent lifecycle. Created when a user
+//                             initiates a top-up, transitions through the
+//                             gateway, settles to "succeeded" / "failed" /
+//                             "cancelled". Once succeeded, the order id is
+//                             stored as the ledger entry's gatewayRef.
+//
+//  Payment gateway is abstracted via IPaymentGateway. MockPaymentGateway
+//  is the current implementation — fully simulates the cycle without real
+//  money. Razorpay/Stripe slot in via DI swap with no domain changes.
+// ============================================================
+
+public class TokenBalance
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    /// <summary>Indexed unique — one row per user.</summary>
+    public string UserId { get; set; } = default!;
+
+    /// <summary>Current spendable balance. Updated atomically alongside
+    /// every TokenLedgerEntry insert.</summary>
+    public int Balance { get; set; }
+
+    /// <summary>Cumulative totals — never reset. Used for "lifetime
+    /// purchased" badges + analytics.</summary>
+    public int LifetimeCredited { get; set; }
+    public int LifetimeDebited  { get; set; }
+
+    /// <summary>Set the first time SignupBonus runs for this user.
+    /// Idempotency guard for the bonus path.</summary>
+    public DateTime? SignupBonusGrantedAt { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+    public DateTime UpdatedAt { get; set; }
+}
+
+public class TokenLedgerEntry
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string UserId { get; set; } = default!;
+
+    /// <summary>Signed delta. Positive = credit, negative = debit.</summary>
+    public int Delta { get; set; }
+
+    /// <summary>Balance immediately after this entry was applied.
+    /// Snapshotted at write time for cheap point-in-time reads.</summary>
+    public int BalanceAfter { get; set; }
+
+    /// <summary>Short code identifying why this entry exists.
+    /// Keep in lockstep with TokenReasons in TokenLedgerService.</summary>
+    public string Reason { get; set; } = default!;
+
+    /// <summary>Free-form context (e.g. "tip:rose:mehfilRoomId" or
+    /// "topup:order:orderId" or "tip:received:fromUserName").</summary>
+    public string? Note { get; set; }
+
+    /// <summary>Order id for `topup` entries; null for other reasons.</summary>
+    public string? GatewayRef { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+}
+
+public class TokenTopupOrder
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string UserId { get; set; } = default!;
+
+    /// <summary>Pack key the user picked — e.g. "pack_99".</summary>
+    public string PackKey { get; set; } = default!;
+
+    /// <summary>Amount in paise / cents — keep integer to avoid FP.</summary>
+    public int AmountMinor { get; set; }
+
+    /// <summary>Currency code — "INR" by default.</summary>
+    public string Currency { get; set; } = "INR";
+
+    /// <summary>How many tokens the user gets on success.</summary>
+    public int TokenAmount { get; set; }
+
+    /// <summary>"created" → "pending" → "succeeded" / "failed" / "cancelled".
+    /// "pending" exists for the brief window between gateway redirect and
+    /// the confirm callback (real gateways), or the 1.5-sec mock processing
+    /// window.</summary>
+    public string Status { get; set; } = "created";
+
+    /// <summary>Gateway provider key — "mock" today, "razorpay" later.</summary>
+    public string Gateway { get; set; } = "mock";
+
+    /// <summary>Provider's own transaction id once issued. For the mock
+    /// gateway this is generated locally; for Razorpay it lands from
+    /// their webhook.</summary>
+    public string? GatewayRef { get; set; }
+
+    /// <summary>If the user is redirected to a gateway page, the URL
+    /// goes here so the client can re-resume. The mock gateway lives
+    /// at /tokens/mock-gateway?orderId=... on the frontend.</summary>
+    public string? GatewayRedirectUrl { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+    public DateTime? CompletedAt { get; set; }
+
+    /// <summary>Once succeeded, the resulting ledger-entry id is
+    /// linked back here so we can reconstruct the full transaction
+    /// from either direction.</summary>
+    public string? ResultingLedgerEntryId { get; set; }
+}
+
+// ============================================================
 //  MEHFIL — Phase 4 creator platform.
 //
 //  User-created host rooms (Twitch + Discord + Bumble model).

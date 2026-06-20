@@ -250,9 +250,17 @@ public static class MongoCollections
     public const string MehfilAttendances = "mehfil_attendances";
     /// <summary>In-room chat thread.</summary>
     public const string MehfilMessages    = "mehfil_messages";
-    /// <summary>Audience tips (MVP records intent only — settlement
-    /// in Phase 5 token economy).</summary>
+    /// <summary>Audience tips. Once Phase 5 token economy ships, every
+    /// tip insert also writes paired ledger entries (sender debit + host credit).</summary>
     public const string MehfilTips        = "mehfil_tips";
+
+    // ── Token economy (Phase 5) ────────────────────────────────
+    /// <summary>One row per user with authoritative current balance.</summary>
+    public const string TokenBalances    = "token_balances";
+    /// <summary>Append-only audit log — every balance change writes here.</summary>
+    public const string TokenLedger      = "token_ledger";
+    /// <summary>Payment-intent lifecycle rows (one per topup attempt).</summary>
+    public const string TokenTopupOrders = "token_topup_orders";
 }
 
 public static class Theater

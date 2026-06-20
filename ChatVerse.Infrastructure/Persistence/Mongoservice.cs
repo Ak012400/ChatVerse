@@ -72,6 +72,11 @@ public partial class MongoService
     private IMongoCollection<MehfilMessage>    MehfilMessages    => _db.GetCollection<MehfilMessage>(MongoCollections.MehfilMessages);
     private IMongoCollection<MehfilTip>        MehfilTips        => _db.GetCollection<MehfilTip>(MongoCollections.MehfilTips);
 
+    // Token economy (Phase 5)
+    private IMongoCollection<TokenBalance>     TokenBalances    => _db.GetCollection<TokenBalance>(MongoCollections.TokenBalances);
+    private IMongoCollection<TokenLedgerEntry> TokenLedger      => _db.GetCollection<TokenLedgerEntry>(MongoCollections.TokenLedger);
+    private IMongoCollection<TokenTopupOrder>  TokenTopupOrders => _db.GetCollection<TokenTopupOrder>(MongoCollections.TokenTopupOrders);
+
     public MongoService(IMongoClient client, string databaseName)
     {
         // Register camelCase convention — matches MongoDB field names (isActive, displayName etc)
@@ -2613,6 +2618,166 @@ public partial class MongoService
             .SortByDescending(t => t.CreatedAt)
             .Limit(limit)
             .ToListAsync();
+
+    // ════════════════════════════════════════════════════════════
+    //  TOKEN ECONOMY — balance + ledger + topup orders
+    // ════════════════════════════════════════════════════════════
+
+    public const int TokenSignupBonusAmount = 100;
+
+    /// <summary>Read-or-create a user's TokenBalance row. New rows
+    /// are seeded with balance = 0 (signup bonus is a separate
+    /// idempotent grant flow — see EnsureSignupBonusAsync).</summary>
+    public async Task<TokenBalance> GetOrCreateTokenBalanceAsync(string userId)
+    {
+        var existing = await TokenBalances.Find(b => b.UserId == userId).FirstOrDefaultAsync();
+        if (existing is not null) return existing;
+        var fresh = new TokenBalance
+        {
+            UserId    = userId,
+            Balance   = 0,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow,
+        };
+        try
+        {
+            await TokenBalances.InsertOneAsync(fresh);
+            return fresh;
+        }
+        catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+        {
+            // Race — another thread inserted. Re-read.
+            return await TokenBalances.Find(b => b.UserId == userId).FirstAsync();
+        }
+    }
+
+    /// <summary>Read the current balance without auto-creating. Used
+    /// for "can this user afford it?" gates before debit attempts.</summary>
+    public async Task<TokenBalance?> GetTokenBalanceAsync(string userId) =>
+        await TokenBalances.Find(b => b.UserId == userId).FirstOrDefaultAsync();
+
+    /// <summary>Apply a signed delta to the balance + write an audit
+    /// row, in a single logical step. Negative deltas (debits) reject
+    /// if they\'d push the balance below zero. Returns the post-state
+    /// balance + the inserted ledger row.
+    ///
+    /// We don\'t use a real transaction here because Atlas free tier
+    /// doesn\'t allow multi-document transactions. Instead: we update
+    /// the balance with a conditional filter that enforces the
+    /// "balance >= -delta" invariant for debits, then write the ledger
+    /// row. If the balance update lost the race, the ledger insert is
+    /// skipped and the caller gets a failure.</summary>
+    public async Task<(bool Ok, TokenBalance? Balance, TokenLedgerEntry? Entry, string? Error)>
+        ApplyTokenDeltaAsync(string userId, int delta, string reason, string? note = null, string? gatewayRef = null)
+    {
+        if (delta == 0) return (false, null, null, "Delta can't be zero.");
+        await GetOrCreateTokenBalanceAsync(userId);
+
+        FilterDefinition<TokenBalance> filter;
+        if (delta < 0)
+        {
+            // Debit — require balance + delta >= 0.
+            filter = Builders<TokenBalance>.Filter.And(
+                Builders<TokenBalance>.Filter.Eq(b => b.UserId, userId),
+                Builders<TokenBalance>.Filter.Gte(b => b.Balance, -delta));
+        }
+        else
+        {
+            filter = Builders<TokenBalance>.Filter.Eq(b => b.UserId, userId);
+        }
+
+        var update = Builders<TokenBalance>.Update
+            .Inc(b => b.Balance, delta)
+            .Set(b => b.UpdatedAt, DateTime.UtcNow);
+        if (delta > 0) update = update.Inc(b => b.LifetimeCredited, delta);
+        else           update = update.Inc(b => b.LifetimeDebited, -delta);
+
+        var options = new FindOneAndUpdateOptions<TokenBalance> { ReturnDocument = ReturnDocument.After };
+        var post = await TokenBalances.FindOneAndUpdateAsync(filter, update, options);
+        if (post is null)
+        {
+            return (false, null, null, delta < 0 ? "Insufficient token balance." : "Balance not found.");
+        }
+
+        var entry = new TokenLedgerEntry
+        {
+            UserId       = userId,
+            Delta        = delta,
+            BalanceAfter = post.Balance,
+            Reason       = reason,
+            Note         = note,
+            GatewayRef   = gatewayRef,
+            CreatedAt    = DateTime.UtcNow,
+        };
+        await TokenLedger.InsertOneAsync(entry);
+        return (true, post, entry, null);
+    }
+
+    public async Task<List<TokenLedgerEntry>> GetTokenLedgerAsync(string userId, int limit = 30) =>
+        await TokenLedger
+            .Find(e => e.UserId == userId)
+            .SortByDescending(e => e.CreatedAt)
+            .Limit(limit)
+            .ToListAsync();
+
+    /// <summary>Idempotent signup bonus. Grants +TokenSignupBonusAmount
+    /// the FIRST time it\'s called for a user; subsequent calls are
+    /// no-ops. Returns true if THIS call performed the grant.</summary>
+    public async Task<bool> EnsureSignupBonusAsync(string userId)
+    {
+        var balance = await GetOrCreateTokenBalanceAsync(userId);
+        if (balance.SignupBonusGrantedAt is not null) return false;
+
+        // Race-safe: only mark granted if it\'s still unset.
+        var filter = Builders<TokenBalance>.Filter.And(
+            Builders<TokenBalance>.Filter.Eq(b => b.UserId, userId),
+            Builders<TokenBalance>.Filter.Eq(b => b.SignupBonusGrantedAt, (DateTime?)null));
+        var mark = Builders<TokenBalance>.Update.Set(b => b.SignupBonusGrantedAt, DateTime.UtcNow);
+        var result = await TokenBalances.UpdateOneAsync(filter, mark);
+        if (result.ModifiedCount != 1) return false;
+
+        var (ok, _, _, _) = await ApplyTokenDeltaAsync(
+            userId, TokenSignupBonusAmount, "signup_bonus", note: "Welcome to ChatVerse");
+        return ok;
+    }
+
+    // ─── Topup orders ──────────────────────────────────────────
+
+    public async Task<TokenTopupOrder> InsertTokenTopupOrderAsync(TokenTopupOrder o)
+    {
+        o.CreatedAt = DateTime.UtcNow;
+        await TokenTopupOrders.InsertOneAsync(o);
+        return o;
+    }
+
+    public async Task<TokenTopupOrder?> GetTokenTopupOrderAsync(string orderId) =>
+        await TokenTopupOrders.Find(o => o.Id == orderId).FirstOrDefaultAsync();
+
+    public async Task<List<TokenTopupOrder>> GetMyTokenTopupOrdersAsync(string userId, int limit = 20) =>
+        await TokenTopupOrders
+            .Find(o => o.UserId == userId)
+            .SortByDescending(o => o.CreatedAt)
+            .Limit(limit)
+            .ToListAsync();
+
+    /// <summary>Idempotent — only succeeds if the order is currently
+    /// "created" or "pending". Returns true on the transition that
+    /// flipped it.</summary>
+    public async Task<bool> SetTokenTopupOrderStatusAsync(
+        string orderId, string newStatus, string? gatewayRef = null, string? ledgerEntryId = null)
+    {
+        var filter = Builders<TokenTopupOrder>.Filter.And(
+            Builders<TokenTopupOrder>.Filter.Eq(o => o.Id, orderId),
+            Builders<TokenTopupOrder>.Filter.In(o => o.Status, new[] { "created", "pending" }));
+        var update = Builders<TokenTopupOrder>.Update.Set(o => o.Status, newStatus);
+        if (newStatus == "succeeded" || newStatus == "failed" || newStatus == "cancelled")
+            update = update.Set(o => o.CompletedAt, DateTime.UtcNow);
+        if (gatewayRef is not null)     update = update.Set(o => o.GatewayRef, gatewayRef);
+        if (ledgerEntryId is not null)  update = update.Set(o => o.ResultingLedgerEntryId, ledgerEntryId);
+
+        var result = await TokenTopupOrders.UpdateOneAsync(filter, update);
+        return result.ModifiedCount == 1;
+    }
 }
 
 // ── Supporting result types ───────────────────────────────────
