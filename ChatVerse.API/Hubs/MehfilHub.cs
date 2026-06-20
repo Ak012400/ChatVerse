@@ -1,5 +1,6 @@
 using ChatVerse.API.Extensions;
 using ChatVerse.API.Services;
+using ChatVerse.API.Services.Tokens;
 using ChatVerse.Domain.Entities;
 using ChatVerse.Infrastructure.Persistence.MongoDB;
 using Microsoft.AspNetCore.Authorization;
@@ -37,12 +38,18 @@ namespace ChatVerse.API.Hubs;
 public class MehfilHub : Hub
 {
     private readonly MongoService _mongo;
+    private readonly TokenLedgerService _tokens;
     private readonly IHubContext<MehfilHub> _hubCtx;
     private readonly ILogger<MehfilHub> _logger;
 
-    public MehfilHub(MongoService mongo, IHubContext<MehfilHub> hubCtx, ILogger<MehfilHub> logger)
+    public MehfilHub(
+        MongoService mongo,
+        TokenLedgerService tokens,
+        IHubContext<MehfilHub> hubCtx,
+        ILogger<MehfilHub> logger)
     {
         _mongo = mongo;
+        _tokens = tokens;
         _hubCtx = hubCtx;
         _logger = logger;
     }
@@ -257,8 +264,24 @@ public class MehfilHub : Hub
             ?? throw new HubException("Mehfil not found.");
         if (room.Status != "live") throw new HubException("Tips only during live shows.");
         if (room.HostUserId == meId) throw new HubException("Host can't tip themselves.");
-        if (!MongoService.MehfilGifts.ContainsKey(giftType))
+        if (!MongoService.MehfilGifts.TryGetValue(giftType, out var amount))
             throw new HubException("Unknown gift.");
+
+        // ── Real token settlement now that Phase 5 ledger exists. ──
+        //    Debit sender → if they don\'t have enough tokens, the
+        //    transfer fails before the tip row is written. Then credit
+        //    host. If the credit half fails (very unlikely — the only
+        //    way is a Mongo write error), TransferAsync auto-rolls
+        //    back the debit via a refund ledger row.
+        var (transferOk, transferErr) = await _tokens.TransferAsync(
+            fromUserId:   meId,
+            toUserId:     room.HostUserId,
+            amount:       amount,
+            debitReason:  TokenReasons.TipSent,
+            creditReason: TokenReasons.TipReceived,
+            note:         $"mehfil:{giftType}:{roomId}");
+        if (!transferOk)
+            throw new HubException(transferErr ?? "Couldn\'t complete the tip.");
 
         var tip = new MehfilTip
         {
