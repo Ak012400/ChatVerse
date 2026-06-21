@@ -297,6 +297,10 @@ try
     // its author. Idempotent per UTC date.
     builder.Services.AddHostedService<ChatVerse.API.Services.ConfessionRankingService>();
 
+    // Polls auto-close ticker (parity polish) — 1-min tick sweeps
+    // expired open polls and broadcasts PollClosed to the room.
+    builder.Services.AddHostedService<ChatVerse.API.Services.PollsTickerService>();
+
     // Ghost Date (Phase 2 weekly anonymous dating) — 60-second tick
     // handles Thursday 9pm IST pairing + 9:30pm chat-ended push +
     // 9:35pm decision-deadline expiry. All idempotent.
@@ -420,6 +424,11 @@ try
     // GetPacks / CreateTopupOrder / ConfirmMockPayment / CancelTopupOrder /
     // EnsureSignupBonus. Push: BalanceChanged (per-user).
     app.MapHub<ChatVerse.API.Hubs.TokensHub>("/hubs/tokens");
+
+    // Parity-polish hub — Soundboard: JoinScope / LeaveScope / PlaySound
+    // with 8-sound allowlist + per-second rate-limit. Push: SoundPlayed.
+    // Mounted in Theater, PYAAR LIVE spectator, Mehfil, Hosted group video.
+    app.MapHub<ChatVerse.API.Hubs.SoundboardHub>("/hubs/soundboard");
 
     // ── Startup banner ────────────────────────────────────────────
     // Emit a clear, grep-friendly summary of WHICH hubs got mapped.

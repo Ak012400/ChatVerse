@@ -1435,4 +1435,155 @@ public class ChatHub : Hub
         editedAt = m.EditedAt,
         createdAt = m.CreatedAt
     };
+
+    // ──────────────────────────────────────────────────────────────
+    //  Polls — in-room voting primitive (parity polish)
+    //
+    //  Lives on ChatHub so we can reuse the existing room SignalR
+    //  group instead of opening another websocket. Hub methods are
+    //  async + Context.ConnectionAborted-cancellable per house rules.
+    //
+    //  Push events:
+    //    PollCreated  (room group) — full poll + ttl
+    //    PollUpdated  (room group) — vote counts only (no voter ids
+    //                                  when Anonymous=true)
+    //    PollClosed   (room group) — final counts + optional voter
+    //                                  reveal when Anonymous=false
+    //
+    //  Privacy contract:
+    //    Anonymous polls NEVER serialise Votes by user. Only the per-
+    //    option count arrays go out. The server preserves voter ids
+    //    internally for de-duplication; clients only see totals.
+    // ──────────────────────────────────────────────────────────────
+
+    private const int MaxPollQuestionChars = 200;
+    private const int MaxPollOptionChars   = 80;
+    private const int MaxPollOptions       = 6;
+    private const int MinPollOptions       = 2;
+    private static readonly int[] AllowedPollDurations = new[] { 30, 60, 300 };
+
+    public async Task<string?> CreatePoll(
+        string roomSlug,
+        string question,
+        IEnumerable<string> options,
+        int durationSeconds,
+        bool multiSelect,
+        bool anonymous)
+    {
+        var ct = Context.ConnectionAborted;
+        if (string.IsNullOrWhiteSpace(roomSlug)) throw new HubException("Invalid room.");
+        if (string.IsNullOrWhiteSpace(question) || question.Length > MaxPollQuestionChars)
+            throw new HubException("Question must be 1-200 chars.");
+
+        var trimmedOptions = (options ?? Array.Empty<string>())
+            .Select(o => o?.Trim() ?? "")
+            .Where(o => o.Length > 0 && o.Length <= MaxPollOptionChars)
+            .Take(MaxPollOptions)
+            .ToList();
+        if (trimmedOptions.Count < MinPollOptions)
+            throw new HubException($"At least {MinPollOptions} options required.");
+
+        if (!AllowedPollDurations.Contains(durationSeconds))
+            throw new HubException("Duration must be 30, 60, or 300 seconds.");
+
+        var userId   = JwtService.GetUserId(Context.User!).ToString();
+        var username = JwtService.GetUsername(Context.User!);
+        var now      = DateTime.UtcNow;
+
+        var poll = new Poll
+        {
+            RoomSlug        = roomSlug,
+            CreatorUserId   = userId,
+            CreatorUsername = username,
+            Question        = question.Trim(),
+            Options         = trimmedOptions,
+            MultiSelect     = multiSelect,
+            Anonymous       = anonymous,
+            CreatedAt       = now,
+            ExpiresAt       = now.AddSeconds(durationSeconds),
+        };
+        await _mongo.InsertPollAsync(poll, ct);
+
+        await Clients.Group(roomSlug).SendAsync("PollCreated", ShapePoll(poll, includeVoters: false), ct);
+        return poll.Id;
+    }
+
+    public async Task Vote(string pollId, int optionIndex)
+    {
+        var ct = Context.ConnectionAborted;
+        if (string.IsNullOrWhiteSpace(pollId)) throw new HubException("Invalid poll.");
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+
+        var updated = await _mongo.ApplyPollVoteAsync(pollId, userId, optionIndex, ct);
+        if (updated is null) return;
+
+        await Clients.Group(updated.RoomSlug).SendAsync(
+            "PollUpdated",
+            ShapePoll(updated, includeVoters: false),
+            ct);
+    }
+
+    public async Task ClosePoll(string pollId)
+    {
+        var ct = Context.ConnectionAborted;
+        if (string.IsNullOrWhiteSpace(pollId)) throw new HubException("Invalid poll.");
+        var userId = JwtService.GetUserId(Context.User!).ToString();
+
+        var poll = await _mongo.GetPollAsync(pollId, ct);
+        if (poll is null || poll.IsClosed) return;
+
+        // Only the creator can close early. (Future: extend to room owners.)
+        if (!string.Equals(poll.CreatorUserId, userId, StringComparison.OrdinalIgnoreCase))
+            throw new HubException("Only the poll creator can close it.");
+
+        var closed = await _mongo.ClosePollAsync(pollId, ct);
+        if (closed is null) return;
+
+        // On close, include voter reveal IFF the poll is non-anonymous.
+        await Clients.Group(closed.RoomSlug).SendAsync(
+            "PollClosed",
+            ShapePoll(closed, includeVoters: !closed.Anonymous),
+            ct);
+    }
+
+    public async Task<List<object>> GetActivePollsForRoom(string roomSlug)
+    {
+        var ct = Context.ConnectionAborted;
+        var polls = await _mongo.GetActivePollsForRoomAsync(roomSlug, ct);
+        return polls.Select(p => ShapePoll(p, includeVoters: false)).ToList();
+    }
+
+    /// <summary>Project a Poll for over-the-wire serialisation.
+    /// `includeVoters` only ever flips true at close on non-anonymous polls.</summary>
+    private static object ShapePoll(Poll p, bool includeVoters)
+    {
+        // Per-option vote counts derived from the Votes dictionary.
+        var counts = new int[p.Options.Count];
+        foreach (var picks in p.Votes.Values)
+        {
+            foreach (var idx in picks)
+            {
+                if (idx >= 0 && idx < counts.Length) counts[idx]++;
+            }
+        }
+
+        return new
+        {
+            id              = p.Id,
+            roomSlug        = p.RoomSlug,
+            creatorUserId   = p.CreatorUserId,
+            creatorUsername = p.CreatorUsername,
+            question        = p.Question,
+            options         = p.Options,
+            counts,
+            multiSelect     = p.MultiSelect,
+            anonymous       = p.Anonymous,
+            createdAt       = p.CreatedAt,
+            expiresAt       = p.ExpiresAt,
+            isClosed        = p.IsClosed,
+            closedAt        = p.ClosedAt,
+            // Voter reveal ONLY when contract permits.
+            voters          = includeVoters ? p.Votes : null,
+        };
+    }
 }
