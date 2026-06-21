@@ -202,6 +202,12 @@ public static class MongoCollections
     /// reveal offer; archives roll into the Lore Wall.</summary>
     public const string Confessions = "confessions";
 
+    // ── In-room polls (parity polish) ─────────────────────────
+    /// <summary>Lightweight voting primitive scoped to a chat room.
+    /// 30 / 60 / 300 sec timed polls, multi-choice, anonymous-by-default.
+    /// Reused by PYAAR LIVE spectator Q&amp;A + Love Triangle audience picks.</summary>
+    public const string Polls = "polls";
+
     // ── Ghost Date ─────────────────────────────────────────────
     /// <summary>Weekly opt-in pool for Thursday 9pm IST ghost dates.</summary>
     public const string GhostDateRegistrations = "ghost_date_registrations";

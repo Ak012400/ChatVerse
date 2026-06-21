@@ -38,6 +38,9 @@ public partial class MongoService
     // Confession Box — anonymous daily confessions
     private IMongoCollection<Confession> Confessions => _db.GetCollection<Confession>(MongoCollections.Confessions);
 
+    // In-room polls (parity polish)
+    private IMongoCollection<Poll> Polls => _db.GetCollection<Poll>(MongoCollections.Polls);
+
     // Ghost Date — weekly Thursday 9pm IST anonymous dating
     private IMongoCollection<GhostDateRegistration> GhostDateRegistrations =>
         _db.GetCollection<GhostDateRegistration>(MongoCollections.GhostDateRegistrations);
@@ -2836,6 +2839,127 @@ public partial class MongoService
             .Set(o => o.GatewayRef, gatewayRef)
             .Set(o => o.GatewayRedirectUrl, redirectUrl);
         await TokenTopupOrders.UpdateOneAsync(filter, update);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  In-room polls (parity polish)
+    //
+    //  All operations cancellable; vote toggle uses atomic update with
+    //  positional operators so concurrent voters don't trample each
+    //  other. We DO NOT use a transaction (Atlas free tier doesn't
+    //  support multi-doc transactions) — every mutation is one update.
+    // ──────────────────────────────────────────────────────────────
+
+    public async Task InsertPollAsync(Poll p, CancellationToken ct = default)
+    {
+        await Polls.InsertOneAsync(p, options: null, ct);
+    }
+
+    public async Task<Poll?> GetPollAsync(string id, CancellationToken ct = default)
+    {
+        return await Polls.Find(p => p.Id == id).FirstOrDefaultAsync(ct);
+    }
+
+    /// <summary>Active = not closed AND ExpiresAt &gt; now. Used by
+    /// ChatPage when it opens a lounge to populate any in-flight polls.</summary>
+    public async Task<List<Poll>> GetActivePollsForRoomAsync(string roomSlug, CancellationToken ct = default)
+    {
+        var nowUtc = DateTime.UtcNow;
+        var filter = Builders<Poll>.Filter.And(
+            Builders<Poll>.Filter.Eq(p => p.RoomSlug, roomSlug),
+            Builders<Poll>.Filter.Eq(p => p.IsClosed, false),
+            Builders<Poll>.Filter.Gt(p => p.ExpiresAt, nowUtc));
+        return await Polls.Find(filter)
+            .SortByDescending(p => p.CreatedAt)
+            .Limit(20)
+            .ToListAsync(ct);
+    }
+
+    /// <summary>Sweeped by the ticker every minute. Returns polls that
+    /// have already expired but haven't been flagged closed yet.</summary>
+    public async Task<List<Poll>> GetExpiredOpenPollsAsync(int limit, CancellationToken ct = default)
+    {
+        var nowUtc = DateTime.UtcNow;
+        var filter = Builders<Poll>.Filter.And(
+            Builders<Poll>.Filter.Eq(p => p.IsClosed, false),
+            Builders<Poll>.Filter.Lte(p => p.ExpiresAt, nowUtc));
+        return await Polls.Find(filter).Limit(limit).ToListAsync(ct);
+    }
+
+    /// <summary>Toggle a vote atomically. Single-choice = replaces any
+    /// prior pick. Multi-select = adds/removes the single index from the
+    /// user's list. Returns updated poll OR null if the poll is closed.</summary>
+    public async Task<Poll?> ApplyPollVoteAsync(
+        string pollId,
+        string userId,
+        int optionIndex,
+        CancellationToken ct = default)
+    {
+        var poll = await GetPollAsync(pollId, ct);
+        if (poll is null) return null;
+        if (poll.IsClosed) return poll;
+        if (poll.ExpiresAt <= DateTime.UtcNow) return poll;
+        if (optionIndex < 0 || optionIndex >= poll.Options.Count) return poll;
+
+        var existing = poll.Votes.TryGetValue(userId, out var list) ? list : new List<int>();
+        List<int> next;
+        if (poll.MultiSelect)
+        {
+            // Toggle this single index in the user's pick list.
+            if (existing.Contains(optionIndex))
+                next = existing.Where(i => i != optionIndex).ToList();
+            else
+                next = existing.Concat(new[] { optionIndex }).Distinct().ToList();
+        }
+        else
+        {
+            // Single-choice: clicking the same option twice clears the vote;
+            // clicking a new option replaces. Lets users undo + change.
+            next = existing.Count == 1 && existing[0] == optionIndex
+                ? new List<int>()
+                : new List<int> { optionIndex };
+        }
+
+        // String-path Set to avoid the "key contains period" issue Mongo
+        // hits with dots in user-ids (Guid strings are safe but we still
+        // want one consistent shape).
+        var votesField = $"Votes.{userId}";
+        var filter = Builders<Poll>.Filter.And(
+            Builders<Poll>.Filter.Eq(p => p.Id, pollId),
+            Builders<Poll>.Filter.Eq(p => p.IsClosed, false));
+        var update = next.Count == 0
+            ? Builders<Poll>.Update.Unset(votesField)
+            : Builders<Poll>.Update.Set(votesField, next);
+        await Polls.UpdateOneAsync(filter, update, options: null, ct);
+
+        return await GetPollAsync(pollId, ct);
+    }
+
+    /// <summary>Close a poll immediately. Idempotent — safe to call
+    /// from both the ticker (expiry) and the host (manual close).</summary>
+    public async Task<Poll?> ClosePollAsync(string pollId, CancellationToken ct = default)
+    {
+        var filter = Builders<Poll>.Filter.And(
+            Builders<Poll>.Filter.Eq(p => p.Id, pollId),
+            Builders<Poll>.Filter.Eq(p => p.IsClosed, false));
+        var update = Builders<Poll>.Update
+            .Set(p => p.IsClosed, true)
+            .Set(p => p.ClosedAt, DateTime.UtcNow);
+        await Polls.UpdateOneAsync(filter, update, options: null, ct);
+        return await GetPollAsync(pollId, ct);
+    }
+
+    /// <summary>Recent closed polls for the room, newest first. Used for
+    /// the small history rail above the lounge composer.</summary>
+    public async Task<List<Poll>> GetClosedPollsForRoomAsync(string roomSlug, int limit, CancellationToken ct = default)
+    {
+        var filter = Builders<Poll>.Filter.And(
+            Builders<Poll>.Filter.Eq(p => p.RoomSlug, roomSlug),
+            Builders<Poll>.Filter.Eq(p => p.IsClosed, true));
+        return await Polls.Find(filter)
+            .SortByDescending(p => p.ClosedAt)
+            .Limit(limit)
+            .ToListAsync(ct);
     }
 }
 

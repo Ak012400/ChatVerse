@@ -1457,3 +1457,55 @@ public class PersonaMessage
 
     public DateTime CreatedAt { get; set; }
 }
+
+// ============================================================
+//  Poll — lightweight in-room voting primitive.
+//
+//  Lives in any chat room (RoomSlug = the lounge slug). Vote-update
+//  push happens via ChatHub since the room hub is already singleton-
+//  connected for every user in the room. We piggyback its SignalR
+//  group instead of opening a new hub.
+//
+//  Anonymous mode is the default to match Confession / Ghost-Date
+//  privacy DNA. When Anonymous=true the server NEVER serialises
+//  voter ids in the DTO, only counts per option. When false, voters
+//  are revealed on close (per-option voter id list).
+//
+//  Vote shape: Dictionary<userId, List<optionIndex>>. Single-choice
+//  polls have at most one entry per user; multi-select lets the
+//  list grow up to OptionCount.
+// ============================================================
+
+public class Poll
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    /// <summary>Room this poll belongs to. SignalR group key in ChatHub. </summary>
+    public string RoomSlug { get; set; } = default!;
+
+    public string CreatorUserId { get; set; } = default!;
+    public string CreatorUsername { get; set; } = default!;
+
+    /// <summary>≤ 200 chars (enforced in hub). Plain text. </summary>
+    public string Question { get; set; } = default!;
+
+    /// <summary>2-6 options. Each is plain text, ≤ 80 chars. </summary>
+    public List<string> Options { get; set; } = new();
+
+    /// <summary>userId → list of chosen option indices. Single-choice
+    /// polls cap list length at 1; multi-select allows up to Options.Count. </summary>
+    public Dictionary<string, List<int>> Votes { get; set; } = new();
+
+    public bool MultiSelect { get; set; }
+
+    /// <summary>If true, voter ids are NEVER serialised — only the
+    /// counts go out. Even at close-time, the reveal stays at counts. </summary>
+    public bool Anonymous { get; set; } = true;
+
+    public DateTime CreatedAt { get; set; }
+    public DateTime ExpiresAt { get; set; }
+    public bool IsClosed { get; set; }
+    public DateTime? ClosedAt { get; set; }
+}
