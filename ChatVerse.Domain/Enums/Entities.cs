@@ -896,6 +896,12 @@ public class PyaarShow
     public DateTime? StartedAt { get; set; }
     public DateTime? EndedAt { get; set; }
     public DateTime CreatedAt { get; set; }
+
+    /// <summary>Who is "running" this show. MVP is auto-orchestrated
+    /// so this defaults to "ChatVerse System". Reserved field for the
+    /// v2 user-MC role where a verified host can take the mic between
+    /// rounds.</summary>
+    public string HostedBy { get; set; } = "ChatVerse System";
 }
 
 public class PyaarCouple
@@ -928,6 +934,45 @@ public class PyaarCouple
     /// in top 3. Set at show completion.</summary>
     public int? FinalRank { get; set; }
 
+    /// <summary>Couple member toggled their camera on. The control-
+    /// room grid uses this to swap the avatar circles for a "video
+    /// active" badge. v2 wires actual LiveKit rooms here; today the
+    /// flag exists so the UI is ready when video lands.</summary>
+    public bool VideoActive { get; set; }
+
+    /// <summary>Pre-computed LiveKit sub-room name for this couple,
+    /// pattern `pyaar:show:{showId}:couple:{coupleId}`. Stored so
+    /// both members + spectators can resolve the same room without
+    /// re-deriving from ids. Null until VideoActive flips true.</summary>
+    public string? LiveKitRoomName { get; set; }
+
+    /// <summary>Cached count of spectators currently drilled into this
+    /// couple\'s view. Bumped/decremented atomically by the hub on
+    /// Watch/Unwatch + cleaned up on disconnect via Redis presence
+    /// set as source of truth (this field is best-effort cache).</summary>
+    public int SpectatorCount { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+}
+
+// ============================================================
+//  PyaarReaction — short-lived ambient emoji broadcast for the
+//  spectator grid. Stored only briefly (24h TTL via maintenance
+//  sweep); the UI uses them as floating-emoji bursts, not as a
+//  durable record.
+// ============================================================
+public class PyaarReaction
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string ShowId { get; set; } = default!;
+    /// <summary>Null = grid-wide ambient reaction. Set = targeted at
+    /// a specific couple\'s tile.</summary>
+    public string? CoupleId { get; set; }
+    public string SenderUserId { get; set; } = default!;
+    public string Emoji { get; set; } = default!;
     public DateTime CreatedAt { get; set; }
 }
 

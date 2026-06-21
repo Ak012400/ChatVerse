@@ -4,6 +4,7 @@ using ChatVerse.Domain.Entities;
 using ChatVerse.Infrastructure.Persistence.MongoDB;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
+using StackExchange.Redis;
 
 namespace ChatVerse.API.Hubs;
 
@@ -41,15 +42,29 @@ namespace ChatVerse.API.Hubs;
 public class PyaarLiveHub : Hub
 {
     private readonly MongoService _mongo;
+    private readonly IConnectionMultiplexer _redis;
     private readonly IHubContext<PyaarLiveHub> _hubCtx;
     private readonly ILogger<PyaarLiveHub> _logger;
 
-    public PyaarLiveHub(MongoService mongo, IHubContext<PyaarLiveHub> hubCtx, ILogger<PyaarLiveHub> logger)
+    public PyaarLiveHub(
+        MongoService mongo,
+        IConnectionMultiplexer redis,
+        IHubContext<PyaarLiveHub> hubCtx,
+        ILogger<PyaarLiveHub> logger)
     {
         _mongo = mongo;
+        _redis = redis;
         _hubCtx = hubCtx;
         _logger = logger;
     }
+
+    // ─── Redis helpers ──────────────────────────────────────────
+    // Per-couple spectator presence set + grid-wide spectator presence.
+    // Sorted set scored by "last-seen ms" so we can sweep stale members.
+    private IDatabase Db => _redis.GetDatabase();
+    private static string CoupleSpectatorsKey(string coupleId)  => $"pyaar:c:{coupleId}:spectators";
+    private static string ShowSpectatorsKey(string showId)       => $"pyaar:s:{showId}:spectators";
+    private static string CoupleGroup(string coupleId)           => $"pyaar-couple:{coupleId}";
 
     // ─── Time helpers ──────────────────────────────────────────
 
@@ -77,9 +92,45 @@ public class PyaarLiveHub : Hub
         var meId = JwtService.GetUserId(Context.User!).ToString();
         var active = await _mongo.GetActivePyaarShowAsync();
         if (active is not null)
+        {
             await Groups.AddToGroupAsync(Context.ConnectionId, ShowGroup(active.Id!));
+            // Add to the show-wide spectator presence set so the live
+            // header count is real. Score = now-ms; stale entries are
+            // swept by the maintenance job + on disconnect below.
+            var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            await Db.SortedSetAddAsync(ShowSpectatorsKey(active.Id!), meId, nowMs);
+        }
         await base.OnConnectedAsync();
-        _ = meId;  // suppress unused warning if logger removed later
+        _ = meId;
+    }
+
+    public override async Task OnDisconnectedAsync(Exception? exception)
+    {
+        var meId = JwtService.GetUserId(Context.User!).ToString();
+        var active = await _mongo.GetActivePyaarShowAsync();
+        if (active is not null)
+        {
+            await Db.SortedSetRemoveAsync(ShowSpectatorsKey(active.Id!), meId);
+            // Walk every couple in the show, remove me from anywhere I
+            // was watching. Cheap because show has at most 10 couples.
+            var couples = await _mongo.GetCouplesForShowAsync(active.Id!);
+            foreach (var c in couples)
+            {
+                var removed = await Db.SortedSetRemoveAsync(CoupleSpectatorsKey(c.Id!), meId);
+                if (removed)
+                {
+                    var freshCount = (int)(await Db.SortedSetLengthAsync(CoupleSpectatorsKey(c.Id!)));
+                    await _mongo.BumpPyaarCoupleSpectatorCountAsync(c.Id!, freshCount - c.SpectatorCount);
+                    await _hubCtx.Clients.Group(ShowGroup(active.Id!))
+                        .SendAsync("CoupleSpectatorCountChanged", new
+                        {
+                            coupleId       = c.Id,
+                            spectatorCount = freshCount,
+                        });
+                }
+            }
+        }
+        await base.OnDisconnectedAsync(exception);
     }
 
     // ─── Registration ──────────────────────────────────────────
@@ -292,6 +343,8 @@ public class PyaarLiveHub : Hub
     {
         var couples = await _mongo.GetCouplesForShowAsync(show.Id!);
         var mineCouple = couples.FirstOrDefault(c => c.UserAId == viewerId || c.UserBId == viewerId);
+        // Live show-wide spectator headcount from Redis presence set.
+        var showSpectatorCount = (int)(await Db.SortedSetLengthAsync(ShowSpectatorsKey(show.Id!)));
         return new
         {
             id               = show.Id,
@@ -302,18 +355,23 @@ public class PyaarLiveHub : Hub
             currentRoundLabel = show.CurrentRoundLabel,
             currentRoundEndsAt = show.CurrentRoundEndsAt,
             prizePool        = show.PrizePool,
+            hostedBy         = show.HostedBy,
+            spectatorCount   = showSpectatorCount,
             iAmInCouple      = mineCouple is not null,
             myCoupleId       = mineCouple?.Id,
             couples          = couples.Select(c => new
             {
-                id           = c.Id,
-                codename     = c.Codename,
-                coupleNumber = c.CoupleNumber,
-                voteCount    = c.VoteCount,
-                eliminated   = c.EliminatedAt != null,
-                finalRank    = c.FinalRank,
-                memberA      = c.UserAUsername,
-                memberB      = c.UserBUsername,
+                id             = c.Id,
+                codename       = c.Codename,
+                coupleNumber   = c.CoupleNumber,
+                voteCount      = c.VoteCount,
+                eliminated     = c.EliminatedAt != null,
+                eliminatedInRound = c.EliminatedInRound,
+                finalRank      = c.FinalRank,
+                memberA        = c.UserAUsername,
+                memberB        = c.UserBUsername,
+                videoActive    = c.VideoActive,
+                spectatorCount = c.SpectatorCount,
             }).ToList(),
             winningCoupleIds = show.WinningCoupleIds,
         };
@@ -361,4 +419,199 @@ public class PyaarLiveHub : Hub
         content        = m.Content,
         createdAt      = m.CreatedAt,
     };
+
+    // ════════════════════════════════════════════════════════════
+    //  ECOSYSTEM additions — drill-down, video toggle, reactions,
+    //  eliminated archive. Made the spectator experience real.
+    // ════════════════════════════════════════════════════════════
+
+    /// <summary>Spectator opens a couple's full stage view. Joins that
+    /// couple's SignalR group (so PYAAR LIVE messages targeted at the
+    /// couple group fan out to them), adds them to the Redis presence
+    /// set, bumps the cached count, broadcasts the change. Returns the
+    /// full couple state incl. its complete chat thread.</summary>
+    public async Task<object> WatchCouple(string coupleId)
+    {
+        var meId = JwtService.GetUserId(Context.User!).ToString();
+        var active = await _mongo.GetActivePyaarShowAsync()
+            ?? throw new HubException("No live show right now.");
+        var couple = await _mongo.GetCoupleByIdAsync(coupleId)
+            ?? throw new HubException("Couple not found.");
+        if (couple.ShowId != active.Id)
+            throw new HubException("That couple isn't in the live show.");
+
+        await Groups.AddToGroupAsync(Context.ConnectionId, CoupleGroup(coupleId));
+        var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var added = await Db.SortedSetAddAsync(CoupleSpectatorsKey(coupleId), meId, nowMs);
+        if (added)
+        {
+            var freshCount = (int)(await Db.SortedSetLengthAsync(CoupleSpectatorsKey(coupleId)));
+            await _mongo.BumpPyaarCoupleSpectatorCountAsync(coupleId, freshCount - couple.SpectatorCount);
+            await _hubCtx.Clients.Group(ShowGroup(active.Id!))
+                .SendAsync("CoupleSpectatorCountChanged", new
+                {
+                    coupleId,
+                    spectatorCount = freshCount,
+                });
+        }
+
+        var thread = await _mongo.GetPyaarCoupleFullThreadAsync(coupleId);
+        return new
+        {
+            couple = new
+            {
+                id           = couple.Id,
+                codename     = couple.Codename,
+                coupleNumber = couple.CoupleNumber,
+                memberA      = couple.UserAUsername,
+                memberB      = couple.UserBUsername,
+                voteCount    = couple.VoteCount,
+                eliminated   = couple.EliminatedAt != null,
+                eliminatedInRound = couple.EliminatedInRound,
+                finalRank    = couple.FinalRank,
+                videoActive  = couple.VideoActive,
+                livekitRoomName = couple.LiveKitRoomName,
+            },
+            messages = thread.Select(m => ToMessageDtoForViewer(m, meId)).ToList(),
+        };
+    }
+
+    public async Task<object> UnwatchCouple(string coupleId)
+    {
+        var meId = JwtService.GetUserId(Context.User!).ToString();
+        await Groups.RemoveFromGroupAsync(Context.ConnectionId, CoupleGroup(coupleId));
+        var removed = await Db.SortedSetRemoveAsync(CoupleSpectatorsKey(coupleId), meId);
+        if (removed)
+        {
+            var couple = await _mongo.GetCoupleByIdAsync(coupleId);
+            var active = await _mongo.GetActivePyaarShowAsync();
+            if (couple is not null && active is not null)
+            {
+                var freshCount = (int)(await Db.SortedSetLengthAsync(CoupleSpectatorsKey(coupleId)));
+                await _mongo.BumpPyaarCoupleSpectatorCountAsync(coupleId, freshCount - couple.SpectatorCount);
+                await _hubCtx.Clients.Group(ShowGroup(active.Id!))
+                    .SendAsync("CoupleSpectatorCountChanged", new
+                    {
+                        coupleId,
+                        spectatorCount = freshCount,
+                    });
+            }
+        }
+        return new { ok = true };
+    }
+
+    /// <summary>Couple member flips their camera on/off. MVP just
+    /// records the flag + broadcasts; LiveKit room provisioning lands
+    /// in the follow-up (the LiveKitRoomName field is already stamped).</summary>
+    public async Task<object> ToggleCoupleVideo(bool active)
+    {
+        var meId = JwtService.GetUserId(Context.User!).ToString();
+        var show = await _mongo.GetActivePyaarShowAsync()
+            ?? throw new HubException("No live show right now.");
+        var couple = await _mongo.GetMyCoupleAsync(show.Id!, meId)
+            ?? throw new HubException("You're not in a couple this show.");
+        if (couple.EliminatedAt is not null)
+            throw new HubException("Eliminated couples can't toggle video.");
+
+        var livekitRoom = active ? $"pyaar:show:{show.Id}:couple:{couple.Id}" : null;
+        await _mongo.SetPyaarCoupleVideoActiveAsync(couple.Id!, active, livekitRoom);
+
+        await _hubCtx.Clients.Group(ShowGroup(show.Id!))
+            .SendAsync("CoupleVideoStateChanged", new
+            {
+                coupleId    = couple.Id,
+                videoActive = active,
+                livekitRoomName = livekitRoom,
+            });
+        return new { ok = true, videoActive = active, livekitRoomName = livekitRoom };
+    }
+
+    /// <summary>Ambient reaction broadcast. coupleId is optional — null
+    /// means a grid-wide ambient emoji. We persist briefly (24h sweep)
+    /// so late-joiners get the recent crowd vibe.</summary>
+    public async Task<object> SendReaction(string emoji, string? coupleId = null)
+    {
+        var meId = JwtService.GetUserId(Context.User!).ToString();
+        var show = await _mongo.GetActivePyaarShowAsync()
+            ?? throw new HubException("No live show right now.");
+        if (string.IsNullOrWhiteSpace(emoji) || emoji.Length > 8)
+            throw new HubException("Pick a single emoji.");
+
+        var reaction = new PyaarReaction
+        {
+            ShowId       = show.Id!,
+            CoupleId     = coupleId,
+            SenderUserId = meId,
+            Emoji        = emoji,
+        };
+        await _mongo.InsertPyaarReactionAsync(reaction);
+
+        await _hubCtx.Clients.Group(ShowGroup(show.Id!))
+            .SendAsync("ReactionFlashed", new
+            {
+                emoji,
+                coupleId,
+                createdAt = reaction.CreatedAt,
+            });
+        return new { ok = true };
+    }
+
+    /// <summary>Read-only post-mortem for eliminated couples — surfaces
+    /// their full chat history so spectators can scroll back and read
+    /// what they were saying before getting kicked. "Yeh log kya batein
+    /// kar rahe the" wala feel.</summary>
+    public async Task<object> GetEliminatedThreads()
+    {
+        var show = await _mongo.GetActivePyaarShowAsync()
+            ?? throw new HubException("No live show right now.");
+        var couples = await _mongo.GetCouplesForShowAsync(show.Id!);
+        var eliminated = couples.Where(c => c.EliminatedAt is not null).ToList();
+        var rows = new List<object>();
+        foreach (var c in eliminated)
+        {
+            var thread = await _mongo.GetPyaarCoupleFullThreadAsync(c.Id!, 200);
+            rows.Add(new
+            {
+                couple = new
+                {
+                    id              = c.Id,
+                    codename        = c.Codename,
+                    coupleNumber    = c.CoupleNumber,
+                    memberA         = c.UserAUsername,
+                    memberB         = c.UserBUsername,
+                    voteCount       = c.VoteCount,
+                    eliminatedInRound = c.EliminatedInRound,
+                    eliminatedAt    = c.EliminatedAt,
+                },
+                messages = thread.Select(m => new
+                {
+                    id             = m.Id,
+                    senderUsername = m.SenderUsername,
+                    roundNumber    = m.RoundNumber,
+                    content        = m.Content,
+                    createdAt      = m.CreatedAt,
+                }).ToList(),
+            });
+        }
+        return new { count = rows.Count, eliminated = rows };
+    }
+
+    /// <summary>Recent ambient reactions so a fresh spectator sees the
+    /// emoji crowd-vibe immediately on opening the grid.</summary>
+    public async Task<object> GetRecentReactions()
+    {
+        var show = await _mongo.GetActivePyaarShowAsync()
+            ?? throw new HubException("No live show right now.");
+        var recent = await _mongo.GetRecentPyaarReactionsAsync(show.Id!);
+        return new
+        {
+            count     = recent.Count,
+            reactions = recent.Select(r => new
+            {
+                emoji     = r.Emoji,
+                coupleId  = r.CoupleId,
+                createdAt = r.CreatedAt,
+            }).ToList(),
+        };
+    }
 }
