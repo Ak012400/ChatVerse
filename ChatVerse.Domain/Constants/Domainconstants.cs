@@ -241,6 +241,9 @@ public static class MongoCollections
     /// write wins, the cached PyaarCouple.VoteCount is the source
     /// of truth for ranking.</summary>
     public const string PyaarVotes         = "pyaar_votes";
+    /// <summary>Short-lived ambient reactions (emoji bursts) on the
+    /// spectator grid. Swept by maintenance webjob after 24h.</summary>
+    public const string PyaarReactions     = "pyaar_reactions";
 
     // ── MEHFIL ─────────────────────────────────────────────────
     /// <summary>Host-created rooms with template + lifecycle.</summary>

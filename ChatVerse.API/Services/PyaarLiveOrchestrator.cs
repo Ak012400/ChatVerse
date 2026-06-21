@@ -133,6 +133,9 @@ public sealed class PyaarLiveOrchestrator : BackgroundService
             CurrentRoundLabel = "Icebreaker",
             CurrentRoundEndsAt = scheduledFor.AddMinutes(Round1Minutes),
             PrizePool     = 0,
+            // Auto-orchestrated shows belong to the system. v2 user-MC
+            // role would replace this with a username at formation time.
+            HostedBy      = "ChatVerse System",
         };
         var savedShow = await mongo.InsertPyaarShowAsync(show);
 

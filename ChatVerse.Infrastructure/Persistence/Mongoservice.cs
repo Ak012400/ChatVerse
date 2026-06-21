@@ -65,6 +65,7 @@ public partial class MongoService
     private IMongoCollection<PyaarCouple>       PyaarCouples       => _db.GetCollection<PyaarCouple>(MongoCollections.PyaarCouples);
     private IMongoCollection<PyaarMessage>      PyaarMessages      => _db.GetCollection<PyaarMessage>(MongoCollections.PyaarMessages);
     private IMongoCollection<PyaarVote>         PyaarVotes         => _db.GetCollection<PyaarVote>(MongoCollections.PyaarVotes);
+    private IMongoCollection<PyaarReaction>     PyaarReactions     => _db.GetCollection<PyaarReaction>(MongoCollections.PyaarReactions);
 
     // MEHFIL — creator-room platform
     private IMongoCollection<MehfilRoom>       MehfilRooms       => _db.GetCollection<MehfilRoom>(MongoCollections.MehfilRooms);
@@ -2453,6 +2454,50 @@ public partial class MongoService
 
     public async Task<PyaarVote?> GetMyPyaarVoteAsync(string showId, string voterUserId) =>
         await PyaarVotes.Find(v => v.ShowId == showId && v.VoterUserId == voterUserId).FirstOrDefaultAsync();
+
+    // ─── PYAAR LIVE ecosystem extras ───────────────────────────
+
+    public async Task SetPyaarCoupleVideoActiveAsync(string coupleId, bool active, string? livekitRoomName)
+    {
+        var update = Builders<PyaarCouple>.Update
+            .Set(c => c.VideoActive, active)
+            .Set(c => c.LiveKitRoomName, livekitRoomName);
+        await PyaarCouples.UpdateOneAsync(
+            Builders<PyaarCouple>.Filter.Eq(c => c.Id, coupleId), update);
+    }
+
+    public async Task BumpPyaarCoupleSpectatorCountAsync(string coupleId, int delta)
+    {
+        await PyaarCouples.UpdateOneAsync(
+            Builders<PyaarCouple>.Filter.Eq(c => c.Id, coupleId),
+            Builders<PyaarCouple>.Update.Inc(c => c.SpectatorCount, delta));
+    }
+
+    public async Task<List<PyaarMessage>> GetPyaarCoupleFullThreadAsync(string coupleId, int limit = 500) =>
+        await PyaarMessages
+            .Find(m => m.CoupleId == coupleId)
+            .SortBy(m => m.CreatedAt)
+            .Limit(limit)
+            .ToListAsync();
+
+    public async Task InsertPyaarReactionAsync(PyaarReaction r)
+    {
+        r.CreatedAt = DateTime.UtcNow;
+        await PyaarReactions.InsertOneAsync(r);
+    }
+
+    /// <summary>Recent ambient reactions (last 60 seconds) so a late-
+    /// joining spectator gets a few floating emojis on arrival rather
+    /// than a static grid.</summary>
+    public async Task<List<PyaarReaction>> GetRecentPyaarReactionsAsync(string showId, int limit = 30)
+    {
+        var since = DateTime.UtcNow.AddSeconds(-60);
+        return await PyaarReactions
+            .Find(r => r.ShowId == showId && r.CreatedAt >= since)
+            .SortByDescending(r => r.CreatedAt)
+            .Limit(limit)
+            .ToListAsync();
+    }
 
     // ════════════════════════════════════════════════════════════
     //  MEHFIL — creator-room platform
