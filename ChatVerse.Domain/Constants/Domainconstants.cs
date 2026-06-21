@@ -220,6 +220,20 @@ public static class MongoCollections
     public const string DebateBans              = "debate_bans";
     public const string DebateMessages          = "debate_messages";
 
+    // ── Ghost Room (second per-template Mehfil specialisation) ──
+    /// <summary>All gd_* collections — STANDALONE Mehfil ghost-room
+    /// template. Distinct from the legacy ghost_date_* family used by
+    /// the weekly Thursday /ghost-date feature. The two features
+    /// coexist and never share collections.</summary>
+    public const string GhostRoomConfigs        = "gd_room_configs";
+    public const string GhostVoyagers           = "gd_voyagers";
+    public const string GhostNominations        = "gd_nominations";
+    public const string GhostPairs              = "gd_pairs";
+    public const string GhostPairMessages       = "gd_pair_messages";
+    public const string GhostReveals            = "gd_reveals";
+    public const string GhostBans               = "gd_bans";
+    public const string GhostMatchmakerActions  = "gd_matchmaker_actions";
+
     // ── Ghost Date ─────────────────────────────────────────────
     /// <summary>Weekly opt-in pool for Thursday 9pm IST ghost dates.</summary>
     public const string GhostDateRegistrations = "ghost_date_registrations";
