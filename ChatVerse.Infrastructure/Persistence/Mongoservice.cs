@@ -41,6 +41,16 @@ public partial class MongoService
     // In-room polls (parity polish)
     private IMongoCollection<Poll> Polls => _db.GetCollection<Poll>(MongoCollections.Polls);
 
+    // Debate (per-template Mehfil specialisation — all collections
+    // are standalone per the per-feature isolation policy).
+    private IMongoCollection<DebateRound>           DebateRounds           => _db.GetCollection<DebateRound>(MongoCollections.DebateRounds);
+    private IMongoCollection<DebateSeat>            DebateSeats            => _db.GetCollection<DebateSeat>(MongoCollections.DebateSeats);
+    private IMongoCollection<DebateNomination>      DebateNominations      => _db.GetCollection<DebateNomination>(MongoCollections.DebateNominations);
+    private IMongoCollection<DebateModeratorAction> DebateModeratorActions => _db.GetCollection<DebateModeratorAction>(MongoCollections.DebateModeratorActions);
+    private IMongoCollection<DebateHighlight>       DebateHighlights       => _db.GetCollection<DebateHighlight>(MongoCollections.DebateHighlights);
+    private IMongoCollection<DebateBan>             DebateBans             => _db.GetCollection<DebateBan>(MongoCollections.DebateBans);
+    private IMongoCollection<DebateMessage>         DebateMessages         => _db.GetCollection<DebateMessage>(MongoCollections.DebateMessages);
+
     // Ghost Date — weekly Thursday 9pm IST anonymous dating
     private IMongoCollection<GhostDateRegistration> GhostDateRegistrations =>
         _db.GetCollection<GhostDateRegistration>(MongoCollections.GhostDateRegistrations);
@@ -2532,6 +2542,12 @@ public partial class MongoService
     public async Task<MehfilRoom?> GetMehfilRoomByIdAsync(string id) =>
         await MehfilRooms.Find(r => r.Id == id).FirstOrDefaultAsync();
 
+    /// <summary>CT-cancellable overload — Debate's DebateHub uses this
+    /// path so it can honour Context.ConnectionAborted. Behaviour
+    /// identical to the no-CT overload above.</summary>
+    public async Task<MehfilRoom?> GetMehfilRoomByIdAsync(string id, CancellationToken ct) =>
+        await MehfilRooms.Find(r => r.Id == id).FirstOrDefaultAsync(ct);
+
     public async Task<List<MehfilRoom>> GetLiveMehfilRoomsAsync(int limit = 30) =>
         await MehfilRooms
             .Find(r => r.Status == "live")
@@ -2960,6 +2976,253 @@ public partial class MongoService
             .SortByDescending(p => p.ClosedAt)
             .Limit(limit)
             .ToListAsync(ct);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  Debate (per-template Mehfil specialisation)
+    //
+    //  All methods take a CancellationToken; never block forever.
+    //  Privileged data (nomination bios) is loaded by the hub only
+    //  for the monitor — Mongo here just stores; the hub enforces.
+    // ──────────────────────────────────────────────────────────────
+
+    // ─── Rounds ───────────────────────────────────────────────
+
+    public async Task<DebateRound?> GetActiveDebateRoundAsync(string roomId, CancellationToken ct = default)
+    {
+        var nowUtc = DateTime.UtcNow;
+        var filter = Builders<DebateRound>.Filter.And(
+            Builders<DebateRound>.Filter.Eq(r => r.RoomId, roomId),
+            Builders<DebateRound>.Filter.Ne(r => r.Status, "ended"));
+        return await DebateRounds.Find(filter)
+            .SortByDescending(r => r.CreatedAt)
+            .FirstOrDefaultAsync(ct);
+    }
+
+    public async Task InsertDebateRoundAsync(DebateRound r, CancellationToken ct = default)
+    {
+        await DebateRounds.InsertOneAsync(r, options: null, ct);
+    }
+
+    public async Task<DebateRound?> UpdateDebateRoundStatusAsync(string roundId, string status, DateTime? endsAt, CancellationToken ct = default)
+    {
+        var filter = Builders<DebateRound>.Filter.Eq(r => r.Id, roundId);
+        var update = Builders<DebateRound>.Update.Set(r => r.Status, status);
+        if (status == "live")
+        {
+            update = update.Set(r => r.StartedAt, DateTime.UtcNow);
+            if (endsAt.HasValue) update = update.Set(r => r.EndsAt, endsAt.Value);
+        }
+        if (status == "ended")
+        {
+            update = update.Set(r => r.EndedAt, DateTime.UtcNow);
+        }
+        await DebateRounds.UpdateOneAsync(filter, update, options: null, ct);
+        return await DebateRounds.Find(filter).FirstOrDefaultAsync(ct);
+    }
+
+    // ─── Seats ────────────────────────────────────────────────
+
+    public async Task SeedDebateSeatsAsync(string roomId, string roundId, int perSide, CancellationToken ct = default)
+    {
+        var seats = new List<DebateSeat>();
+        foreach (var side in new[] { "pro", "con" })
+        {
+            for (var i = 0; i < perSide; i++)
+            {
+                seats.Add(new DebateSeat
+                {
+                    RoomId   = roomId,
+                    RoundId  = roundId,
+                    Side     = side,
+                    Position = i,
+                });
+            }
+        }
+        if (seats.Count > 0) await DebateSeats.InsertManyAsync(seats, options: null, ct);
+    }
+
+    public async Task<List<DebateSeat>> GetDebateSeatsAsync(string roundId, CancellationToken ct = default)
+    {
+        var filter = Builders<DebateSeat>.Filter.Eq(s => s.RoundId, roundId);
+        return await DebateSeats.Find(filter)
+            .SortBy(s => s.Side).ThenBy(s => s.Position)
+            .ToListAsync(ct);
+    }
+
+    /// <summary>Assign a user to a specific seat. Atomic: rejects if
+    /// the seat is already taken OR if the same user is already seated
+    /// on another seat in this round (no double-seating).</summary>
+    public async Task<bool> TryAssignDebateSeatAsync(
+        string roundId, string side, int position,
+        string userId, string username, CancellationToken ct = default)
+    {
+        // 1. Reject if user already on any seat this round.
+        var alreadyOn = await DebateSeats.Find(
+            Builders<DebateSeat>.Filter.And(
+                Builders<DebateSeat>.Filter.Eq(s => s.RoundId, roundId),
+                Builders<DebateSeat>.Filter.Eq(s => s.OccupantUserId, userId)))
+            .AnyAsync(ct);
+        if (alreadyOn) return false;
+
+        // 2. Conditional update: only succeed if the target seat is empty.
+        var filter = Builders<DebateSeat>.Filter.And(
+            Builders<DebateSeat>.Filter.Eq(s => s.RoundId, roundId),
+            Builders<DebateSeat>.Filter.Eq(s => s.Side, side),
+            Builders<DebateSeat>.Filter.Eq(s => s.Position, position),
+            Builders<DebateSeat>.Filter.Eq(s => s.OccupantUserId, null as string));
+        var update = Builders<DebateSeat>.Update
+            .Set(s => s.OccupantUserId, userId)
+            .Set(s => s.OccupantUsername, username)
+            .Set(s => s.AssignedAt, DateTime.UtcNow);
+        var res = await DebateSeats.UpdateOneAsync(filter, update, options: null, ct);
+        return res.ModifiedCount == 1;
+    }
+
+    public async Task UnassignDebateSeatAsync(string roundId, string userId, CancellationToken ct = default)
+    {
+        var filter = Builders<DebateSeat>.Filter.And(
+            Builders<DebateSeat>.Filter.Eq(s => s.RoundId, roundId),
+            Builders<DebateSeat>.Filter.Eq(s => s.OccupantUserId, userId));
+        var update = Builders<DebateSeat>.Update
+            .Set(s => s.OccupantUserId, (string?)null)
+            .Set(s => s.OccupantUsername, (string?)null)
+            .Set(s => s.AssignedAt, (DateTime?)null);
+        await DebateSeats.UpdateOneAsync(filter, update, options: null, ct);
+    }
+
+    public async Task<bool> IsUserSeatedAsync(string roundId, string userId, CancellationToken ct = default)
+    {
+        return await DebateSeats.Find(
+            Builders<DebateSeat>.Filter.And(
+                Builders<DebateSeat>.Filter.Eq(s => s.RoundId, roundId),
+                Builders<DebateSeat>.Filter.Eq(s => s.OccupantUserId, userId)))
+            .AnyAsync(ct);
+    }
+
+    // ─── Nominations ─────────────────────────────────────────
+
+    public async Task<DebateNomination?> InsertDebateNominationAsync(
+        DebateNomination n, CancellationToken ct = default)
+    {
+        // Reject duplicates: same (roundId, userId) with non-terminal status.
+        var existing = await DebateNominations.Find(
+            Builders<DebateNomination>.Filter.And(
+                Builders<DebateNomination>.Filter.Eq(x => x.RoundId, n.RoundId),
+                Builders<DebateNomination>.Filter.Eq(x => x.UserId, n.UserId),
+                Builders<DebateNomination>.Filter.Eq(x => x.Status, "pending")))
+            .FirstOrDefaultAsync(ct);
+        if (existing is not null) return existing;
+        await DebateNominations.InsertOneAsync(n, options: null, ct);
+        return n;
+    }
+
+    public async Task WithdrawDebateNominationAsync(string roundId, string userId, CancellationToken ct = default)
+    {
+        var filter = Builders<DebateNomination>.Filter.And(
+            Builders<DebateNomination>.Filter.Eq(n => n.RoundId, roundId),
+            Builders<DebateNomination>.Filter.Eq(n => n.UserId, userId),
+            Builders<DebateNomination>.Filter.Eq(n => n.Status, "pending"));
+        var update = Builders<DebateNomination>.Update
+            .Set(n => n.Status, "withdrawn")
+            .Set(n => n.ResolvedAt, DateTime.UtcNow);
+        await DebateNominations.UpdateOneAsync(filter, update, options: null, ct);
+    }
+
+    public async Task SetDebateNominationStatusAsync(string nominationId, string status, CancellationToken ct = default)
+    {
+        var filter = Builders<DebateNomination>.Filter.Eq(n => n.Id, nominationId);
+        var update = Builders<DebateNomination>.Update
+            .Set(n => n.Status, status)
+            .Set(n => n.ResolvedAt, DateTime.UtcNow);
+        await DebateNominations.UpdateOneAsync(filter, update, options: null, ct);
+    }
+
+    /// <summary>PRIVILEGED — returns nominations WITH bios. Caller (the
+    /// hub) MUST gate this on monitor role. Includes only pending rows.</summary>
+    public async Task<List<DebateNomination>> GetPendingNominationsForMonitorAsync(string roundId, CancellationToken ct = default)
+    {
+        var filter = Builders<DebateNomination>.Filter.And(
+            Builders<DebateNomination>.Filter.Eq(n => n.RoundId, roundId),
+            Builders<DebateNomination>.Filter.Eq(n => n.Status, "pending"));
+        return await DebateNominations.Find(filter)
+            .SortBy(n => n.RaisedAt)
+            .ToListAsync(ct);
+    }
+
+    public async Task<DebateNomination?> GetDebateNominationAsync(string nominationId, CancellationToken ct = default)
+    {
+        return await DebateNominations.Find(n => n.Id == nominationId).FirstOrDefaultAsync(ct);
+    }
+
+    /// <summary>How many pending hands are raised in this round? Public
+    /// (counts only, no bios) — surfaces a "N waiting" badge for audience.</summary>
+    public async Task<int> CountPendingNominationsAsync(string roundId, CancellationToken ct = default)
+    {
+        var filter = Builders<DebateNomination>.Filter.And(
+            Builders<DebateNomination>.Filter.Eq(n => n.RoundId, roundId),
+            Builders<DebateNomination>.Filter.Eq(n => n.Status, "pending"));
+        return (int)await DebateNominations.CountDocumentsAsync(filter, options: null, ct);
+    }
+
+    // ─── Moderator audit ─────────────────────────────────────
+
+    public async Task LogModeratorActionAsync(DebateModeratorAction a, CancellationToken ct = default)
+    {
+        await DebateModeratorActions.InsertOneAsync(a, options: null, ct);
+    }
+
+    // ─── Highlights ──────────────────────────────────────────
+
+    public async Task HighlightDebateMessageAsync(string messageId, CancellationToken ct = default)
+    {
+        var filter = Builders<DebateMessage>.Filter.Eq(m => m.Id, messageId);
+        var update = Builders<DebateMessage>.Update.Set(m => m.IsHighlighted, true);
+        await DebateMessages.UpdateOneAsync(filter, update, options: null, ct);
+    }
+
+    public async Task InsertDebateHighlightAsync(DebateHighlight h, CancellationToken ct = default)
+    {
+        await DebateHighlights.InsertOneAsync(h, options: null, ct);
+    }
+
+    // ─── Bans ────────────────────────────────────────────────
+
+    public async Task BanFromDebateAsync(DebateBan b, CancellationToken ct = default)
+    {
+        await DebateBans.InsertOneAsync(b, options: null, ct);
+    }
+
+    public async Task<bool> IsBannedFromDebateAsync(string roomId, string userId, CancellationToken ct = default)
+    {
+        var filter = Builders<DebateBan>.Filter.And(
+            Builders<DebateBan>.Filter.Eq(b => b.RoomId, roomId),
+            Builders<DebateBan>.Filter.Eq(b => b.UserId, userId));
+        return await DebateBans.Find(filter).AnyAsync(ct);
+    }
+
+    // ─── Chat ────────────────────────────────────────────────
+
+    public async Task<DebateMessage> InsertDebateMessageAsync(DebateMessage m, CancellationToken ct = default)
+    {
+        await DebateMessages.InsertOneAsync(m, options: null, ct);
+        return m;
+    }
+
+    public async Task<List<DebateMessage>> GetDebateMessagesAsync(string roomId, int limit, CancellationToken ct = default)
+    {
+        var filter = Builders<DebateMessage>.Filter.Eq(m => m.RoomId, roomId);
+        var msgs = await DebateMessages.Find(filter)
+            .SortByDescending(m => m.CreatedAt)
+            .Limit(limit)
+            .ToListAsync(ct);
+        msgs.Reverse();
+        return msgs;
+    }
+
+    public async Task<DebateMessage?> GetDebateMessageAsync(string messageId, CancellationToken ct = default)
+    {
+        return await DebateMessages.Find(m => m.Id == messageId).FirstOrDefaultAsync(ct);
     }
 }
 

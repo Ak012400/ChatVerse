@@ -430,6 +430,11 @@ try
     // Mounted in Theater, PYAAR LIVE spectator, Mehfil, Hosted group video.
     app.MapHub<ChatVerse.API.Hubs.SoundboardHub>("/hubs/soundboard");
 
+    // Debate (first per-template Mehfil specialisation) — STANDALONE hub.
+    // Mehfil rooms with templateKind == "debate" land on DebateRoomPage,
+    // which connects here. Doesn't touch MehfilHub state at all.
+    app.MapHub<ChatVerse.API.Hubs.DebateHub>("/hubs/debate");
+
     // ── Startup banner ────────────────────────────────────────────
     // Emit a clear, grep-friendly summary of WHICH hubs got mapped.
     // Render's deploy logs make this the fastest way to confirm a
