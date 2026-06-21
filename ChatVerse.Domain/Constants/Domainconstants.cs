@@ -208,6 +208,18 @@ public static class MongoCollections
     /// Reused by PYAAR LIVE spectator Q&amp;A + Love Triangle audience picks.</summary>
     public const string Polls = "polls";
 
+    // ── Debate (first per-template Mehfil specialisation) ───────
+    /// <summary>All debate_* collections are STANDALONE for the Debate
+    /// template per the per-feature isolation policy (PROGRESS.md §🔒).
+    /// They reference the parent MehfilRoom by id but never write to it.</summary>
+    public const string DebateRounds            = "debate_rounds";
+    public const string DebateSeats             = "debate_seats";
+    public const string DebateNominations       = "debate_nominations";
+    public const string DebateModeratorActions  = "debate_moderator_actions";
+    public const string DebateHighlights        = "debate_highlights";
+    public const string DebateBans              = "debate_bans";
+    public const string DebateMessages          = "debate_messages";
+
     // ── Ghost Date ─────────────────────────────────────────────
     /// <summary>Weekly opt-in pool for Thursday 9pm IST ghost dates.</summary>
     public const string GhostDateRegistrations = "ghost_date_registrations";

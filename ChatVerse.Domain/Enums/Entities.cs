@@ -1509,3 +1509,183 @@ public class Poll
     public bool IsClosed { get; set; }
     public DateTime? ClosedAt { get; set; }
 }
+
+// ============================================================
+//  DEBATE — first per-template Mehfil specialisation.
+//
+//  Per the per-feature isolation policy (PROGRESS.md §🔒), every
+//  Debate entity lives in its OWN debate_* collection and is referenced
+//  to the parent MehfilRoom only by string id. Debate code NEVER writes
+//  to MehfilRoom — it just reads templateKind to identify itself.
+//
+//  The MehfilRoom keeps owning: room lifecycle (status / scheduledFor /
+//  audience cap / host id / room title). Debate adds on top: rounds,
+//  seating brackets, audience nominations (privileged bios), monitor
+//  audit actions, highlights, bans, and its own chat collection.
+//
+//  All ids are string ObjectIds. RoomId on every entity = MehfilRoom.Id.
+// ============================================================
+
+/// <summary>One debate round inside a Mehfil debate room. Lifecycle:
+///   OpenNominations → Seating → Live → Ended.
+/// `Format` is `1v1` / `2v2` / ... / `5v5`, locking seat counts per side.
+/// Round timer is advisory — server stores `EndsAt` as the source-of-truth
+/// expiry, client renders the countdown locally. Monitor can manually end early.</summary>
+public class DebateRound
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    /// <summary>References MehfilRoom.Id.</summary>
+    public string RoomId { get; set; } = default!;
+
+    public string MonitorUserId { get; set; } = default!;
+
+    /// <summary>`1v1` / `2v2` / `3v3` / `4v4` / `5v5`.</summary>
+    public string Format { get; set; } = "1v1";
+
+    /// <summary>`open_nominations` (audience can raise hands), `seating`
+    /// (monitor is assigning seats), `live` (debate in progress),
+    /// `ended` (closed).</summary>
+    public string Status { get; set; } = "open_nominations";
+
+    public DateTime? StartedAt { get; set; }
+    public DateTime? EndsAt { get; set; }
+    public DateTime CreatedAt { get; set; }
+    public DateTime? EndedAt { get; set; }
+}
+
+/// <summary>One seat in the bracket. `Side` = "pro" | "con". `Position`
+/// 0..4 (capped by round format). `OccupantUserId` null when empty.
+/// Username is snapshotted at assignment so a later rename doesn't
+/// rewrite history mid-round.</summary>
+public class DebateSeat
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string RoundId { get; set; } = default!;
+
+    public string Side { get; set; } = "pro";
+    public int Position { get; set; }
+
+    public string? OccupantUserId { get; set; }
+    public string? OccupantUsername { get; set; }
+    public DateTime? AssignedAt { get; set; }
+}
+
+/// <summary>Audience hand-raise. The bio fields here are PRIVILEGED —
+/// monitor-only data. Captured from the user's nomination form at
+/// raise-time, NOT pulled from the global User table (which doesn't
+/// store name/age/gender per the platform's privacy minimisation
+/// stance — users opt in here, debate-room-only).</summary>
+public class DebateNomination
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string RoundId { get; set; } = default!;
+
+    public string UserId { get; set; } = default!;
+    public string Username { get; set; } = default!;
+
+    /// <summary>Real name as the audience member chose to disclose to
+    /// the monitor only. NEVER serialised to anyone but the monitor.</summary>
+    public string RealName { get; set; } = "";
+    /// <summary>Age (years). 0 if not disclosed.</summary>
+    public int Age { get; set; }
+    /// <summary>"male" | "female" | "other" | "" if not disclosed.</summary>
+    public string Gender { get; set; } = "";
+    /// <summary>"pro" | "con" | "either".</summary>
+    public string PreferredSide { get; set; } = "either";
+
+    public string Status { get; set; } = "pending"; // pending | accepted | rejected | withdrawn
+    public DateTime RaisedAt { get; set; }
+    public DateTime? ResolvedAt { get; set; }
+}
+
+/// <summary>Append-only audit log of every privileged action the
+/// monitor takes. Useful for moderation review + post-mortem if a
+/// nominee disputes a kick/ban.</summary>
+public class DebateModeratorAction
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string MonitorUserId { get; set; } = default!;
+    public string TargetUserId { get; set; } = default!;
+
+    public string ActionType { get; set; } = default!; // assign_seat | unseat | kick | ban | highlight
+    public string? Reason { get; set; }
+    public DateTime At { get; set; }
+}
+
+/// <summary>"Good question" flag — monitor can hilight an audience
+/// member whose question landed well. Surfaces a celebration animation
+/// on their chat bubble client-side. Idempotent: one highlight per
+/// (room, user, messageId).</summary>
+public class DebateHighlight
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string TargetUserId { get; set; } = default!;
+    public string TargetUsername { get; set; } = default!;
+    public string? MessageId { get; set; }
+    public string MonitorUserId { get; set; } = default!;
+    public DateTime At { get; set; }
+}
+
+/// <summary>Per-room ban. Scoped to one debate room — NOT a global
+/// ban. Lives in debate_bans (NOT shared with the chat.RoomBan PG
+/// table) so debate moderation is self-contained per isolation policy.</summary>
+public class DebateBan
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string UserId { get; set; } = default!;
+    public string MonitorUserId { get; set; } = default!;
+    public string? Reason { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+
+/// <summary>Chat message inside a debate room. Lives in debate_messages
+/// (NOT mehfil_messages) so debate-specific fields (`IsQuestion`,
+/// `IsHighlighted`) don't leak into Mehfil's generic chat schema.
+/// `IsHighlighted` is updated by HighlightGoodQuestion server-side.</summary>
+public class DebateMessage
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string SenderUserId { get; set; } = default!;
+    public string SenderUsername { get; set; } = default!;
+    public bool SenderIsMonitor { get; set; }
+    /// <summary>True when on a debate seat at the time of sending —
+    /// surfaces a "speaker" badge in the chat bubble.</summary>
+    public bool SenderIsSeated { get; set; }
+
+    public string Content { get; set; } = default!;
+    /// <summary>True when the user sent this via the dedicated
+    /// "Ask question" CTA — makes it easier for the monitor to spot
+    /// in the chat firehose.</summary>
+    public bool IsQuestion { get; set; }
+    /// <summary>Set true when the monitor highlights this message.</summary>
+    public bool IsHighlighted { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+}
