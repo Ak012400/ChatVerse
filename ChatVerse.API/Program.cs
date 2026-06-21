@@ -435,6 +435,13 @@ try
     // which connects here. Doesn't touch MehfilHub state at all.
     app.MapHub<ChatVerse.API.Hubs.DebateHub>("/hubs/debate");
 
+    // Ghost Room (second per-template Mehfil specialisation) — STANDALONE.
+    // Mehfil rooms with templateKind == "ghost_date" land on
+    // GhostRoomPage, which connects here. Coexists with the weekly
+    // /hubs/ghost-date Thursday feature (separate hub, separate
+    // collection family). No shared state.
+    app.MapHub<ChatVerse.API.Hubs.GhostRoomHub>("/hubs/ghost-room");
+
     // ── Startup banner ────────────────────────────────────────────
     // Emit a clear, grep-friendly summary of WHICH hubs got mapped.
     // Render's deploy logs make this the fastest way to confirm a

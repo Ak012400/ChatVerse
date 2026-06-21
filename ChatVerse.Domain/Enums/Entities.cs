@@ -1689,3 +1689,204 @@ public class DebateMessage
 
     public DateTime CreatedAt { get; set; }
 }
+
+// ============================================================
+//  GHOST ROOM — second per-template Mehfil specialisation.
+//
+//  Mehfil rooms with templateKind == "ghost_date" become "Ghost Rooms" —
+//  host-driven anonymous speed-dating. Coexists with the existing
+//  weekly /ghost-date Thursday auto-pairing (those collections stay
+//  intact). Like Debate, this is FULLY standalone:
+//   • All gd_* collections, gd_* names — never mixed with the legacy
+//     ghost_date_* collections (those still serve the weekly feature).
+//   • FK to MehfilRoom.Id only; never writes to MehfilRoom.
+//   • All bios are matchmaker-only (privacy contract enforced at hub).
+// ============================================================
+
+/// <summary>Ghost-room configuration extends MehfilRoom for this
+/// template only. Public rooms surface in Mehfil Discover; private
+/// rooms are invite-only via `InviteCode`.</summary>
+public class GhostRoomConfig
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string MatchmakerUserId { get; set; } = default!;
+
+    /// <summary>"public" (Discover-visible) | "private" (invite-only). </summary>
+    public string Privacy { get; set; } = "public";
+
+    /// <summary>Set when Privacy == "private". 8-char alphanumeric token. </summary>
+    public string? InviteCode { get; set; }
+
+    /// <summary>4 / 6 / 8 / 10 / 12. Max pairs = MaxVoyagers / 2. </summary>
+    public int MaxVoyagers { get; set; } = 8;
+
+    /// <summary>5 / 10 / 15 / 20. Per-round duration cap. </summary>
+    public int RoundDurationMinutes { get; set; } = 10;
+
+    public DateTime CreatedAt { get; set; }
+}
+
+/// <summary>Per-room per-user anonymous identity. `VoyagerTag` is
+/// "V1" / "V2" / ... assigned in join-order, persistent for the room
+/// session so chat history doesn't break on re-join. Real userId never
+/// leaks publicly (only matchmaker sees mapping). `Status` tracks
+/// position in the flow.</summary>
+public class GhostVoyager
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string UserId { get; set; } = default!;
+
+    /// <summary>Visible alias (V1, V2, ...). Allocated atomically server-side. </summary>
+    public string VoyagerTag { get; set; } = default!;
+
+    /// <summary>"lobby" (joined, not nominated) | "nominated" (raised
+    /// hand, awaiting pair) | "paired" (in pair right now) |
+    /// "done" (round ended, awaiting next). </summary>
+    public string Status { get; set; } = "lobby";
+
+    public DateTime JoinedAt { get; set; }
+    public DateTime? LeftAt { get; set; }
+}
+
+/// <summary>Audience hand-raise. Bios PRIVILEGED — matchmaker-only.
+/// Same shape rationale as DebateNomination: name + age + gender +
+/// interestedIn captured in nomination form, never on the User table.</summary>
+public class GhostNomination
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string RoundNumber { get; set; } = "1";
+
+    public string UserId { get; set; } = default!;
+    public string VoyagerTag { get; set; } = default!;
+
+    public string RealName { get; set; } = "";
+    public int Age { get; set; }
+    public string Gender { get; set; } = "";
+
+    /// <summary>"male" | "female" | "other" | "any". Helps matchmaker
+    /// pair on declared preference for "interest-balanced" auto-pair.</summary>
+    public string InterestedIn { get; set; } = "any";
+
+    /// <summary>≤ 50 chars short bio.</summary>
+    public string ShortBio { get; set; } = "";
+
+    public string Status { get; set; } = "pending"; // pending | paired | withdrawn
+    public DateTime RaisedAt { get; set; }
+    public DateTime? ResolvedAt { get; set; }
+}
+
+/// <summary>One pair created by matchmaker (manually or via auto-pair).
+/// Server auto-creates a LiveKit room `ghost-pair-{Id}` for audio. The
+/// pair's chat lives in GhostPairMessage. Outcome resolved at round
+/// end based on both voyagers' reveal votes.</summary>
+public class GhostPair
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public int RoundNumber { get; set; } = 1;
+
+    public string VoyagerAUserId { get; set; } = default!;
+    public string VoyagerATag { get; set; } = default!;
+    public string VoyagerBUserId { get; set; } = default!;
+    public string VoyagerBTag { get; set; } = default!;
+
+    /// <summary>LiveKit room name for this pair's audio call. </summary>
+    public string LivekitRoomName { get; set; } = default!;
+
+    public DateTime CreatedAt { get; set; }
+    public DateTime? StartedAt { get; set; }
+    public DateTime? EndedAt { get; set; }
+
+    /// <summary>Voyager A's reveal vote at round end (true = wants
+    /// reveal, false = pass, null = not yet voted). </summary>
+    public bool? VoyagerAWantsReveal { get; set; }
+    public bool? VoyagerBWantsReveal { get; set; }
+
+    /// <summary>null until both voted. "mutual_reveal" / "bittersweet"
+    /// (mixed) / "mutual_pass" / "abandoned" (round ended before votes).</summary>
+    public string? Outcome { get; set; }
+}
+
+/// <summary>Chat inside a Ghost pair room. Lives in gd_pair_messages
+/// — NOT shared with the legacy ghost_date_messages (Thursday feature).</summary>
+public class GhostPairMessage
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string PairId { get; set; } = default!;
+    public string SenderUserId { get; set; } = default!;
+    /// <summary>Anonymous tag at send time (V1 / V2). Audience never
+    /// sees raw userId — only the tag.</summary>
+    public string SenderVoyagerTag { get; set; } = default!;
+
+    public string Content { get; set; } = default!;
+    public DateTime CreatedAt { get; set; }
+}
+
+/// <summary>Records a successful mutual reveal. Surfaces both real
+/// usernames so the voyagers can DM each other post-room (future:
+/// pre-populated DM conversation, see #future-cross-session-dm).</summary>
+public class GhostReveal
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string PairId { get; set; } = default!;
+    public string UserAId { get; set; } = default!;
+    public string UserAUsername { get; set; } = default!;
+    public string UserBId { get; set; } = default!;
+    public string UserBUsername { get; set; } = default!;
+    public DateTime RevealedAt { get; set; }
+}
+
+/// <summary>Per-room ban — scoped to ONE ghost room. Separate from
+/// chat.RoomBan + DebateBan per isolation policy. </summary>
+public class GhostBan
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string UserId { get; set; } = default!;
+    public string MatchmakerUserId { get; set; } = default!;
+    public string? Reason { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+
+/// <summary>Audit log of every privileged matchmaker action.</summary>
+public class GhostMatchmakerAction
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string MatchmakerUserId { get; set; } = default!;
+    public string TargetUserId { get; set; } = default!;
+
+    /// <summary>assign_pair | auto_pair | start_round | end_round |
+    /// rotate | highlight | kick | ban</summary>
+    public string ActionType { get; set; } = default!;
+    public string? Reason { get; set; }
+    public DateTime At { get; set; }
+}

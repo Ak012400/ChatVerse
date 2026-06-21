@@ -51,6 +51,17 @@ public partial class MongoService
     private IMongoCollection<DebateBan>             DebateBans             => _db.GetCollection<DebateBan>(MongoCollections.DebateBans);
     private IMongoCollection<DebateMessage>         DebateMessages         => _db.GetCollection<DebateMessage>(MongoCollections.DebateMessages);
 
+    // Ghost Room (second per-template Mehfil specialisation — all
+    // gd_* collections standalone per the per-feature isolation policy).
+    private IMongoCollection<GhostRoomConfig>       GhostRoomConfigs       => _db.GetCollection<GhostRoomConfig>(MongoCollections.GhostRoomConfigs);
+    private IMongoCollection<GhostVoyager>          GhostVoyagers          => _db.GetCollection<GhostVoyager>(MongoCollections.GhostVoyagers);
+    private IMongoCollection<GhostNomination>       GhostNominations       => _db.GetCollection<GhostNomination>(MongoCollections.GhostNominations);
+    private IMongoCollection<GhostPair>             GhostPairs             => _db.GetCollection<GhostPair>(MongoCollections.GhostPairs);
+    private IMongoCollection<GhostPairMessage>      GhostPairMessages      => _db.GetCollection<GhostPairMessage>(MongoCollections.GhostPairMessages);
+    private IMongoCollection<GhostReveal>           GhostReveals           => _db.GetCollection<GhostReveal>(MongoCollections.GhostReveals);
+    private IMongoCollection<GhostBan>              GhostBans              => _db.GetCollection<GhostBan>(MongoCollections.GhostBans);
+    private IMongoCollection<GhostMatchmakerAction> GhostMatchmakerActions => _db.GetCollection<GhostMatchmakerAction>(MongoCollections.GhostMatchmakerActions);
+
     // Ghost Date — weekly Thursday 9pm IST anonymous dating
     private IMongoCollection<GhostDateRegistration> GhostDateRegistrations =>
         _db.GetCollection<GhostDateRegistration>(MongoCollections.GhostDateRegistrations);
@@ -3223,6 +3234,324 @@ public partial class MongoService
     public async Task<DebateMessage?> GetDebateMessageAsync(string messageId, CancellationToken ct = default)
     {
         return await DebateMessages.Find(m => m.Id == messageId).FirstOrDefaultAsync(ct);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  Ghost Room (second per-template Mehfil specialisation)
+    //
+    //  Mehfil-template ghost-dating room. Coexists with the weekly
+    //  /ghost-date feature (uses ghost_date_* collections — not
+    //  touched here). Every method below is CT-cancellable.
+    // ──────────────────────────────────────────────────────────────
+
+    // ─── Room config ─────────────────────────────────────────
+
+    public async Task UpsertGhostRoomConfigAsync(GhostRoomConfig c, CancellationToken ct = default)
+    {
+        var filter = Builders<GhostRoomConfig>.Filter.Eq(x => x.RoomId, c.RoomId);
+        var existing = await GhostRoomConfigs.Find(filter).FirstOrDefaultAsync(ct);
+        if (existing is null)
+        {
+            await GhostRoomConfigs.InsertOneAsync(c, options: null, ct);
+        }
+        else
+        {
+            var update = Builders<GhostRoomConfig>.Update
+                .Set(x => x.Privacy, c.Privacy)
+                .Set(x => x.InviteCode, c.InviteCode)
+                .Set(x => x.MaxVoyagers, c.MaxVoyagers)
+                .Set(x => x.RoundDurationMinutes, c.RoundDurationMinutes);
+            await GhostRoomConfigs.UpdateOneAsync(filter, update, options: null, ct);
+        }
+    }
+
+    public async Task<GhostRoomConfig?> GetGhostRoomConfigAsync(string roomId, CancellationToken ct = default)
+    {
+        return await GhostRoomConfigs.Find(c => c.RoomId == roomId).FirstOrDefaultAsync(ct);
+    }
+
+    public async Task<GhostRoomConfig?> GetGhostRoomConfigByInviteCodeAsync(string inviteCode, CancellationToken ct = default)
+    {
+        return await GhostRoomConfigs.Find(c => c.InviteCode == inviteCode).FirstOrDefaultAsync(ct);
+    }
+
+    // ─── Voyagers ────────────────────────────────────────────
+
+    /// <summary>Get-or-create a voyager record for (room, user). Tag
+    /// is allocated as V{N+1} where N = current voyager count for the
+    /// room. Race-safe enough at low audience scale — duplicate-key
+    /// risk is mitigated by a re-read on conflict.</summary>
+    public async Task<GhostVoyager> GetOrCreateVoyagerAsync(string roomId, string userId, CancellationToken ct = default)
+    {
+        var existing = await GhostVoyagers.Find(
+            Builders<GhostVoyager>.Filter.And(
+                Builders<GhostVoyager>.Filter.Eq(v => v.RoomId, roomId),
+                Builders<GhostVoyager>.Filter.Eq(v => v.UserId, userId)))
+            .FirstOrDefaultAsync(ct);
+        if (existing is not null)
+        {
+            // Returning user — reset LeftAt if they re-join.
+            if (existing.LeftAt.HasValue)
+            {
+                await GhostVoyagers.UpdateOneAsync(
+                    Builders<GhostVoyager>.Filter.Eq(v => v.Id, existing.Id),
+                    Builders<GhostVoyager>.Update.Set(v => v.LeftAt, (DateTime?)null),
+                    options: null, ct);
+            }
+            return existing;
+        }
+
+        var count = (int)await GhostVoyagers.CountDocumentsAsync(
+            Builders<GhostVoyager>.Filter.Eq(v => v.RoomId, roomId),
+            options: null, ct);
+
+        var fresh = new GhostVoyager
+        {
+            RoomId     = roomId,
+            UserId     = userId,
+            VoyagerTag = $"V{count + 1}",
+            Status     = "lobby",
+            JoinedAt   = DateTime.UtcNow,
+        };
+        await GhostVoyagers.InsertOneAsync(fresh, options: null, ct);
+        return fresh;
+    }
+
+    public async Task<List<GhostVoyager>> GetActiveVoyagersAsync(string roomId, CancellationToken ct = default)
+    {
+        var filter = Builders<GhostVoyager>.Filter.And(
+            Builders<GhostVoyager>.Filter.Eq(v => v.RoomId, roomId),
+            Builders<GhostVoyager>.Filter.Eq(v => v.LeftAt, null as DateTime?));
+        return await GhostVoyagers.Find(filter)
+            .SortBy(v => v.JoinedAt)
+            .ToListAsync(ct);
+    }
+
+    public async Task MarkVoyagerLeftAsync(string roomId, string userId, CancellationToken ct = default)
+    {
+        var filter = Builders<GhostVoyager>.Filter.And(
+            Builders<GhostVoyager>.Filter.Eq(v => v.RoomId, roomId),
+            Builders<GhostVoyager>.Filter.Eq(v => v.UserId, userId));
+        var update = Builders<GhostVoyager>.Update.Set(v => v.LeftAt, DateTime.UtcNow);
+        await GhostVoyagers.UpdateOneAsync(filter, update, options: null, ct);
+    }
+
+    public async Task SetVoyagerStatusAsync(string voyagerId, string status, CancellationToken ct = default)
+    {
+        var filter = Builders<GhostVoyager>.Filter.Eq(v => v.Id, voyagerId);
+        var update = Builders<GhostVoyager>.Update.Set(v => v.Status, status);
+        await GhostVoyagers.UpdateOneAsync(filter, update, options: null, ct);
+    }
+
+    public async Task<GhostVoyager?> GetVoyagerAsync(string roomId, string userId, CancellationToken ct = default)
+    {
+        return await GhostVoyagers.Find(
+            Builders<GhostVoyager>.Filter.And(
+                Builders<GhostVoyager>.Filter.Eq(v => v.RoomId, roomId),
+                Builders<GhostVoyager>.Filter.Eq(v => v.UserId, userId)))
+            .FirstOrDefaultAsync(ct);
+    }
+
+    // ─── Nominations ─────────────────────────────────────────
+
+    public async Task<GhostNomination?> InsertGhostNominationAsync(GhostNomination n, CancellationToken ct = default)
+    {
+        var existing = await GhostNominations.Find(
+            Builders<GhostNomination>.Filter.And(
+                Builders<GhostNomination>.Filter.Eq(x => x.RoomId, n.RoomId),
+                Builders<GhostNomination>.Filter.Eq(x => x.UserId, n.UserId),
+                Builders<GhostNomination>.Filter.Eq(x => x.Status, "pending")))
+            .FirstOrDefaultAsync(ct);
+        if (existing is not null) return existing;
+
+        await GhostNominations.InsertOneAsync(n, options: null, ct);
+        return n;
+    }
+
+    public async Task WithdrawGhostNominationAsync(string roomId, string userId, CancellationToken ct = default)
+    {
+        var filter = Builders<GhostNomination>.Filter.And(
+            Builders<GhostNomination>.Filter.Eq(n => n.RoomId, roomId),
+            Builders<GhostNomination>.Filter.Eq(n => n.UserId, userId),
+            Builders<GhostNomination>.Filter.Eq(n => n.Status, "pending"));
+        var update = Builders<GhostNomination>.Update
+            .Set(n => n.Status, "withdrawn")
+            .Set(n => n.ResolvedAt, DateTime.UtcNow);
+        await GhostNominations.UpdateOneAsync(filter, update, options: null, ct);
+    }
+
+    public async Task SetGhostNominationStatusAsync(string nominationId, string status, CancellationToken ct = default)
+    {
+        var filter = Builders<GhostNomination>.Filter.Eq(n => n.Id, nominationId);
+        var update = Builders<GhostNomination>.Update
+            .Set(n => n.Status, status)
+            .Set(n => n.ResolvedAt, DateTime.UtcNow);
+        await GhostNominations.UpdateOneAsync(filter, update, options: null, ct);
+    }
+
+    /// <summary>PRIVILEGED — full bios. Hub must gate on matchmaker role.</summary>
+    public async Task<List<GhostNomination>> GetPendingGhostNominationsForMatchmakerAsync(string roomId, CancellationToken ct = default)
+    {
+        var filter = Builders<GhostNomination>.Filter.And(
+            Builders<GhostNomination>.Filter.Eq(n => n.RoomId, roomId),
+            Builders<GhostNomination>.Filter.Eq(n => n.Status, "pending"));
+        return await GhostNominations.Find(filter)
+            .SortBy(n => n.RaisedAt)
+            .ToListAsync(ct);
+    }
+
+    public async Task<GhostNomination?> GetGhostNominationAsync(string nominationId, CancellationToken ct = default)
+    {
+        return await GhostNominations.Find(n => n.Id == nominationId).FirstOrDefaultAsync(ct);
+    }
+
+    public async Task<int> CountPendingGhostNominationsAsync(string roomId, CancellationToken ct = default)
+    {
+        var filter = Builders<GhostNomination>.Filter.And(
+            Builders<GhostNomination>.Filter.Eq(n => n.RoomId, roomId),
+            Builders<GhostNomination>.Filter.Eq(n => n.Status, "pending"));
+        return (int)await GhostNominations.CountDocumentsAsync(filter, options: null, ct);
+    }
+
+    // ─── Pairs ───────────────────────────────────────────────
+
+    public async Task<GhostPair> InsertGhostPairAsync(GhostPair p, CancellationToken ct = default)
+    {
+        await GhostPairs.InsertOneAsync(p, options: null, ct);
+        return p;
+    }
+
+    public async Task<GhostPair?> GetGhostPairAsync(string pairId, CancellationToken ct = default)
+    {
+        return await GhostPairs.Find(p => p.Id == pairId).FirstOrDefaultAsync(ct);
+    }
+
+    public async Task<List<GhostPair>> GetActiveGhostPairsAsync(string roomId, CancellationToken ct = default)
+    {
+        var filter = Builders<GhostPair>.Filter.And(
+            Builders<GhostPair>.Filter.Eq(p => p.RoomId, roomId),
+            Builders<GhostPair>.Filter.Eq(p => p.EndedAt, null as DateTime?));
+        return await GhostPairs.Find(filter).ToListAsync(ct);
+    }
+
+    public async Task<GhostPair?> GetActivePairForUserAsync(string roomId, string userId, CancellationToken ct = default)
+    {
+        var filter = Builders<GhostPair>.Filter.And(
+            Builders<GhostPair>.Filter.Eq(p => p.RoomId, roomId),
+            Builders<GhostPair>.Filter.Eq(p => p.EndedAt, null as DateTime?),
+            Builders<GhostPair>.Filter.Or(
+                Builders<GhostPair>.Filter.Eq(p => p.VoyagerAUserId, userId),
+                Builders<GhostPair>.Filter.Eq(p => p.VoyagerBUserId, userId)));
+        return await GhostPairs.Find(filter).FirstOrDefaultAsync(ct);
+    }
+
+    public async Task SetGhostPairStartedAsync(string pairId, CancellationToken ct = default)
+    {
+        var filter = Builders<GhostPair>.Filter.Eq(p => p.Id, pairId);
+        var update = Builders<GhostPair>.Update.Set(p => p.StartedAt, DateTime.UtcNow);
+        await GhostPairs.UpdateOneAsync(filter, update, options: null, ct);
+    }
+
+    public async Task SetGhostPairRevealVoteAsync(string pairId, string userId, bool wantsReveal, CancellationToken ct = default)
+    {
+        var p = await GetGhostPairAsync(pairId, ct);
+        if (p is null) return;
+        UpdateDefinition<GhostPair> update;
+        if (string.Equals(p.VoyagerAUserId, userId, StringComparison.OrdinalIgnoreCase))
+            update = Builders<GhostPair>.Update.Set(x => x.VoyagerAWantsReveal, wantsReveal);
+        else if (string.Equals(p.VoyagerBUserId, userId, StringComparison.OrdinalIgnoreCase))
+            update = Builders<GhostPair>.Update.Set(x => x.VoyagerBWantsReveal, wantsReveal);
+        else return;
+        await GhostPairs.UpdateOneAsync(
+            Builders<GhostPair>.Filter.Eq(x => x.Id, pairId),
+            update, options: null, ct);
+    }
+
+    public async Task<GhostPair?> ResolveGhostPairOutcomeAsync(string pairId, CancellationToken ct = default)
+    {
+        var p = await GetGhostPairAsync(pairId, ct);
+        if (p is null) return null;
+
+        string outcome;
+        if (p.VoyagerAWantsReveal is null || p.VoyagerBWantsReveal is null)
+        {
+            outcome = "abandoned";
+        }
+        else if (p.VoyagerAWantsReveal == true && p.VoyagerBWantsReveal == true)
+        {
+            outcome = "mutual_reveal";
+        }
+        else if (p.VoyagerAWantsReveal == false && p.VoyagerBWantsReveal == false)
+        {
+            outcome = "mutual_pass";
+        }
+        else
+        {
+            outcome = "bittersweet";
+        }
+
+        var update = Builders<GhostPair>.Update
+            .Set(x => x.Outcome, outcome)
+            .Set(x => x.EndedAt, DateTime.UtcNow);
+        await GhostPairs.UpdateOneAsync(
+            Builders<GhostPair>.Filter.Eq(x => x.Id, pairId),
+            update, options: null, ct);
+        return await GetGhostPairAsync(pairId, ct);
+    }
+
+    public async Task EndAllActivePairsAsync(string roomId, CancellationToken ct = default)
+    {
+        var filter = Builders<GhostPair>.Filter.And(
+            Builders<GhostPair>.Filter.Eq(p => p.RoomId, roomId),
+            Builders<GhostPair>.Filter.Eq(p => p.EndedAt, null as DateTime?));
+        var update = Builders<GhostPair>.Update
+            .Set(p => p.EndedAt, DateTime.UtcNow)
+            .Set(p => p.Outcome, "abandoned");
+        await GhostPairs.UpdateManyAsync(filter, update, options: null, ct);
+    }
+
+    // ─── Pair chat ───────────────────────────────────────────
+
+    public async Task<GhostPairMessage> InsertGhostPairMessageAsync(GhostPairMessage m, CancellationToken ct = default)
+    {
+        await GhostPairMessages.InsertOneAsync(m, options: null, ct);
+        return m;
+    }
+
+    public async Task<List<GhostPairMessage>> GetPairMessagesAsync(string pairId, int limit, CancellationToken ct = default)
+    {
+        var filter = Builders<GhostPairMessage>.Filter.Eq(m => m.PairId, pairId);
+        var msgs = await GhostPairMessages.Find(filter)
+            .SortByDescending(m => m.CreatedAt)
+            .Limit(limit)
+            .ToListAsync(ct);
+        msgs.Reverse();
+        return msgs;
+    }
+
+    // ─── Reveals + bans + audit ──────────────────────────────
+
+    public async Task InsertGhostRevealAsync(GhostReveal r, CancellationToken ct = default)
+    {
+        await GhostReveals.InsertOneAsync(r, options: null, ct);
+    }
+
+    public async Task BanFromGhostAsync(GhostBan b, CancellationToken ct = default)
+    {
+        await GhostBans.InsertOneAsync(b, options: null, ct);
+    }
+
+    public async Task<bool> IsBannedFromGhostAsync(string roomId, string userId, CancellationToken ct = default)
+    {
+        var filter = Builders<GhostBan>.Filter.And(
+            Builders<GhostBan>.Filter.Eq(b => b.RoomId, roomId),
+            Builders<GhostBan>.Filter.Eq(b => b.UserId, userId));
+        return await GhostBans.Find(filter).AnyAsync(ct);
+    }
+
+    public async Task LogGhostMatchmakerActionAsync(GhostMatchmakerAction a, CancellationToken ct = default)
+    {
+        await GhostMatchmakerActions.InsertOneAsync(a, options: null, ct);
     }
 }
 
