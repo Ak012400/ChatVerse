@@ -442,6 +442,13 @@ try
     // collection family). No shared state.
     app.MapHub<ChatVerse.API.Hubs.GhostRoomHub>("/hubs/ghost-room");
 
+    // Open Mic (third per-template Mehfil specialisation) — STANDALONE.
+    // Mehfil rooms with templateKind == "open_mic" land on
+    // OpenMicRoomPage. Per-slot LiveKit room is provisioned on
+    // NextPerformer; audience reactions are emoji bursts (no userId
+    // serialised).
+    app.MapHub<ChatVerse.API.Hubs.OpenMicHub>("/hubs/open-mic");
+
     // ── Startup banner ────────────────────────────────────────────
     // Emit a clear, grep-friendly summary of WHICH hubs got mapped.
     // Render's deploy logs make this the fastest way to confirm a
