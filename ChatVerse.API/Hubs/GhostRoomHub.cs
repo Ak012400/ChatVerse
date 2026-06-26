@@ -157,7 +157,7 @@ public class GhostRoomHub : Hub
     // ─── Matchmaker: config + rounds ──────────────────────────────
 
     public async Task<object> ConfigureRoom(
-        string roomId, string privacy, int maxVoyagers, int roundDurationMinutes)
+        string roomId, string privacy, int maxVoyagers, int roundDurationMinutes, bool autoPair = false)
     {
         var ct = Context.ConnectionAborted;
         var (room, _, isMatchmaker) = await AuthorizeAsync(roomId, ct);
@@ -179,6 +179,11 @@ public class GhostRoomHub : Hub
                                    : null,
             MaxVoyagers          = maxVoyagers,
             RoundDurationMinutes = roundDurationMinutes,
+            // AUTO-PAIR mode: server pairs voyagers continuously as they
+            // raise hands, no matchmaker intervention. Public Ghost Rooms
+            // typically run this way (Omegle-style); private rooms can
+            // also opt in if the host wants to step back.
+            AutoPair             = autoPair,
             CreatedAt            = DateTime.UtcNow,
         };
         await _mongo.UpsertGhostRoomConfigAsync(c, ct);
@@ -230,6 +235,31 @@ public class GhostRoomHub : Hub
         if (inserted is null) return null;
 
         await _mongo.SetVoyagerStatusAsync(voyager.Id!, "nominated", ct);
+
+        // ── AUTO-PAIR (Public Ghost Room mode) ────────────────────
+        // If the room is configured with AutoPair=true, immediately
+        // look for any OTHER pending nomination and create the pair
+        // server-side without waiting for a matchmaker. First-come-
+        // first-paired so the wait stays minimal.
+        var cfg = await _mongo.GetGhostRoomConfigAsync(roomId, ct);
+        if (cfg is not null && cfg.AutoPair)
+        {
+            var pending = await _mongo.GetPendingGhostNominationsForMatchmakerAsync(roomId, ct);
+            // Exclude self — we want a DIFFERENT user.
+            var partner = pending.FirstOrDefault(p =>
+                !string.Equals(p.UserId, meId, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(p.Id, inserted.Id, StringComparison.OrdinalIgnoreCase));
+            if (partner is not null)
+            {
+                var room = await _mongo.GetMehfilRoomByIdAsync(roomId, ct);
+                if (room is not null)
+                {
+                    var pair = await CreatePairAsync(roomId, inserted, partner, ct);
+                    await PushPairCreated(roomId, pair, inserted, partner, ct);
+                    return inserted.Id;
+                }
+            }
+        }
 
         // Public push: count only.
         var count = await _mongo.CountPendingGhostNominationsAsync(roomId, ct);
@@ -708,6 +738,7 @@ public class GhostRoomHub : Hub
                 inviteCode           = isMatchmaker ? config.InviteCode : null, // only matchmaker sees the code
                 maxVoyagers          = config.MaxVoyagers,
                 roundDurationMinutes = config.RoundDurationMinutes,
+                autoPair             = config.AutoPair,
             },
             isMatchmaker,
             me = new

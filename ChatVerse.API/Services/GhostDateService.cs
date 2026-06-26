@@ -137,6 +137,24 @@ public sealed class GhostDateService : BackgroundService
         }
     }
 
+    /// <summary>Admin-only test trigger — fires Ghost Date pairing NOW
+    /// (bypassing the Thursday 9pm IST guard). Pool comes from the
+    /// today-IST event-date if registrations exist there, else a
+    /// fresh test-{ts} bucket. Audience users register normally.</summary>
+    public async Task ForcePairingNowAsync(CancellationToken ct)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var mongo    = scope.ServiceProvider.GetRequiredService<MongoService>();
+        var postgres = scope.ServiceProvider.GetRequiredService<PostgresProcService>();
+
+        var nowUtc = DateTime.UtcNow;
+        var todayIst = nowUtc.AddHours(5).AddMinutes(30).Date.ToString("yyyy-MM-dd");
+        var pool = await mongo.GetPendingRegistrationsAsync(todayIst);
+        var eventDate = pool.Count > 0 ? todayIst : $"test-{nowUtc:yyyy-MM-dd-HH-mm}";
+        _logger.LogInformation("GhostDate admin force-pairing triggered (eventDate={Date})", eventDate);
+        await PairAsync(mongo, postgres, eventDate, nowUtc, ct);
+    }
+
     private async Task PairAsync(
         MongoService mongo, PostgresProcService postgres,
         string eventDate, DateTime scheduledFor, CancellationToken ct)
