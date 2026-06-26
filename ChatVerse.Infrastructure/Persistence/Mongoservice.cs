@@ -62,6 +62,16 @@ public partial class MongoService
     private IMongoCollection<GhostBan>              GhostBans              => _db.GetCollection<GhostBan>(MongoCollections.GhostBans);
     private IMongoCollection<GhostMatchmakerAction> GhostMatchmakerActions => _db.GetCollection<GhostMatchmakerAction>(MongoCollections.GhostMatchmakerActions);
 
+    // Open Mic (third per-template Mehfil specialisation — all om_*
+    // standalone per the per-feature isolation policy).
+    private IMongoCollection<OpenMicConfig>      OpenMicConfigs      => _db.GetCollection<OpenMicConfig>(MongoCollections.OpenMicConfigs);
+    private IMongoCollection<OpenMicSet>         OpenMicSets         => _db.GetCollection<OpenMicSet>(MongoCollections.OpenMicSets);
+    private IMongoCollection<OpenMicQueueEntry>  OpenMicQueueEntries => _db.GetCollection<OpenMicQueueEntry>(MongoCollections.OpenMicQueueEntries);
+    private IMongoCollection<OpenMicSlot>        OpenMicSlots        => _db.GetCollection<OpenMicSlot>(MongoCollections.OpenMicSlots);
+    private IMongoCollection<OpenMicReaction>    OpenMicReactions    => _db.GetCollection<OpenMicReaction>(MongoCollections.OpenMicReactions);
+    private IMongoCollection<OpenMicBan>         OpenMicBans         => _db.GetCollection<OpenMicBan>(MongoCollections.OpenMicBans);
+    private IMongoCollection<OpenMicMcAction>    OpenMicMcActions    => _db.GetCollection<OpenMicMcAction>(MongoCollections.OpenMicMcActions);
+
     // Ghost Date — weekly Thursday 9pm IST anonymous dating
     private IMongoCollection<GhostDateRegistration> GhostDateRegistrations =>
         _db.GetCollection<GhostDateRegistration>(MongoCollections.GhostDateRegistrations);
@@ -3552,6 +3562,202 @@ public partial class MongoService
     public async Task LogGhostMatchmakerActionAsync(GhostMatchmakerAction a, CancellationToken ct = default)
     {
         await GhostMatchmakerActions.InsertOneAsync(a, options: null, ct);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  Open Mic (third per-template Mehfil specialisation)
+    // ──────────────────────────────────────────────────────────────
+
+    // ─── Config ──────────────────────────────────────────────
+
+    public async Task UpsertOpenMicConfigAsync(OpenMicConfig c, CancellationToken ct = default)
+    {
+        var filter = Builders<OpenMicConfig>.Filter.Eq(x => x.RoomId, c.RoomId);
+        var existing = await OpenMicConfigs.Find(filter).FirstOrDefaultAsync(ct);
+        if (existing is null)
+        {
+            await OpenMicConfigs.InsertOneAsync(c, options: null, ct);
+        }
+        else
+        {
+            var update = Builders<OpenMicConfig>.Update
+                .Set(x => x.Privacy, c.Privacy)
+                .Set(x => x.InviteCode, c.InviteCode)
+                .Set(x => x.SlotDurationSeconds, c.SlotDurationSeconds);
+            await OpenMicConfigs.UpdateOneAsync(filter, update, options: null, ct);
+        }
+    }
+
+    public async Task<OpenMicConfig?> GetOpenMicConfigAsync(string roomId, CancellationToken ct = default)
+    {
+        return await OpenMicConfigs.Find(c => c.RoomId == roomId).FirstOrDefaultAsync(ct);
+    }
+
+    // ─── Set lifecycle ───────────────────────────────────────
+
+    public async Task<OpenMicSet?> GetActiveOpenMicSetAsync(string roomId, CancellationToken ct = default)
+    {
+        var filter = Builders<OpenMicSet>.Filter.And(
+            Builders<OpenMicSet>.Filter.Eq(s => s.RoomId, roomId),
+            Builders<OpenMicSet>.Filter.Ne(s => s.Status, "ended"));
+        return await OpenMicSets.Find(filter).SortByDescending(s => s.CreatedAt).FirstOrDefaultAsync(ct);
+    }
+
+    public async Task InsertOpenMicSetAsync(OpenMicSet s, CancellationToken ct = default)
+    {
+        await OpenMicSets.InsertOneAsync(s, options: null, ct);
+    }
+
+    public async Task SetOpenMicSetStatusAsync(string setId, string status, CancellationToken ct = default)
+    {
+        var filter = Builders<OpenMicSet>.Filter.Eq(s => s.Id, setId);
+        var update = Builders<OpenMicSet>.Update.Set(s => s.Status, status);
+        if (status == "ended")
+            update = update.Set(s => s.EndedAt, DateTime.UtcNow);
+        await OpenMicSets.UpdateOneAsync(filter, update, options: null, ct);
+    }
+
+    // ─── Queue ───────────────────────────────────────────────
+
+    public async Task<OpenMicQueueEntry?> InsertOpenMicQueueEntryAsync(OpenMicQueueEntry e, CancellationToken ct = default)
+    {
+        var existing = await OpenMicQueueEntries.Find(
+            Builders<OpenMicQueueEntry>.Filter.And(
+                Builders<OpenMicQueueEntry>.Filter.Eq(x => x.SetId, e.SetId),
+                Builders<OpenMicQueueEntry>.Filter.Eq(x => x.UserId, e.UserId),
+                Builders<OpenMicQueueEntry>.Filter.Eq(x => x.Status, "pending")))
+            .FirstOrDefaultAsync(ct);
+        if (existing is not null) return existing;
+
+        // Assign next position.
+        var count = (int)await OpenMicQueueEntries.CountDocumentsAsync(
+            Builders<OpenMicQueueEntry>.Filter.And(
+                Builders<OpenMicQueueEntry>.Filter.Eq(x => x.SetId, e.SetId),
+                Builders<OpenMicQueueEntry>.Filter.Eq(x => x.Status, "pending")),
+            options: null, ct);
+        e.Position = count + 1;
+        await OpenMicQueueEntries.InsertOneAsync(e, options: null, ct);
+        return e;
+    }
+
+    public async Task WithdrawOpenMicQueueEntryAsync(string setId, string userId, CancellationToken ct = default)
+    {
+        var filter = Builders<OpenMicQueueEntry>.Filter.And(
+            Builders<OpenMicQueueEntry>.Filter.Eq(e => e.SetId, setId),
+            Builders<OpenMicQueueEntry>.Filter.Eq(e => e.UserId, userId),
+            Builders<OpenMicQueueEntry>.Filter.Eq(e => e.Status, "pending"));
+        var update = Builders<OpenMicQueueEntry>.Update
+            .Set(e => e.Status, "withdrawn")
+            .Set(e => e.ResolvedAt, DateTime.UtcNow);
+        await OpenMicQueueEntries.UpdateOneAsync(filter, update, options: null, ct);
+    }
+
+    public async Task SetOpenMicQueueEntryStatusAsync(string entryId, string status, CancellationToken ct = default)
+    {
+        var filter = Builders<OpenMicQueueEntry>.Filter.Eq(e => e.Id, entryId);
+        var update = Builders<OpenMicQueueEntry>.Update
+            .Set(e => e.Status, status)
+            .Set(e => e.ResolvedAt, DateTime.UtcNow);
+        await OpenMicQueueEntries.UpdateOneAsync(filter, update, options: null, ct);
+    }
+
+    /// <summary>PRIVILEGED — full bios. MC-gated at hub layer.</summary>
+    public async Task<List<OpenMicQueueEntry>> GetPendingOpenMicQueueForMcAsync(string setId, CancellationToken ct = default)
+    {
+        var filter = Builders<OpenMicQueueEntry>.Filter.And(
+            Builders<OpenMicQueueEntry>.Filter.Eq(e => e.SetId, setId),
+            Builders<OpenMicQueueEntry>.Filter.Eq(e => e.Status, "pending"));
+        return await OpenMicQueueEntries.Find(filter)
+            .SortBy(e => e.Position)
+            .ToListAsync(ct);
+    }
+
+    public async Task<OpenMicQueueEntry?> GetOpenMicQueueEntryAsync(string entryId, CancellationToken ct = default)
+    {
+        return await OpenMicQueueEntries.Find(e => e.Id == entryId).FirstOrDefaultAsync(ct);
+    }
+
+    public async Task<int> CountPendingOpenMicQueueAsync(string setId, CancellationToken ct = default)
+    {
+        var filter = Builders<OpenMicQueueEntry>.Filter.And(
+            Builders<OpenMicQueueEntry>.Filter.Eq(e => e.SetId, setId),
+            Builders<OpenMicQueueEntry>.Filter.Eq(e => e.Status, "pending"));
+        return (int)await OpenMicQueueEntries.CountDocumentsAsync(filter, options: null, ct);
+    }
+
+    // ─── Slots ───────────────────────────────────────────────
+
+    public async Task<OpenMicSlot> InsertOpenMicSlotAsync(OpenMicSlot s, CancellationToken ct = default)
+    {
+        await OpenMicSlots.InsertOneAsync(s, options: null, ct);
+        return s;
+    }
+
+    public async Task<OpenMicSlot?> GetActiveOpenMicSlotAsync(string roomId, CancellationToken ct = default)
+    {
+        var filter = Builders<OpenMicSlot>.Filter.And(
+            Builders<OpenMicSlot>.Filter.Eq(s => s.RoomId, roomId),
+            Builders<OpenMicSlot>.Filter.Eq(s => s.EndedAt, null as DateTime?));
+        return await OpenMicSlots.Find(filter).SortByDescending(s => s.StartedAt).FirstOrDefaultAsync(ct);
+    }
+
+    public async Task<OpenMicSlot?> GetOpenMicSlotAsync(string slotId, CancellationToken ct = default)
+    {
+        return await OpenMicSlots.Find(s => s.Id == slotId).FirstOrDefaultAsync(ct);
+    }
+
+    public async Task EndOpenMicSlotAsync(string slotId, CancellationToken ct = default)
+    {
+        var filter = Builders<OpenMicSlot>.Filter.Eq(s => s.Id, slotId);
+        var update = Builders<OpenMicSlot>.Update.Set(s => s.EndedAt, DateTime.UtcNow);
+        await OpenMicSlots.UpdateOneAsync(filter, update, options: null, ct);
+    }
+
+    public async Task IncrementOpenMicSlotApplauseAsync(string slotId, int delta, CancellationToken ct = default)
+    {
+        var filter = Builders<OpenMicSlot>.Filter.Eq(s => s.Id, slotId);
+        var update = Builders<OpenMicSlot>.Update.Inc(s => s.ApplauseCount, delta);
+        await OpenMicSlots.UpdateOneAsync(filter, update, options: null, ct);
+    }
+
+    public async Task HighlightOpenMicSlotAsync(string slotId, CancellationToken ct = default)
+    {
+        var filter = Builders<OpenMicSlot>.Filter.Eq(s => s.Id, slotId);
+        var update = Builders<OpenMicSlot>.Update.Set(s => s.IsHighlighted, true);
+        await OpenMicSlots.UpdateOneAsync(filter, update, options: null, ct);
+    }
+
+    public async Task<List<OpenMicSlot>> GetRecentOpenMicSlotsAsync(string roomId, int limit, CancellationToken ct = default)
+    {
+        var filter = Builders<OpenMicSlot>.Filter.Eq(s => s.RoomId, roomId);
+        return await OpenMicSlots.Find(filter).SortByDescending(s => s.StartedAt).Limit(limit).ToListAsync(ct);
+    }
+
+    // ─── Reactions ───────────────────────────────────────────
+
+    public async Task InsertOpenMicReactionAsync(OpenMicReaction r, CancellationToken ct = default)
+    {
+        await OpenMicReactions.InsertOneAsync(r, options: null, ct);
+    }
+
+    // ─── Bans + audit ────────────────────────────────────────
+
+    public async Task BanFromOpenMicAsync(OpenMicBan b, CancellationToken ct = default)
+    {
+        await OpenMicBans.InsertOneAsync(b, options: null, ct);
+    }
+
+    public async Task<bool> IsBannedFromOpenMicAsync(string roomId, string userId, CancellationToken ct = default)
+    {
+        var filter = Builders<OpenMicBan>.Filter.And(
+            Builders<OpenMicBan>.Filter.Eq(b => b.RoomId, roomId),
+            Builders<OpenMicBan>.Filter.Eq(b => b.UserId, userId));
+        return await OpenMicBans.Find(filter).AnyAsync(ct);
+    }
+
+    public async Task LogOpenMicMcActionAsync(OpenMicMcAction a, CancellationToken ct = default)
+    {
+        await OpenMicMcActions.InsertOneAsync(a, options: null, ct);
     }
 }
 

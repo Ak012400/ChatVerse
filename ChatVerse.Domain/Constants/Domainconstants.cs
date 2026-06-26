@@ -234,6 +234,18 @@ public static class MongoCollections
     public const string GhostBans               = "gd_bans";
     public const string GhostMatchmakerActions  = "gd_matchmaker_actions";
 
+    // ── Open Mic (third per-template Mehfil specialisation) ────
+    /// <summary>All om_* collections — STANDALONE. Audience raises hand
+    /// with bio + performance title, MC seats the next performer on a
+    /// LiveKit audio slot, audience reacts with emoji bursts.</summary>
+    public const string OpenMicConfigs          = "om_configs";
+    public const string OpenMicSets             = "om_sets";
+    public const string OpenMicQueueEntries     = "om_queue_entries";
+    public const string OpenMicSlots            = "om_slots";
+    public const string OpenMicReactions        = "om_reactions";
+    public const string OpenMicBans             = "om_bans";
+    public const string OpenMicMcActions        = "om_mc_actions";
+
     // ── Ghost Date ─────────────────────────────────────────────
     /// <summary>Weekly opt-in pool for Thursday 9pm IST ghost dates.</summary>
     public const string GhostDateRegistrations = "ghost_date_registrations";

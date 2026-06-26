@@ -1890,3 +1890,165 @@ public class GhostMatchmakerAction
     public string? Reason { get; set; }
     public DateTime At { get; set; }
 }
+
+// ============================================================
+//  OPEN MIC — third per-template Mehfil specialisation.
+//
+//  Host = "MC" (Master of Ceremonies). Audience members raise hand
+//  with a performance title + short bio; MC picks the next performer.
+//  Active performer gets a LiveKit audio slot (audience listens). Set
+//  has a configurable slot duration. Audience can fire emoji reactions
+//  (clap / fire / cry / laugh / mic / 100) which float over the stage
+//  and tally as applause for the performer.
+//
+//  All om_* collections STANDALONE per the per-feature isolation policy.
+// ============================================================
+
+/// <summary>Configuration for a Mehfil Open Mic room (per-room config
+/// row, distinct from MehfilRoom). MC sets slot duration + privacy.</summary>
+public class OpenMicConfig
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string McUserId { get; set; } = default!;
+
+    /// <summary>"public" | "private". Private rooms gate joins via InviteCode.</summary>
+    public string Privacy { get; set; } = "public";
+    public string? InviteCode { get; set; }
+
+    /// <summary>60 / 180 / 300. Per-slot mic duration.</summary>
+    public int SlotDurationSeconds { get; set; } = 180;
+
+    public DateTime CreatedAt { get; set; }
+}
+
+/// <summary>A "set" = grouping of slots inside an Open Mic room.
+/// One set is live at a time; ended sets stay in history. MC manually
+/// starts + ends sets (or ends current slot to advance the queue).</summary>
+public class OpenMicSet
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string McUserId { get; set; } = default!;
+
+    /// <summary>"waiting" (queue open, no live slot) | "live" (a slot
+    /// is on stage right now) | "ended" (closed).</summary>
+    public string Status { get; set; } = "waiting";
+
+    public DateTime CreatedAt { get; set; }
+    public DateTime? EndedAt { get; set; }
+}
+
+/// <summary>Audience hand-raise — request to perform. Privileged bio
+/// fields are visible ONLY to the MC. `Position` orders the queue and
+/// is recomputed when entries are added/removed. Status tracks lifecycle.</summary>
+public class OpenMicQueueEntry
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string SetId { get; set; } = default!;
+    public string UserId { get; set; } = default!;
+    public string Username { get; set; } = default!;
+
+    /// <summary>MC-visible only.</summary>
+    public string RealName { get; set; } = "";
+    public int Age { get; set; }
+    public string Gender { get; set; } = "";
+
+    /// <summary>Short title for the performance — visible to audience
+    /// once the performer takes the stage.</summary>
+    public string PerformanceTitle { get; set; } = "";
+
+    /// <summary>"pending" | "called" (now on stage) | "done" | "withdrawn"</summary>
+    public string Status { get; set; } = "pending";
+    public int Position { get; set; }
+    public DateTime RaisedAt { get; set; }
+    public DateTime? ResolvedAt { get; set; }
+}
+
+/// <summary>One slot = one performer's turn on the mic. Server auto-
+/// creates a LiveKit room when MC calls NextPerformer; performer is
+/// publisher, audience are subscribers. `ApplauseCount` increments
+/// from audience reaction bursts.</summary>
+public class OpenMicSlot
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string SetId { get; set; } = default!;
+    public string QueueEntryId { get; set; } = default!;
+
+    public string PerformerUserId { get; set; } = default!;
+    public string PerformerUsername { get; set; } = default!;
+    public string PerformanceTitle { get; set; } = "";
+
+    /// <summary>LiveKit room name (om-slot-{Id}).</summary>
+    public string LivekitRoomName { get; set; } = default!;
+
+    public DateTime StartedAt { get; set; }
+    public DateTime? EndsAt { get; set; }
+    public DateTime? EndedAt { get; set; }
+
+    /// <summary>Total reactions tallied during this slot.</summary>
+    public int ApplauseCount { get; set; }
+    /// <summary>Set true when MC flags this performance as "highlighted"
+    /// — surfaces a Crown badge in the slot card.</summary>
+    public bool IsHighlighted { get; set; }
+}
+
+/// <summary>Audience reaction burst. Stored for history + ApplauseCount
+/// tally. Many of these per slot, so kept lightweight (no per-user audit).</summary>
+public class OpenMicReaction
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string SlotId { get; set; } = default!;
+    public string Emoji { get; set; } = default!;
+    public DateTime At { get; set; }
+}
+
+/// <summary>Per-room ban — scoped to ONE open mic room only.</summary>
+public class OpenMicBan
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string UserId { get; set; } = default!;
+    public string McUserId { get; set; } = default!;
+    public string? Reason { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+
+/// <summary>Audit log for MC actions.</summary>
+public class OpenMicMcAction
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string McUserId { get; set; } = default!;
+    public string TargetUserId { get; set; } = default!;
+
+    /// <summary>start_set | end_set | next_performer | end_slot |
+    /// highlight | kick | ban</summary>
+    public string ActionType { get; set; } = default!;
+    public string? Reason { get; set; }
+    public DateTime At { get; set; }
+}
