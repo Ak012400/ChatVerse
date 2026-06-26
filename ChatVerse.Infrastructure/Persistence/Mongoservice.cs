@@ -3270,7 +3270,8 @@ public partial class MongoService
                 .Set(x => x.Privacy, c.Privacy)
                 .Set(x => x.InviteCode, c.InviteCode)
                 .Set(x => x.MaxVoyagers, c.MaxVoyagers)
-                .Set(x => x.RoundDurationMinutes, c.RoundDurationMinutes);
+                .Set(x => x.RoundDurationMinutes, c.RoundDurationMinutes)
+                .Set(x => x.AutoPair, c.AutoPair);
             await GhostRoomConfigs.UpdateOneAsync(filter, update, options: null, ct);
         }
     }

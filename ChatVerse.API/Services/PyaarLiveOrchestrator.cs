@@ -99,6 +99,28 @@ public sealed class PyaarLiveOrchestrator : BackgroundService
 
     // ─── Formation ─────────────────────────────────────────────
 
+    /// <summary>Admin-only test trigger — fires show formation NOW
+    /// (bypassing the Saturday 8pm IST guard). Uses a unique
+    /// `test-{ts}` event-date so the duplicate-formation guard
+    /// doesn't block successive test runs. Audience users still need
+    /// to register first (POST /api/pyaar-live/register).</summary>
+    public async Task ForceFormationNowAsync(CancellationToken ct)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var mongo    = scope.ServiceProvider.GetRequiredService<MongoService>();
+        var postgres = scope.ServiceProvider.GetRequiredService<PostgresProcService>();
+
+        var nowUtc = DateTime.UtcNow;
+        // Look first for any pending registration on today's IST date
+        // so existing testers don't have to re-register. Otherwise
+        // fall back to a fresh test-{ts} bucket.
+        var todayIst = nowUtc.AddHours(5).AddMinutes(30).Date.ToString("yyyy-MM-dd");
+        var pool = await mongo.GetPendingPyaarRegistrationsAsync(todayIst);
+        var eventDate = pool.Count > 0 ? todayIst : $"test-{nowUtc:yyyy-MM-dd-HH-mm}";
+        _logger.LogInformation("PYAAR LIVE admin force-formation triggered (eventDate={Date})", eventDate);
+        await FormShowAsync(mongo, postgres, eventDate, nowUtc, ct);
+    }
+
     private async Task FormShowAsync(
         MongoService mongo, PostgresProcService postgres,
         string eventDate, DateTime scheduledFor, CancellationToken ct)

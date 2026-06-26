@@ -1727,6 +1727,14 @@ public class GhostRoomConfig
     /// <summary>5 / 10 / 15 / 20. Per-round duration cap. </summary>
     public int RoundDurationMinutes { get; set; } = 10;
 
+    /// <summary>When TRUE, the room has no matchmaker — server pairs
+    /// voyagers AUTOMATICALLY as they raise hands (continuous-pairing
+    /// mode, Omegle-style). Matchmaker controls are hidden in the UI
+    /// and the privileged bio queue is irrelevant (no human picks).
+    /// When FALSE (default), the room is matchmaker-driven: host
+    /// nominates pairs from the bio queue.</summary>
+    public bool AutoPair { get; set; }
+
     public DateTime CreatedAt { get; set; }
 }
 

@@ -1,4 +1,5 @@
 using ChatVerse.API.Extensions;
+using ChatVerse.API.Services;
 using ChatVerse.Domain.Constants;
 using ChatVerse.Domain.Enums;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
@@ -253,3 +254,82 @@ public class AdminController : ControllerBase
 
 public record ReviewReportRequest(string Outcome, string? Note);
 public record ReviewDocRequest(string Outcome, string? RejectReason);
+
+// ============================================================
+//  Admin test triggers — exposed via a SEPARATE controller class
+//  but same /api/admin route, gated by the same admin allow-list.
+//
+//  Why separate class: keeps the historical AdminController focused on
+//  user / report / doc review while the test-trigger endpoints sit
+//  alongside without bloating that file. They share the same allow-list
+//  pattern but inject the background-service singletons directly.
+//
+//  Endpoints:
+//    • POST /api/admin/test/force-pyaar-formation
+//        Bypasses Saturday 8pm IST guard and runs FormShowAsync now.
+//    • POST /api/admin/test/force-ghost-pairing
+//        Bypasses Thursday 9pm IST guard and runs PairAsync now.
+//
+//  Both require the caller's userId to appear in Admin:UserIds.
+// ============================================================
+[ApiController]
+[Route("api/admin/test")]
+[Authorize]
+public class AdminTestTriggersController : ControllerBase
+{
+    private readonly IConfiguration _config;
+    private readonly PyaarLiveOrchestrator _pyaar;
+    private readonly GhostDateService _ghost;
+    private readonly ILogger<AdminTestTriggersController> _logger;
+
+    public AdminTestTriggersController(
+        IConfiguration config,
+        PyaarLiveOrchestrator pyaar,
+        GhostDateService ghost,
+        ILogger<AdminTestTriggersController> logger)
+    {
+        _config = config;
+        _pyaar = pyaar;
+        _ghost = ghost;
+        _logger = logger;
+    }
+
+    private bool IsAdmin()
+    {
+        var meId = JwtService.GetUserId(User);
+        var allowList = _config.GetSection("Admin:UserIds").Get<string[]>() ?? Array.Empty<string>();
+        return allowList.Contains(meId.ToString(), StringComparer.OrdinalIgnoreCase);
+    }
+
+    [HttpPost("force-pyaar-formation")]
+    public async Task<IActionResult> ForcePyaarFormation(CancellationToken ct)
+    {
+        if (!IsAdmin()) return Forbid();
+        try
+        {
+            await _pyaar.ForceFormationNowAsync(ct);
+            return Ok(new { ok = true, message = "PYAAR LIVE formation triggered." });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "PYAAR force-formation failed");
+            return StatusCode(500, new { ok = false, error = ex.Message });
+        }
+    }
+
+    [HttpPost("force-ghost-pairing")]
+    public async Task<IActionResult> ForceGhostPairing(CancellationToken ct)
+    {
+        if (!IsAdmin()) return Forbid();
+        try
+        {
+            await _ghost.ForcePairingNowAsync(ct);
+            return Ok(new { ok = true, message = "Ghost Date pairing triggered." });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Ghost force-pairing failed");
+            return StatusCode(500, new { ok = false, error = ex.Message });
+        }
+    }
+}

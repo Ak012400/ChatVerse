@@ -304,7 +304,11 @@ try
     // Ghost Date (Phase 2 weekly anonymous dating) — 60-second tick
     // handles Thursday 9pm IST pairing + 9:30pm chat-ended push +
     // 9:35pm decision-deadline expiry. All idempotent.
-    builder.Services.AddHostedService<ChatVerse.API.Services.GhostDateService>();
+    // Singleton registration so AdminTestTriggersController can resolve
+    // the SAME instance and call ForcePairingNowAsync() for test runs.
+    builder.Services.AddSingleton<ChatVerse.API.Services.GhostDateService>();
+    builder.Services.AddHostedService(sp =>
+        sp.GetRequiredService<ChatVerse.API.Services.GhostDateService>());
 
     // Love Triangle (Phase 2 weekly drama) — 5-min tick handles
     // Sunday 10pm IST formation + 7-day chat-end voting open +
@@ -320,7 +324,11 @@ try
     // PYAAR LIVE (Phase 3 flagship) — 1-min tick orchestrates the
     // Saturday 8pm IST mass dating show end-to-end: formation,
     // 4-round advancement, mid-show elimination, completion + winners.
-    builder.Services.AddHostedService<ChatVerse.API.Services.PyaarLiveOrchestrator>();
+    // Singleton registration so AdminTestTriggersController can resolve
+    // the SAME instance and call ForceFormationNowAsync() for test runs.
+    builder.Services.AddSingleton<ChatVerse.API.Services.PyaarLiveOrchestrator>();
+    builder.Services.AddHostedService(sp =>
+        sp.GetRequiredService<ChatVerse.API.Services.PyaarLiveOrchestrator>());
 
     // ── Phase 5 token economy ────────────────────────────────────
     //    TokenLedgerService is the only place that writes balance +
