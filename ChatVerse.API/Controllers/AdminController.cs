@@ -280,17 +280,23 @@ public class AdminTestTriggersController : ControllerBase
     private readonly IConfiguration _config;
     private readonly PyaarLiveOrchestrator _pyaar;
     private readonly GhostDateService _ghost;
+    private readonly ChatVerse.Infrastructure.Persistence.MongoDB.MongoService _mongo;
+    private readonly ChatVerse.Infrastructure.Persistence.PostgreSQL.ChatVerseDbContext _db;
     private readonly ILogger<AdminTestTriggersController> _logger;
 
     public AdminTestTriggersController(
         IConfiguration config,
         PyaarLiveOrchestrator pyaar,
         GhostDateService ghost,
+        ChatVerse.Infrastructure.Persistence.MongoDB.MongoService mongo,
+        ChatVerse.Infrastructure.Persistence.PostgreSQL.ChatVerseDbContext db,
         ILogger<AdminTestTriggersController> logger)
     {
         _config = config;
         _pyaar = pyaar;
         _ghost = ghost;
+        _mongo = mongo;
+        _db = db;
         _logger = logger;
     }
 
@@ -331,5 +337,58 @@ public class AdminTestTriggersController : ControllerBase
             _logger.LogError(ex, "Ghost force-pairing failed");
             return StatusCode(500, new { ok = false, error = ex.Message });
         }
+    }
+
+    /// <summary>Seed the PYAAR LIVE / Ghost Date pool with N existing
+    /// users (the most recently active non-guest accounts other than the
+    /// admin themselves). Lets a single admin test the full pairing flow
+    /// without needing N other browsers signed in. Idempotent per-user:
+    /// users already pending in today's pool are skipped.</summary>
+    [HttpPost("seed-pool")]
+    public async Task<IActionResult> SeedPool([FromQuery] string kind, [FromQuery] int count, CancellationToken ct)
+    {
+        if (!IsAdmin()) return Forbid();
+        if (kind != "pyaar" && kind != "ghost")
+            return BadRequest(new { ok = false, error = "kind must be 'pyaar' or 'ghost'" });
+        if (count is < 1 or > 20)
+            return BadRequest(new { ok = false, error = "count must be 1..20" });
+
+        var meId = JwtService.GetUserId(User);
+
+        // Pull recent active non-guest users (excluding me).
+        var users = await _db.Users
+            .Where(u => !u.IsGuest && u.Status == ChatVerse.Domain.Enums.UserStatus.Active && u.Id != meId)
+            .OrderByDescending(u => u.LastActiveDate)
+            .Take(count)
+            .Select(u => u.Id)
+            .ToListAsync(ct);
+        if (users.Count == 0)
+            return Ok(new { ok = false, message = "No eligible users to seed with — invite some real test accounts first." });
+
+        var nowUtc = DateTime.UtcNow;
+        var todayIst = nowUtc.AddHours(5).AddMinutes(30).Date.ToString("yyyy-MM-dd");
+        var seeded = 0;
+        foreach (var uid in users)
+        {
+            try
+            {
+                if (kind == "pyaar")
+                    await _mongo.RegisterForPyaarLiveAsync(uid.ToString(), todayIst);
+                else
+                    await _mongo.RegisterForGhostDateAsync(uid.ToString(), todayIst);
+                seeded++;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Seed-pool insert failed for user {UserId}", uid);
+            }
+        }
+
+        return Ok(new
+        {
+            ok = true,
+            message = $"Seeded {seeded} user(s) into the {kind} pool for today. Now click 'Start' to trigger formation.",
+            seeded,
+        });
     }
 }

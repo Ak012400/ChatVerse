@@ -92,6 +92,36 @@ public class BrevoEmailService
         return await SendEmailAsync(toEmail, subject, html, text);
     }
 
+    /// <summary>Sends an in-app support ticket to the support inbox.
+    /// The user's userId + username + reply-to email are stamped into
+    /// the email body so the agent can respond directly. Truncates
+    /// bodies > 8000 chars defensively.</summary>
+    public async Task<bool> SendSupportTicketAsync(
+        string userEmail, string username, string userId,
+        string subject, string body)
+    {
+        var clean = (body ?? "").Trim();
+        if (clean.Length > 8000) clean = clean.Substring(0, 8000) + "\n\n[truncated]";
+        var ticketSubject = $"[ChatVerse support] {subject}";
+
+        var html =
+            $"<h2>New support request</h2>" +
+            $"<p><strong>From:</strong> {System.Net.WebUtility.HtmlEncode(username)} ({System.Net.WebUtility.HtmlEncode(userEmail)})</p>" +
+            $"<p><strong>User ID:</strong> <code>{System.Net.WebUtility.HtmlEncode(userId)}</code></p>" +
+            $"<p><strong>Subject:</strong> {System.Net.WebUtility.HtmlEncode(subject)}</p>" +
+            $"<hr/>" +
+            $"<pre style='white-space:pre-wrap;font-family:system-ui,sans-serif;line-height:1.5'>{System.Net.WebUtility.HtmlEncode(clean)}</pre>";
+
+        var text =
+            $"New support request\n\n" +
+            $"From: {username} ({userEmail})\n" +
+            $"User ID: {userId}\n" +
+            $"Subject: {subject}\n\n" +
+            $"-----\n{clean}";
+
+        return await SendEmailAsync(SupportEmail, ticketSubject, html, text);
+    }
+
     // ============================================================
     //  Core send — builds a MIME message (text + HTML) and ships
     //  it through the SMTP relay. STARTTLS on 587 (Gmail default),
