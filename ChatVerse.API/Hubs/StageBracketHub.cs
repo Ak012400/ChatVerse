@@ -166,6 +166,92 @@ public class StageBracketHub : Hub
 
     // ─── Round lifecycle ──────────────────────────────────────
 
+    /// <summary>One-shot host action — wraps ConfigureRoom (with sane
+    /// defaults if no config exists) + StartRound + GoLive in a single
+    /// server call so the host can jump from "empty room" to "live with
+    /// mic open" in one click. Topic is host-provided if supplied, else
+    /// random from the public Debate bank (Roast still needs a topic).</summary>
+    public async Task<object> QuickStart(string roomId, string mode, string? hostTopic)
+    {
+        var ct = Context.ConnectionAborted;
+        var (room, isHost) = await AuthorizeAsync(roomId, ct);
+        RequireHost(isHost);
+
+        if (!AllowedModes.Contains(mode))
+            throw new HubException("Mode must be debate or roast.");
+
+        var topicClean = (hostTopic ?? "").Trim();
+        if (topicClean.Length > MaxTopicChars) topicClean = topicClean.Substring(0, MaxTopicChars);
+
+        // Roast must have a topic — fail fast so the UI can prompt.
+        if (string.Equals(mode, "roast", StringComparison.OrdinalIgnoreCase) && topicClean.Length == 0)
+            throw new HubException("Roast rooms need a host-provided subject before going live.");
+
+        // 1. Upsert config with defaults (preserve existing values if set).
+        var existing = await _mongo.GetStageBracketConfigAsync(roomId, ct);
+        var cfg = existing ?? new StageBracketConfig
+        {
+            RoomId               = roomId,
+            HostUserId           = room.HostUserId,
+            Mode                 = mode.ToLowerInvariant(),
+            Privacy              = "public",
+            SecondsPerTurn       = 90,
+            RoundDurationMinutes = 5,
+            ChallengeSlotSeconds = 60,
+            CreatedAt            = DateTime.UtcNow,
+        };
+        cfg.Mode = mode.ToLowerInvariant();
+        if (topicClean.Length > 0) cfg.HostTopic = topicClean;
+        await _mongo.UpsertStageBracketConfigAsync(cfg, ct);
+
+        // 2. Ensure no active round is already live.
+        var active = await _mongo.GetActiveStageBracketRoundAsync(roomId, ct);
+        if (active is not null && active.Status != "ended")
+        {
+            // Already running — just return state.
+            return await BuildRoomStateAsync(room, isHost: true, ct);
+        }
+
+        // 3. Pick topic for the round (host-provided wins; else bank for debate).
+        var topic = !string.IsNullOrWhiteSpace(cfg.HostTopic)
+            ? cfg.HostTopic!
+            : PublicDebateTopics[Random.Shared.Next(PublicDebateTopics.Length)];
+
+        // 4. Create round + seats.
+        var round = new StageBracketRound
+        {
+            RoomId    = roomId,
+            Mode      = cfg.Mode,
+            Topic     = topic,
+            Status    = "open_seats",
+            CreatedAt = DateTime.UtcNow,
+        };
+        await _mongo.InsertStageBracketRoundAsync(round, ct);
+        await _mongo.SeedStageBracketSeatsAsync(roomId, round.Id!, ct);
+
+        // 5. Immediately go live — audience can nominate + auto-seat
+        //    (public mode) so the room is hot from the first second.
+        var now = DateTime.UtcNow;
+        var endsAt = now.AddMinutes(cfg.RoundDurationMinutes);
+        var turnEndsAt = now.AddSeconds(cfg.SecondsPerTurn);
+        await _mongo.PatchStageBracketRoundAsync(round.Id!,
+            status: "live",
+            activeSide: "left", activeSeatPosition: 0,
+            nextLeftPosition: 1, nextRightPosition: 0,
+            startedAt: now, endsAt: endsAt, currentTurnEndsAt: turnEndsAt,
+            ct: ct);
+
+        await _mongo.LogStageBracketHostActionAsync(new StageBracketHostAction
+        {
+            RoomId = roomId, HostUserId = room.HostUserId, TargetUserId = room.HostUserId,
+            ActionType = "quick_start", Reason = $"topic={topic}", At = DateTime.UtcNow,
+        }, ct);
+
+        var state = await BuildRoomStateAsync(room, isHost: true, ct);
+        await _hubCtx.Clients.Group(RoomGroup(roomId)).SendAsync("RoundLive", state, ct);
+        return state;
+    }
+
     public async Task<string?> StartRound(string roomId)
     {
         var ct = Context.ConnectionAborted;
