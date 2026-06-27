@@ -1,12 +1,13 @@
 using ChatVerse.API.Extensions;
 using ChatVerse.API.Models;
-using ChatVerse.Domain.Entities;
 using ChatVerse.Infrastructure.ExternalServices.AI;
 using ChatVerse.Infrastructure.ExternalServices.Email;
 using ChatVerse.Infrastructure.Persistence.PostgreSQL;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
+using System.Data;
 
 namespace ChatVerse.API.Controllers;
 
@@ -183,13 +184,34 @@ ChatVerse questions; for other topics try a general assistant.""
             return BadRequest(ApiResponse.Fail("Body must be 10-8000 chars."));
 
         var meId = JwtService.GetUserId(User);
-        var user = await _db.Users.AsNoTracking()
-            .FirstOrDefaultAsync(u => u.Id == meId, ct);
-        if (user is null) return Unauthorized();
+
+        // Direct SQL — ChatVerseDbContext intentionally has no DbSet<T>
+        // mappings, so we go through the underlying Npgsql connection
+        // for one-shot reads like this.
+        var conn = (NpgsqlConnection)_db.Database.GetDbConnection();
+        if (conn.State != ConnectionState.Open) await conn.OpenAsync(ct);
+
+        string username = "";
+        string email    = "(no email on file)";
+        await using (var cmd = new NpgsqlCommand(
+            "SELECT username, email FROM user_auth.users WHERE id = @p_id", conn))
+        {
+            cmd.Parameters.AddWithValue("p_id", meId);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            if (await reader.ReadAsync(ct))
+            {
+                username = reader.GetString(0);
+                if (!reader.IsDBNull(1)) email = reader.GetString(1);
+            }
+            else
+            {
+                return Unauthorized();
+            }
+        }
 
         var ok = await _email.SendSupportTicketAsync(
-            userEmail: user.Email ?? "(no email on file)",
-            username:  user.Username,
+            userEmail: email,
+            username:  username,
             userId:    meId.ToString(),
             subject:   subject,
             body:      body);

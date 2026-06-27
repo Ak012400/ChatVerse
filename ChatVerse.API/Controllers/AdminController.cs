@@ -355,13 +355,31 @@ public class AdminTestTriggersController : ControllerBase
 
         var meId = JwtService.GetUserId(User);
 
-        // Pull recent active non-guest users (excluding me).
-        var users = await _db.Users
-            .Where(u => !u.IsGuest && u.Status == ChatVerse.Domain.Enums.UserStatus.Active && u.Id != meId)
-            .OrderByDescending(u => u.LastActiveDate)
-            .Take(count)
-            .Select(u => u.Id)
-            .ToListAsync(ct);
+        // Direct SQL — ChatVerseDbContext has no DbSet<T> mappings so we
+        // can't use LINQ. Pull recent active non-guest users (excluding me)
+        // ordered by last activity. `status` is the user_auth.user_status
+        // enum; raw text comparison to 'active' is what the existing
+        // admin queries already do.
+        var conn = (NpgsqlConnection)_db.Database.GetDbConnection();
+        if (conn.State != ConnectionState.Open) await conn.OpenAsync(ct);
+
+        var users = new List<Guid>();
+        await using (var cmd = new NpgsqlCommand(
+            @"SELECT id FROM user_auth.users
+              WHERE is_guest = false
+                AND status = 'active'
+                AND id <> @p_me
+              ORDER BY last_active_date DESC NULLS LAST
+              LIMIT @p_count", conn))
+        {
+            cmd.Parameters.AddWithValue("p_me", meId);
+            cmd.Parameters.AddWithValue("p_count", count);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                users.Add(reader.GetGuid(0));
+            }
+        }
         if (users.Count == 0)
             return Ok(new { ok = false, message = "No eligible users to seed with — invite some real test accounts first." });
 
