@@ -24,12 +24,21 @@ public class AiChatProvider
     private readonly HttpClient _http;
     private readonly string _groqKey;
     private readonly string _geminiKey;
+    // Model names are now config-overridable so we can swap to a newer
+    // model (or a model still on the free tier) without a redeploy.
+    // Defaults track the current "recommended free-tier chat" model on
+    // each provider as of 2026-06; override via env vars:
+    //   Groq__Model = llama-3.3-70b-versatile (or whatever Groq publishes)
+    //   Gemini__Model = gemini-1.5-flash
+    private readonly string _groqModel;
+    private readonly string _geminiModel;
     private readonly ILogger<AiChatProvider> _logger;
 
     private const string GroqUrl = "https://api.groq.com/openai/v1/chat/completions";
-    private const string GroqModel = "llama-3.1-8b-instant";
-    private const string GeminiUrl =
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent";
+    private const string GroqDefaultModel = "llama-3.3-70b-versatile";
+    // Gemini URL takes the model in the path; we build it dynamically
+    // in TryGeminiAsync so the model env var actually has effect.
+    private const string GeminiDefaultModel = "gemini-1.5-flash";
 
     public AiChatProvider(
         HttpClient http,
@@ -39,6 +48,8 @@ public class AiChatProvider
         _http = http;
         _groqKey = config["Groq:ApiKey"] ?? "";
         _geminiKey = config["Gemini:ApiKey"] ?? "";
+        _groqModel = config["Groq:Model"] ?? GroqDefaultModel;
+        _geminiModel = config["Gemini:Model"] ?? GeminiDefaultModel;
         _logger = logger;
     }
 
@@ -85,7 +96,7 @@ public class AiChatProvider
         {
             var payload = new
             {
-                model = GroqModel,
+                model = _groqModel,
                 messages = req.Messages.Select(m => new { role = m.Role, content = m.Content }),
                 temperature = req.Temperature,
                 max_tokens = req.MaxTokens,
@@ -133,8 +144,12 @@ public class AiChatProvider
     {
         try
         {
-            // Gemini takes ?key=... in the URL rather than an Authorization header.
-            var url = $"{GeminiUrl}?key={_geminiKey}";
+            // Gemini takes ?key=... in the URL rather than an Authorization
+            // header. Model name is config-overridable so we can swap to
+            // gemini-2.0-flash etc without a redeploy.
+            var geminiUrl =
+                $"https://generativelanguage.googleapis.com/v1beta/models/{_geminiModel}:generateContent";
+            var url = $"{geminiUrl}?key={_geminiKey}";
 
             // Split system from user/assistant turns.
             var systemText = string.Join("\n",
