@@ -301,6 +301,11 @@ try
     // expired open polls and broadcasts PollClosed to the room.
     builder.Services.AddHostedService<ChatVerse.API.Services.PollsTickerService>();
 
+    // Stage Bracket ticker (Debate v2 + Roast) — 1-sec tick advances
+    // turn rotation, expires challenger slots, ends rounds. Drives the
+    // entire 5v5 mic rotation server-side so clients are pure-display.
+    builder.Services.AddHostedService<ChatVerse.API.Services.StageBracketTickerService>();
+
     // Ghost Date (Phase 2 weekly anonymous dating) — 60-second tick
     // handles Thursday 9pm IST pairing + 9:30pm chat-ended push +
     // 9:35pm decision-deadline expiry. All idempotent.
@@ -456,6 +461,11 @@ try
     // NextPerformer; audience reactions are emoji bursts (no userId
     // serialised).
     app.MapHub<ChatVerse.API.Hubs.OpenMicHub>("/hubs/open-mic");
+
+    // Stage Bracket (Debate v2 + Roast shared backend) — 5v5 stage,
+    // mic-rotation, audience challenge mechanic, per-round LiveKit
+    // audio room. Mode field on config differentiates the two templates.
+    app.MapHub<ChatVerse.API.Hubs.StageBracketHub>("/hubs/stage-bracket");
 
     // ── Startup banner ────────────────────────────────────────────
     // Emit a clear, grep-friendly summary of WHICH hubs got mapped.

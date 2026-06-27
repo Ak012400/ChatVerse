@@ -72,6 +72,16 @@ public partial class MongoService
     private IMongoCollection<OpenMicBan>         OpenMicBans         => _db.GetCollection<OpenMicBan>(MongoCollections.OpenMicBans);
     private IMongoCollection<OpenMicMcAction>    OpenMicMcActions    => _db.GetCollection<OpenMicMcAction>(MongoCollections.OpenMicMcActions);
 
+    // Stage Bracket — shared backend for Debate v2 + Roast.
+    private IMongoCollection<StageBracketConfig>      StageBracketConfigs      => _db.GetCollection<StageBracketConfig>(MongoCollections.StageBracketConfigs);
+    private IMongoCollection<StageBracketRound>       StageBracketRounds       => _db.GetCollection<StageBracketRound>(MongoCollections.StageBracketRounds);
+    private IMongoCollection<StageBracketSeat>        StageBracketSeats        => _db.GetCollection<StageBracketSeat>(MongoCollections.StageBracketSeats);
+    private IMongoCollection<StageBracketNomination>  StageBracketNominations  => _db.GetCollection<StageBracketNomination>(MongoCollections.StageBracketNominations);
+    private IMongoCollection<StageBracketTurn>        StageBracketTurns        => _db.GetCollection<StageBracketTurn>(MongoCollections.StageBracketTurns);
+    private IMongoCollection<StageBracketChatMessage> StageBracketChatMessages => _db.GetCollection<StageBracketChatMessage>(MongoCollections.StageBracketChatMessages);
+    private IMongoCollection<StageBracketBan>         StageBracketBans         => _db.GetCollection<StageBracketBan>(MongoCollections.StageBracketBans);
+    private IMongoCollection<StageBracketHostAction>  StageBracketHostActions  => _db.GetCollection<StageBracketHostAction>(MongoCollections.StageBracketHostActions);
+
     // Ghost Date — weekly Thursday 9pm IST anonymous dating
     private IMongoCollection<GhostDateRegistration> GhostDateRegistrations =>
         _db.GetCollection<GhostDateRegistration>(MongoCollections.GhostDateRegistrations);
@@ -3759,6 +3769,337 @@ public partial class MongoService
     public async Task LogOpenMicMcActionAsync(OpenMicMcAction a, CancellationToken ct = default)
     {
         await OpenMicMcActions.InsertOneAsync(a, options: null, ct);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    //  Stage Bracket (shared backend for Debate v2 + Roast)
+    // ──────────────────────────────────────────────────────────────
+
+    // ─── Config ──────────────────────────────────────────────
+
+    public async Task UpsertStageBracketConfigAsync(StageBracketConfig c, CancellationToken ct = default)
+    {
+        var filter = Builders<StageBracketConfig>.Filter.Eq(x => x.RoomId, c.RoomId);
+        var existing = await StageBracketConfigs.Find(filter).FirstOrDefaultAsync(ct);
+        if (existing is null)
+        {
+            await StageBracketConfigs.InsertOneAsync(c, options: null, ct);
+        }
+        else
+        {
+            var update = Builders<StageBracketConfig>.Update
+                .Set(x => x.Mode, c.Mode)
+                .Set(x => x.Privacy, c.Privacy)
+                .Set(x => x.InviteCode, c.InviteCode)
+                .Set(x => x.SecondsPerTurn, c.SecondsPerTurn)
+                .Set(x => x.RoundDurationMinutes, c.RoundDurationMinutes)
+                .Set(x => x.ChallengeSlotSeconds, c.ChallengeSlotSeconds)
+                .Set(x => x.HostTopic, c.HostTopic);
+            await StageBracketConfigs.UpdateOneAsync(filter, update, options: null, ct);
+        }
+    }
+
+    public async Task<StageBracketConfig?> GetStageBracketConfigAsync(string roomId, CancellationToken ct = default)
+    {
+        return await StageBracketConfigs.Find(c => c.RoomId == roomId).FirstOrDefaultAsync(ct);
+    }
+
+    // ─── Round ────────────────────────────────────────────────
+
+    public async Task<StageBracketRound?> GetActiveStageBracketRoundAsync(string roomId, CancellationToken ct = default)
+    {
+        var filter = Builders<StageBracketRound>.Filter.And(
+            Builders<StageBracketRound>.Filter.Eq(r => r.RoomId, roomId),
+            Builders<StageBracketRound>.Filter.Ne(r => r.Status, "ended"));
+        return await StageBracketRounds.Find(filter).SortByDescending(r => r.CreatedAt).FirstOrDefaultAsync(ct);
+    }
+
+    public async Task InsertStageBracketRoundAsync(StageBracketRound r, CancellationToken ct = default)
+    {
+        await StageBracketRounds.InsertOneAsync(r, options: null, ct);
+    }
+
+    public async Task<StageBracketRound?> GetStageBracketRoundAsync(string roundId, CancellationToken ct = default)
+    {
+        return await StageBracketRounds.Find(r => r.Id == roundId).FirstOrDefaultAsync(ct);
+    }
+
+    /// <summary>Update one or more round fields atomically. Pass null
+    /// for fields you don't want to change.</summary>
+    public async Task PatchStageBracketRoundAsync(
+        string roundId,
+        string? status = null,
+        string? activeSide = null,
+        int? activeSeatPosition = null,
+        int? nextLeftPosition = null,
+        int? nextRightPosition = null,
+        DateTime? startedAt = null,
+        DateTime? endsAt = null,
+        DateTime? currentTurnEndsAt = null,
+        DateTime? endedAt = null,
+        string? challengerUserId = null,
+        string? challengerUsername = null,
+        DateTime? challengerEndsAt = null,
+        bool clearChallenger = false,
+        CancellationToken ct = default)
+    {
+        var update = Builders<StageBracketRound>.Update.Combine();
+        if (status is not null) update = update.Set(r => r.Status, status);
+        if (activeSide is not null) update = update.Set(r => r.ActiveSide, activeSide);
+        if (activeSeatPosition.HasValue) update = update.Set(r => r.ActiveSeatPosition, activeSeatPosition.Value);
+        if (nextLeftPosition.HasValue) update = update.Set(r => r.NextLeftPosition, nextLeftPosition.Value);
+        if (nextRightPosition.HasValue) update = update.Set(r => r.NextRightPosition, nextRightPosition.Value);
+        if (startedAt.HasValue) update = update.Set(r => r.StartedAt, startedAt.Value);
+        if (endsAt.HasValue) update = update.Set(r => r.EndsAt, endsAt.Value);
+        if (currentTurnEndsAt.HasValue) update = update.Set(r => r.CurrentTurnEndsAt, currentTurnEndsAt.Value);
+        if (endedAt.HasValue) update = update.Set(r => r.EndedAt, endedAt.Value);
+        if (clearChallenger)
+        {
+            update = update
+                .Set(r => r.ChallengerUserId, (string?)null)
+                .Set(r => r.ChallengerUsername, (string?)null)
+                .Set(r => r.ChallengerEndsAt, (DateTime?)null);
+        }
+        else
+        {
+            if (challengerUserId is not null) update = update.Set(r => r.ChallengerUserId, challengerUserId);
+            if (challengerUsername is not null) update = update.Set(r => r.ChallengerUsername, challengerUsername);
+            if (challengerEndsAt.HasValue) update = update.Set(r => r.ChallengerEndsAt, challengerEndsAt.Value);
+        }
+        await StageBracketRounds.UpdateOneAsync(
+            Builders<StageBracketRound>.Filter.Eq(r => r.Id, roundId),
+            update, options: null, ct);
+    }
+
+    /// <summary>All live rounds across all rooms — used by the ticker
+    /// service to fan-out turn advancement work.</summary>
+    public async Task<List<StageBracketRound>> GetAllLiveStageBracketRoundsAsync(CancellationToken ct = default)
+    {
+        var filter = Builders<StageBracketRound>.Filter.Eq(r => r.Status, "live");
+        return await StageBracketRounds.Find(filter).ToListAsync(ct);
+    }
+
+    // ─── Seats ────────────────────────────────────────────────
+
+    public async Task SeedStageBracketSeatsAsync(string roomId, string roundId, CancellationToken ct = default)
+    {
+        var seats = new List<StageBracketSeat>();
+        foreach (var side in new[] { "left", "right" })
+        {
+            for (var i = 0; i < 5; i++)
+            {
+                seats.Add(new StageBracketSeat
+                {
+                    RoomId   = roomId,
+                    RoundId  = roundId,
+                    Side     = side,
+                    Position = i,
+                });
+            }
+        }
+        await StageBracketSeats.InsertManyAsync(seats, options: null, ct);
+    }
+
+    public async Task<List<StageBracketSeat>> GetStageBracketSeatsAsync(string roundId, CancellationToken ct = default)
+    {
+        return await StageBracketSeats.Find(s => s.RoundId == roundId)
+            .SortBy(s => s.Side).ThenBy(s => s.Position)
+            .ToListAsync(ct);
+    }
+
+    public async Task<bool> TryAssignStageBracketSeatAsync(
+        string roundId, string side, int position, string userId, string username,
+        CancellationToken ct = default)
+    {
+        // Reject if user already seated this round.
+        var alreadyOn = await StageBracketSeats.Find(
+            Builders<StageBracketSeat>.Filter.And(
+                Builders<StageBracketSeat>.Filter.Eq(s => s.RoundId, roundId),
+                Builders<StageBracketSeat>.Filter.Eq(s => s.OccupantUserId, userId)))
+            .AnyAsync(ct);
+        if (alreadyOn) return false;
+
+        var filter = Builders<StageBracketSeat>.Filter.And(
+            Builders<StageBracketSeat>.Filter.Eq(s => s.RoundId, roundId),
+            Builders<StageBracketSeat>.Filter.Eq(s => s.Side, side),
+            Builders<StageBracketSeat>.Filter.Eq(s => s.Position, position),
+            Builders<StageBracketSeat>.Filter.Eq(s => s.OccupantUserId, null as string));
+        var update = Builders<StageBracketSeat>.Update
+            .Set(s => s.OccupantUserId, userId)
+            .Set(s => s.OccupantUsername, username)
+            .Set(s => s.AssignedAt, DateTime.UtcNow);
+        var res = await StageBracketSeats.UpdateOneAsync(filter, update, options: null, ct);
+        return res.ModifiedCount == 1;
+    }
+
+    /// <summary>Find next available seat on the given side, returns
+    /// position 0..4 or null if all 5 are filled.</summary>
+    public async Task<int?> FindEmptyStageBracketSeatAsync(string roundId, string side, CancellationToken ct = default)
+    {
+        var filter = Builders<StageBracketSeat>.Filter.And(
+            Builders<StageBracketSeat>.Filter.Eq(s => s.RoundId, roundId),
+            Builders<StageBracketSeat>.Filter.Eq(s => s.Side, side),
+            Builders<StageBracketSeat>.Filter.Eq(s => s.OccupantUserId, null as string));
+        var seat = await StageBracketSeats.Find(filter).SortBy(s => s.Position).FirstOrDefaultAsync(ct);
+        return seat?.Position;
+    }
+
+    public async Task UnassignStageBracketSeatAsync(string roundId, string userId, CancellationToken ct = default)
+    {
+        var filter = Builders<StageBracketSeat>.Filter.And(
+            Builders<StageBracketSeat>.Filter.Eq(s => s.RoundId, roundId),
+            Builders<StageBracketSeat>.Filter.Eq(s => s.OccupantUserId, userId));
+        var update = Builders<StageBracketSeat>.Update
+            .Set(s => s.OccupantUserId, (string?)null)
+            .Set(s => s.OccupantUsername, (string?)null)
+            .Set(s => s.AssignedAt, (DateTime?)null);
+        await StageBracketSeats.UpdateOneAsync(filter, update, options: null, ct);
+    }
+
+    public async Task IncrementStageBracketSeatSecondsAsync(string roundId, string side, int position, int delta, CancellationToken ct = default)
+    {
+        var filter = Builders<StageBracketSeat>.Filter.And(
+            Builders<StageBracketSeat>.Filter.Eq(s => s.RoundId, roundId),
+            Builders<StageBracketSeat>.Filter.Eq(s => s.Side, side),
+            Builders<StageBracketSeat>.Filter.Eq(s => s.Position, position));
+        var update = Builders<StageBracketSeat>.Update.Inc(s => s.SecondsSpoken, delta);
+        await StageBracketSeats.UpdateOneAsync(filter, update, options: null, ct);
+    }
+
+    public async Task<StageBracketSeat?> GetStageBracketSeatAsync(string roundId, string side, int position, CancellationToken ct = default)
+    {
+        return await StageBracketSeats.Find(
+            Builders<StageBracketSeat>.Filter.And(
+                Builders<StageBracketSeat>.Filter.Eq(s => s.RoundId, roundId),
+                Builders<StageBracketSeat>.Filter.Eq(s => s.Side, side),
+                Builders<StageBracketSeat>.Filter.Eq(s => s.Position, position)))
+            .FirstOrDefaultAsync(ct);
+    }
+
+    public async Task<bool> IsUserSeatedStageBracketAsync(string roundId, string userId, CancellationToken ct = default)
+    {
+        return await StageBracketSeats.Find(
+            Builders<StageBracketSeat>.Filter.And(
+                Builders<StageBracketSeat>.Filter.Eq(s => s.RoundId, roundId),
+                Builders<StageBracketSeat>.Filter.Eq(s => s.OccupantUserId, userId)))
+            .AnyAsync(ct);
+    }
+
+    // ─── Nominations ──────────────────────────────────────────
+
+    public async Task<StageBracketNomination?> InsertStageBracketNominationAsync(StageBracketNomination n, CancellationToken ct = default)
+    {
+        // Reject duplicate pending nomination of same intent.
+        var existing = await StageBracketNominations.Find(
+            Builders<StageBracketNomination>.Filter.And(
+                Builders<StageBracketNomination>.Filter.Eq(x => x.RoundId, n.RoundId),
+                Builders<StageBracketNomination>.Filter.Eq(x => x.UserId, n.UserId),
+                Builders<StageBracketNomination>.Filter.Eq(x => x.Intent, n.Intent),
+                Builders<StageBracketNomination>.Filter.Eq(x => x.Status, "pending")))
+            .FirstOrDefaultAsync(ct);
+        if (existing is not null) return existing;
+        await StageBracketNominations.InsertOneAsync(n, options: null, ct);
+        return n;
+    }
+
+    public async Task SetStageBracketNominationStatusAsync(string nominationId, string status, CancellationToken ct = default)
+    {
+        var filter = Builders<StageBracketNomination>.Filter.Eq(n => n.Id, nominationId);
+        var update = Builders<StageBracketNomination>.Update
+            .Set(n => n.Status, status)
+            .Set(n => n.ResolvedAt, DateTime.UtcNow);
+        await StageBracketNominations.UpdateOneAsync(filter, update, options: null, ct);
+    }
+
+    public async Task WithdrawStageBracketNominationAsync(string roundId, string userId, string intent, CancellationToken ct = default)
+    {
+        var filter = Builders<StageBracketNomination>.Filter.And(
+            Builders<StageBracketNomination>.Filter.Eq(n => n.RoundId, roundId),
+            Builders<StageBracketNomination>.Filter.Eq(n => n.UserId, userId),
+            Builders<StageBracketNomination>.Filter.Eq(n => n.Intent, intent),
+            Builders<StageBracketNomination>.Filter.Eq(n => n.Status, "pending"));
+        var update = Builders<StageBracketNomination>.Update
+            .Set(n => n.Status, "withdrawn")
+            .Set(n => n.ResolvedAt, DateTime.UtcNow);
+        await StageBracketNominations.UpdateOneAsync(filter, update, options: null, ct);
+    }
+
+    public async Task<List<StageBracketNomination>> GetPendingStageBracketNominationsAsync(string roundId, string? intent, CancellationToken ct = default)
+    {
+        var filters = new List<FilterDefinition<StageBracketNomination>>
+        {
+            Builders<StageBracketNomination>.Filter.Eq(n => n.RoundId, roundId),
+            Builders<StageBracketNomination>.Filter.Eq(n => n.Status, "pending"),
+        };
+        if (!string.IsNullOrEmpty(intent))
+            filters.Add(Builders<StageBracketNomination>.Filter.Eq(n => n.Intent, intent));
+        return await StageBracketNominations.Find(Builders<StageBracketNomination>.Filter.And(filters))
+            .SortBy(n => n.RaisedAt)
+            .ToListAsync(ct);
+    }
+
+    public async Task<StageBracketNomination?> GetStageBracketNominationAsync(string nominationId, CancellationToken ct = default)
+    {
+        return await StageBracketNominations.Find(n => n.Id == nominationId).FirstOrDefaultAsync(ct);
+    }
+
+    public async Task<int> CountPendingStageBracketNominationsAsync(string roundId, CancellationToken ct = default)
+    {
+        var filter = Builders<StageBracketNomination>.Filter.And(
+            Builders<StageBracketNomination>.Filter.Eq(n => n.RoundId, roundId),
+            Builders<StageBracketNomination>.Filter.Eq(n => n.Status, "pending"));
+        return (int)await StageBracketNominations.CountDocumentsAsync(filter, options: null, ct);
+    }
+
+    // ─── Turns + chat + bans + audit ─────────────────────────
+
+    public async Task InsertStageBracketTurnAsync(StageBracketTurn t, CancellationToken ct = default)
+    {
+        await StageBracketTurns.InsertOneAsync(t, options: null, ct);
+    }
+
+    public async Task EndOpenStageBracketTurnsForRoundAsync(string roundId, CancellationToken ct = default)
+    {
+        var filter = Builders<StageBracketTurn>.Filter.And(
+            Builders<StageBracketTurn>.Filter.Eq(t => t.RoundId, roundId),
+            Builders<StageBracketTurn>.Filter.Eq(t => t.EndedAt, null as DateTime?));
+        var update = Builders<StageBracketTurn>.Update.Set(t => t.EndedAt, DateTime.UtcNow);
+        await StageBracketTurns.UpdateManyAsync(filter, update, options: null, ct);
+    }
+
+    public async Task<StageBracketChatMessage> InsertStageBracketChatAsync(StageBracketChatMessage m, CancellationToken ct = default)
+    {
+        await StageBracketChatMessages.InsertOneAsync(m, options: null, ct);
+        return m;
+    }
+
+    public async Task<List<StageBracketChatMessage>> GetStageBracketChatAsync(string roomId, int limit, CancellationToken ct = default)
+    {
+        var filter = Builders<StageBracketChatMessage>.Filter.Eq(m => m.RoomId, roomId);
+        var msgs = await StageBracketChatMessages.Find(filter)
+            .SortByDescending(m => m.CreatedAt)
+            .Limit(limit)
+            .ToListAsync(ct);
+        msgs.Reverse();
+        return msgs;
+    }
+
+    public async Task BanFromStageBracketAsync(StageBracketBan b, CancellationToken ct = default)
+    {
+        await StageBracketBans.InsertOneAsync(b, options: null, ct);
+    }
+
+    public async Task<bool> IsBannedFromStageBracketAsync(string roomId, string userId, CancellationToken ct = default)
+    {
+        var filter = Builders<StageBracketBan>.Filter.And(
+            Builders<StageBracketBan>.Filter.Eq(b => b.RoomId, roomId),
+            Builders<StageBracketBan>.Filter.Eq(b => b.UserId, userId));
+        return await StageBracketBans.Find(filter).AnyAsync(ct);
+    }
+
+    public async Task LogStageBracketHostActionAsync(StageBracketHostAction a, CancellationToken ct = default)
+    {
+        await StageBracketHostActions.InsertOneAsync(a, options: null, ct);
     }
 }
 

@@ -2060,3 +2060,230 @@ public class OpenMicMcAction
     public string? Reason { get; set; }
     public DateTime At { get; set; }
 }
+
+// ============================================================
+//  STAGE BRACKET — shared backend for Debate v2 + Roast templates.
+//
+//  Architecture decision (2026-06-21): both templates share ONE hub
+//  + ONE collection family because their mechanics are 95% identical
+//  (5v5 stage, mic-rotation, audience challenge, host moderation).
+//  The `Mode` field on the config differentiates Debate from Roast,
+//  driving side labels + topic source + visual theme.
+//
+//  Frontend, however, ships TWO separate pages (DebateV2RoomPage +
+//  RoastRoomPage) with their own CSS prefixes + visual identity. So
+//  the user-facing isolation policy holds; only the backend is shared.
+//
+//  Per-side seating: 5 LEFT (Pro / Roasters) + 5 RIGHT (Con / Roastees).
+//  Server alternates active side + cycles within side every turn.
+// ============================================================
+
+/// <summary>Room config — drives the entire flow.</summary>
+public class StageBracketConfig
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string HostUserId { get; set; } = default!;
+
+    /// <summary>"debate" | "roast" — determines side labels + topic source.</summary>
+    public string Mode { get; set; } = "debate";
+
+    /// <summary>"public" | "private". Public = no host, auto-fill seats
+    /// from nominations. Private = host-driven nomination + assignment.</summary>
+    public string Privacy { get; set; } = "public";
+    public string? InviteCode { get; set; }
+
+    /// <summary>60 / 90 / 120. Cap per individual speaker's turn.</summary>
+    public int SecondsPerTurn { get; set; } = 90;
+
+    /// <summary>Total round length. Default 5 min — covers ~3 turns per side.</summary>
+    public int RoundDurationMinutes { get; set; } = 5;
+
+    /// <summary>Length granted to an audience challenger when host approves
+    /// their raise-hand. The active speaker's mic mutes for this window.</summary>
+    public int ChallengeSlotSeconds { get; set; } = 60;
+
+    /// <summary>Manual topic provided by host. For public debate rooms
+    /// the topic is drawn from a server-side topic bank on round start.</summary>
+    public string? HostTopic { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+}
+
+/// <summary>A single round = one full debate/roast cycle. Server cycles
+/// active speaker every SecondsPerTurn until round duration elapses,
+/// then marks ended + auto-opens new round (if continuous mode).</summary>
+public class StageBracketRound
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string Mode { get; set; } = "debate";
+    public string Topic { get; set; } = "";
+
+    /// <summary>"open_seats" (nominations being collected, seats fillable)
+    /// | "live" (mic rotation active) | "ended"</summary>
+    public string Status { get; set; } = "open_seats";
+
+    /// <summary>"left" (Pro / Roasters) | "right" (Con / Roastees).
+    /// Whose turn it is RIGHT NOW within the rotation.</summary>
+    public string ActiveSide { get; set; } = "left";
+
+    /// <summary>0..4. Position within ActiveSide whose mic is open now.</summary>
+    public int ActiveSeatPosition { get; set; }
+
+    /// <summary>Per-side next-turn index — tracks rotation cycling within
+    /// each side. When ActiveSide flips, ActiveSeatPosition is taken from
+    /// this map. Stored as a Dictionary so we can persist resume state.</summary>
+    public int NextLeftPosition { get; set; }
+    public int NextRightPosition { get; set; }
+
+    public DateTime? StartedAt { get; set; }
+    /// <summary>When the round itself auto-ends.</summary>
+    public DateTime? EndsAt { get; set; }
+    /// <summary>When the CURRENT speaker's turn auto-ends.</summary>
+    public DateTime? CurrentTurnEndsAt { get; set; }
+    public DateTime? EndedAt { get; set; }
+
+    /// <summary>If set, an audience challenger is in the active slot
+    /// AND the original speaker is paused. Server reverts on expiry.</summary>
+    public string? ChallengerUserId { get; set; }
+    public string? ChallengerUsername { get; set; }
+    public DateTime? ChallengerEndsAt { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+}
+
+/// <summary>One of the 10 seats inside a round (5 left + 5 right).
+/// Server pre-creates them all empty on round open; occupants fill in
+/// as nominations are accepted.</summary>
+public class StageBracketSeat
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string RoundId { get; set; } = default!;
+
+    /// <summary>"left" | "right"</summary>
+    public string Side { get; set; } = "left";
+    /// <summary>0..4.</summary>
+    public int Position { get; set; }
+
+    public string? OccupantUserId { get; set; }
+    public string? OccupantUsername { get; set; }
+    public DateTime? AssignedAt { get; set; }
+
+    /// <summary>Total seconds this occupant has actually spoken — sum
+    /// of all their completed turns within this round. UI shows it.</summary>
+    public int SecondsSpoken { get; set; }
+}
+
+/// <summary>Audience nomination — either to take a seat (debate /
+/// roast as primary speaker) OR to challenge a current speaker. Bios
+/// privileged to host; public count to everyone.</summary>
+public class StageBracketNomination
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string RoundId { get; set; } = default!;
+
+    public string UserId { get; set; } = default!;
+    public string Username { get; set; } = default!;
+
+    /// <summary>"seat" | "challenge"</summary>
+    public string Intent { get; set; } = "seat";
+
+    /// <summary>"left" | "right" | "either" — only meaningful for seat intent.</summary>
+    public string PreferredSide { get; set; } = "either";
+
+    /// <summary>Optional short note shown to host alongside the nomination.</summary>
+    public string Note { get; set; } = "";
+
+    /// <summary>"pending" | "accepted" | "rejected" | "withdrawn"</summary>
+    public string Status { get; set; } = "pending";
+
+    public DateTime RaisedAt { get; set; }
+    public DateTime? ResolvedAt { get; set; }
+}
+
+/// <summary>Per-turn audit log — written when a speaker's mic opens
+/// AND again when it closes. Used to compute SecondsSpoken + UI history.</summary>
+public class StageBracketTurn
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string RoundId { get; set; } = default!;
+
+    public string Side { get; set; } = "left";
+    public int SeatPosition { get; set; }
+    public string SpeakerUserId { get; set; } = default!;
+    public string SpeakerUsername { get; set; } = default!;
+
+    /// <summary>"normal" (rotation slot) | "challenge" (audience interrupt)</summary>
+    public string Kind { get; set; } = "normal";
+
+    public DateTime StartedAt { get; set; }
+    public DateTime? EndedAt { get; set; }
+}
+
+/// <summary>Chat message inside the room. Real usernames visible.</summary>
+public class StageBracketChatMessage
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string SenderUserId { get; set; } = default!;
+    public string SenderUsername { get; set; } = default!;
+    public bool SenderIsHost { get; set; }
+    public bool SenderIsSeated { get; set; }
+    public string Content { get; set; } = default!;
+    public DateTime CreatedAt { get; set; }
+}
+
+/// <summary>Per-room ban.</summary>
+public class StageBracketBan
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string UserId { get; set; } = default!;
+    public string HostUserId { get; set; } = default!;
+    public string? Reason { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+
+/// <summary>Audit log of host actions.</summary>
+public class StageBracketHostAction
+{
+    [BsonId]
+    [BsonRepresentation(BsonType.ObjectId)]
+    public string? Id { get; set; }
+
+    public string RoomId { get; set; } = default!;
+    public string HostUserId { get; set; } = default!;
+    public string TargetUserId { get; set; } = default!;
+
+    /// <summary>configure | start_round | end_round | assign_seat |
+    /// unseat | approve_challenge | reject_challenge | next_speaker |
+    /// kick | ban | set_topic</summary>
+    public string ActionType { get; set; } = default!;
+    public string? Reason { get; set; }
+    public DateTime At { get; set; }
+}
