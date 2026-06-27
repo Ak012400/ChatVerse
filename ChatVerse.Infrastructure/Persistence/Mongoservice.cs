@@ -2551,7 +2551,12 @@ public partial class MongoService
     public const int MehfilTitleMaxChars   = 120;
     public static readonly string[] MehfilTemplates = new[]
     {
-        "dating_show", "open_mic", "debate", "watch_party", "game_night",
+        // Debate + Roast are the locked CURRENT-FOCUS templates as of
+        // 2026-06-21 (see PROGRESS.md). The others stay accepted so
+        // existing rooms keep working, but the create-flow filter on
+        // the frontend only exposes Debate + Roast for new rooms.
+        "debate", "roast",
+        "dating_show", "open_mic", "watch_party", "game_night",
         "podcast", "story_circle", "trivia", "talent_show", "networking", "custom",
     };
     public static readonly Dictionary<string, int> MehfilGifts = new()
