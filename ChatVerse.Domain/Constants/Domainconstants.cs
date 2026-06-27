@@ -246,6 +246,20 @@ public static class MongoCollections
     public const string OpenMicBans             = "om_bans";
     public const string OpenMicMcActions        = "om_mc_actions";
 
+    // ── Stage Bracket (Debate v2 + Roast shared backend) ───────
+    /// <summary>All sb_* collections — SHARED between the Debate v2
+    /// + Roast templates. Mode field on config disambiguates. Frontend
+    /// ships two separate pages with own CSS but identical wire
+    /// protocol.</summary>
+    public const string StageBracketConfigs       = "sb_configs";
+    public const string StageBracketRounds        = "sb_rounds";
+    public const string StageBracketSeats         = "sb_seats";
+    public const string StageBracketNominations   = "sb_nominations";
+    public const string StageBracketTurns         = "sb_turns";
+    public const string StageBracketChatMessages  = "sb_chat_messages";
+    public const string StageBracketBans          = "sb_bans";
+    public const string StageBracketHostActions   = "sb_host_actions";
+
     // ── Ghost Date ─────────────────────────────────────────────
     /// <summary>Weekly opt-in pool for Thursday 9pm IST ghost dates.</summary>
     public const string GhostDateRegistrations = "ghost_date_registrations";
