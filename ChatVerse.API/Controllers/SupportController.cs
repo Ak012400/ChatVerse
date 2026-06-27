@@ -52,7 +52,10 @@ public class SupportController : ControllerBase
     //  but feature-complete — adding a new feature means updating this
     //  block. Avoid version numbers / dates so it doesn't go stale.
     // ============================================================
-    private const string SystemPrompt = @"
+    // NOTE: `static readonly` (not `const`) because the .Trim() call at
+    // the end of the literal is evaluated at runtime — const requires
+    // a compile-time constant expression.
+    private static readonly string SystemPrompt = @"
 You are ChatVerse Assistant — a helpful, friendly support AI inside the ChatVerse app.
 You answer in the user's language (Hindi, English, Hinglish), keep replies short
 (2-5 sentences unless asked for detail), and never invent features that don't exist.
